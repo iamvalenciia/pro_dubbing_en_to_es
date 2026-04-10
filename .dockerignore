@@ -1,0 +1,27 @@
+# Archivos de prueba local (no van en la imagen)
+output/
+audio_prueba_1minuto/
+*.mp4
+*.mp3
+
+# Scripts de desarrollo
+benchmark.py
+docker_start.bat
+*.bat
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Git
+.git/
+.gitignore
+
+# Docs
+*.md
+
+# Archivos WAV de prueba/output (excluir, pero NO voice_reference/)
+output/*.wav
+output/tts_segments/

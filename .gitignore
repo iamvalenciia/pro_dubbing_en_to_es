@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Environment
+.env
+.venv/
+venv/
+ENV/
+
+# Development / IDE
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+
+# Project Output Folders & Caches
+cache/
+output/
+enhance_output/
+archives/
+subtitle_output/
+youtube_video/
+voice_reference/
+shorts_videos_lists/
+shorts/_cache/
+
+# Logs and specific files
+_app_log.txt
+app_out.txt
+*.log
+
+# Image previews / UI artefacts generated
+_preview_crop.jpg
+_preview_enhance.jpg
+configuraciones para video final.png
+*.jpg
+*.png
+
+# Media files
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.webm
+*.mkv
+*.avi
+*.mov
+
+# Extra shorts folders
+shorts/audio_original_en/
+shorts/background_music/
+shorts/short_audio_doblado/
+shorts/short_video/
+
+# Ignore other potential zip files from archives
+*.zip

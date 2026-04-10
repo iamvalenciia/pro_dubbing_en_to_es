@@ -1,0 +1,10 @@
+# Transcripción (ya instalado)
+faster-whisper>=1.0.0
+
+# Traducción (ya instalado)
+deep-translator>=1.11.0
+
+# TTS local (instalar si falta)
+qwen-tts>=0.1.0
+soundfile>=0.12.0
+python-dotenv>=1.0.0
