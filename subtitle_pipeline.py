@@ -342,6 +342,33 @@ def _choose_codec(width: int, height: int) -> tuple:
         else:
             return "libx264", "22", "FHD H.264 (CPU)"
 
+def _run_video_retalking(video_path: str, audio_path: str, out_path: str, cb) -> str:
+    """Ejecuta Video-Retalking para sincronizar los labios antes de los subtítulos."""
+    cb("[Lip-Sync] Iniciando Video-Retalking (Esto usará la GPU intensivamente)...", 0.08)
+    
+    # Asume que clonaste video-retalking en la misma carpeta que la app
+    retalking_dir = Path(__file__).parent / "video-retalking"
+    if not retalking_dir.exists():
+        raise FileNotFoundError(f"No se encontró la carpeta {retalking_dir}. Debes clonar el repositorio de OpenTalker.")
+
+    cmd = [
+        sys.executable, "inference.py",
+        "--face", video_path,
+        "--audio", audio_path,
+        "--outfile", out_path
+    ]
+    
+    # Ejecutamos el subproceso dentro de la carpeta de video-retalking
+    result = subprocess.run(cmd, cwd=str(retalking_dir), capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"Error en Video-Retalking:\n{result.stderr[-1500:]}")
+    
+    cb("[Lip-Sync] Sincronización labial completada con éxito.", 0.12)
+    return out_path
+
+
+
 
 # ─── Función principal ────────────────────────────────────────────────────────
 
@@ -358,6 +385,7 @@ def generate_subtitled_video(
     do_orig_audio: bool = False,
     orig_audio_path: str = None,
     orig_audio_db: float = -25,
+    do_lipsync: bool = False,
 ) -> tuple:
     """
     Genera un video con subtítulos quemados y audio doblado.
@@ -420,6 +448,12 @@ def generate_subtitled_video(
         _cb("[1/4] Usando video y audio completos...", 0.05)
         effective_video = video_path
         effective_audio = audio_path
+
+    # ── [NUEVO] Paso 1.5: LIP-SYNC (Video-Retalking) ──────────────────────────
+    if do_lipsync:
+        retalked_video = out_dir / f"_tmp_retalked_{mode_label}.mp4"
+        _run_video_retalking(effective_video, effective_audio, str(retalked_video), _cb)
+        effective_video = str(retalked_video) # A partir de aquí, usamos el video con lip-sync
 
     # ── Detectar resolución y elegir codec ────────────────────────────────────
     w, h = _get_video_resolution(effective_video)

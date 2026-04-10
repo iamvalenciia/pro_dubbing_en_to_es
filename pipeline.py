@@ -387,11 +387,455 @@ def _audit_speechbrain(wav_path: str, out_dir: str, out_json: str) -> str:
     return out_json
 
 
-# ─── PASO 2: TRANSCRIPCIÓN ────────────────────────────────────────────────────
+# ─── PASO 2: TRANSCRIPCIÓN (WhisperX — Forced Alignment) ─────────────────────
+
+def _group_words_into_segments(
+    words: list,
+    min_dur: float = 2.0,
+    max_dur: float = 12.0,
+    gap_threshold: float = 0.4,
+    diarization_data: list = None,
+) -> list:
+    """
+    Agrupa palabras alineadas por WhisperX en frases de 2-12 segundos.
+
+    Estrategia de corte (por prioridad):
+      1. Respetar max_dur como techo duro (nunca superar 12s).
+      2. Después de alcanzar min_dur (2s), buscar el PRIMER punto de corte
+         natural: fin de oración (.!?) o un silencio entre palabras ≥ gap_threshold.
+      3. Si no hay punto de corte natural antes de max_dur, cortar en la mayor
+         pausa encontrada.  Si no hay ninguna, cortar en max_dur.
+
+    Parámetros:
+        words           — lista de dicts con {start, end, word} de WhisperX
+        min_dur         — duración mínima de un segmento antes de buscar un corte
+        max_dur         — techo duro: cortar aunque no haya pausa ideal
+        gap_threshold   — silencio mínimo (s) entre palabras para considerar corte
+        diarization_data— resultados de diarización para asignar speaker
+    """
+    if not words:
+        return []
+
+    # Filtrar palabras sin timestamps válidos
+    valid_words = [w for w in words if w.get("start") is not None and w.get("end") is not None]
+    if not valid_words:
+        return []
+
+    def _assign_speaker(start, end):
+        """Asigna el locutor más probable basándose en la diarización."""
+        if not diarization_data:
+            return "SPEAKER_UNKNOWN"
+        best_spk = "SPEAKER_UNKNOWN"
+        best_overlap = 0.0
+        for d in diarization_data:
+            overlap = max(0.0, min(end, d["end"]) - max(start, d["start"]))
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_spk = d["speaker"]
+        return best_spk
+
+    segments = []
+    i = 0
+
+    while i < len(valid_words):
+        seg_start = valid_words[i]["start"]
+        seg_words = [valid_words[i]]
+        best_cut = None
+        best_gap = -1.0
+
+        for j in range(i + 1, len(valid_words)):
+            elapsed = valid_words[j]["end"] - seg_start
+
+            # Techo duro: no superar max_dur
+            if elapsed > max_dur:
+                if best_cut is None:
+                    best_cut = j
+                break
+
+            seg_words_candidate = seg_words + [valid_words[j]]
+
+            # Gap entre la palabra actual y la anterior
+            gap = valid_words[j]["start"] - valid_words[j - 1]["end"]
+
+            # Solo buscar cortes una vez alcanzado min_dur
+            current_dur = valid_words[j - 1]["end"] - seg_start
+            if current_dur >= min_dur:
+                # Corte por fin de oración
+                prev_word_text = valid_words[j - 1].get("word", "").strip()
+                if prev_word_text and prev_word_text[-1] in ".!?":
+                    best_cut = j
+                    break
+
+                # Corte por silencio natural
+                if gap >= gap_threshold:
+                    best_cut = j
+                    break
+
+                # Guardar mejor gap como fallback
+                if gap > best_gap:
+                    best_gap = gap
+                    best_cut = j
+
+            seg_words = seg_words_candidate
+
+        if best_cut is None:
+            best_cut = len(valid_words)
+
+        chunk_words = valid_words[i:best_cut]
+        seg_start = chunk_words[0]["start"]
+        seg_end = chunk_words[-1]["end"]
+        seg_text = " ".join(w.get("word", "").strip() for w in chunk_words).strip()
+
+        if seg_text:
+            speaker = _assign_speaker(seg_start, seg_end)
+            segments.append({
+                "start": round(seg_start, 3),
+                "end":   round(seg_end, 3),
+                "text":  seg_text,
+                "speaker": speaker,
+            })
+
+        i = best_cut
+
+    return segments
+
+
+def detect_emotions_batch(segments: list, audio_path: str, device: str = "cuda"):
+    """
+    Analiza la emoción de cada segmento original en inglés.
+    Utiliza un modelo Wav2Vec2 especializado en reconocimiento de emociones en habla.
+    """
+    from transformers import pipeline
+    import torch
+    import librosa
+    import os
+
+    _log("Cargando modelo de reconocimiento de emociones (Prosodia)...")
+    try:
+        # Usamos un modelo robusto de clasificación de emociones
+        classifier = pipeline(
+            "audio-classification",
+            model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition",
+            device=0 if device == "cuda" else -1
+        )
+    except Exception as e:
+        _log(f"ERROR cargando modelo de emoción: {e}. Saltando prosodia.")
+        return segments
+
+    # Cargar audio completo una vez para extraer trozos rápido
+    y, sr = librosa.load(audio_path, sr=16000)
+
+    _log(f"Analizando emociones de {len(segments)} segmentos...")
+    for i, seg in enumerate(segments):
+        start_s = seg["start"]
+        end_s = seg["end"]
+        
+        # Extraer clip
+        start_sample = int(start_s * 16000)
+        end_sample = int(end_s * 16000)
+        clip = y[start_sample:end_sample]
+        
+        if len(clip) < 1600: # Ignorar clips < 0.1s
+            seg["emotion"] = "neutral"
+            continue
+            
+        try:
+            # Predicción
+            preds = classifier(clip)
+            # El modelo devuelve etiquetas como 'angry', 'happy', etc.
+            top_emotion = preds[0]['label']
+            seg["emotion"] = top_emotion
+        except:
+            seg["emotion"] = "neutral"
+            
+    # Liberar memoria
+    del classifier
+    if device == "cuda":
+        torch.cuda.empty_cache()
+        
+    _log("Detección de emociones completada.")
+    return segments
+
+
+def extract_speaker_references(
+    wav_path: str,
+    segments: list,
+    output_dir: str,
+    min_continuous_dur: float = 5.0,
+    buffer_sec: float = 1.0,
+    target_total_dur: float = 10.0,
+) -> dict:
+    """
+    Cazador de Referencias Pro:
+    1. Agrupa segmentos por SPEAKER.
+    2. Filtra segmentos de >5s que NO tengan solapamiento (buffer 1s) con otros locutores.
+    3. Concatena hasta llegar a 10s.
+    4. Guarda en output_dir/ref_SPEAKER_XX.wav y retorna mapeo.
+    """
+    import pydub
+    from collections import defaultdict
+    
+    os.makedirs(output_dir, exist_ok=True)
+    audio = pydub.AudioSegment.from_wav(wav_path)
+    
+    # 1. Agrupar por locutor
+    spk_groups = defaultdict(list)
+    for s in segments:
+        spk_groups[s["speaker"]].append(s)
+        
+    speaker_refs = {}
+    
+    for spk, segs in spk_groups.items():
+        if spk == "SPEAKER_UNKNOWN": continue
+        
+        _log(f"Analizando locutor {spk} ({len(segs)} segmentos)...")
+        
+        # 2. Buscar candidatos "limpios"
+        candidatos = []
+        for i, s in enumerate(segs):
+            dur = s["end"] - s["start"]
+            if dur < min_continuous_dur:
+                continue
+            
+            # Validar buffer vs otros locutores
+            # Buscamos en TODOS los segmentos (no solo de este speaker)
+            is_clean = True
+            for other in segments:
+                if other["speaker"] == spk: continue
+                
+                # Si algún otro habla a menos de buffer_sec del inicio o fin de este
+                dist_start = abs(s["start"] - other["end"])
+                dist_end   = abs(other["start"] - s["end"])
+                
+                # Si hay solapamiento real o distancia < buffer
+                overlaps = max(0.0, min(s["end"], other["end"]) - max(s["start"], other["start"]))
+                if overlaps > 0 or dist_start < buffer_sec or dist_end < buffer_sec:
+                    is_clean = False
+                    break
+            
+            if is_clean:
+                candidatos.append(s)
+        
+        # 3. Extraer y concatenar
+        if not candidatos:
+            _log(f"  WARN: No se encontraron monólogos limpios >{min_continuous_dur}s para {spk}.")
+            # Fallback: tomar lo más largo disponible aunque sea < 5s (mejor que nada para clonar)
+            candidatos = sorted(segs, key=lambda x: x["end"] - x["start"], reverse=True)[:3]
+            
+        combined = pydub.AudioSegment.empty()
+        current_dur = 0.0
+        
+        for cand in candidatos:
+            start_ms = int(cand["start"] * 1000)
+            end_ms   = int(cand["end"] * 1000)
+            combined += audio[start_ms:end_ms]
+            current_dur += (cand["end"] - cand["start"])
+            if current_dur >= target_total_dur:
+                break
+                
+        if len(combined) > 0:
+            out_wav = os.path.join(output_dir, f"ref_{spk}.wav")
+            out_txt = os.path.join(output_dir, f"ref_{spk}.txt")
+            
+            combined.export(out_wav, format="wav")
+            # El texto de referencia es clave para Qwen-TTS: tomamos el primer segmento largo
+            ref_texts = []
+            for cand in candidatos:
+                ref_texts.append(cand["text"])
+            
+            with open(out_txt, "w", encoding="utf-8") as f:
+                f.write(" ".join(ref_texts)[:500])
+                
+            speaker_refs[spk] = {
+                "audio": out_wav,
+                "text": " ".join(ref_texts)[:500]
+            }
+            _log(f"  OK Referencia generada: {out_wav} ({current_dur:.1f}s)")
+            
+    return speaker_refs
+
+
+def transcribe_whisperx(
+    wav_path: str,
+    model_size: str = "base",
+    diarization_json_path: str = None,
+    device: str = "cuda",
+    min_seg_dur: float = 2.0,
+    max_seg_dur: float = 12.0,
+    hf_token: str = None,
+) -> list:
+    """
+    Transcribe con WhisperX (Forced Alignment a nivel de palabra).
+
+    Pipeline:
+      1. Transcripción con whisperx.load_model (basado en faster-whisper internamente).
+      2. Alineación forzada (forced alignment) con modelo de alineación fonética
+         → timestamps precisos a nivel de palabra (milisegundos).
+      3. Agrupación de palabras en frases de 2-12 segundos, cortando en
+         finales de oración o en silencios naturales.
+
+    Retorna lista de dicts: {start, end, text, speaker}
+    """
+    # ── MONKEY PATCH: Soluciona el error de "unexpected keyword 'token'" ──
+    try:
+        from pyannote.audio.core.inference import Inference
+        if not getattr(Inference.__init__, "_is_patched", False):
+            _original_init = Inference.__init__
+            def _patched_init(self, *args, **kwargs):
+                kwargs.pop("token", None)  # Eliminamos el token problemático aquí
+                _original_init(self, *args, **kwargs)
+            _patched_init._is_patched = True
+            Inference.__init__ = _patched_init
+    except Exception:
+        pass
+
+    import whisperx
+    import torch
+    import gc
+
+    _log(f"WhisperX: Cargando modelo '{model_size}' en {device}...")
+    compute_type = "float16" if device == "cuda" else "int8"
+    model = whisperx.load_model(model_size, device, compute_type=compute_type)
+
+    # ── 1. Transcripción ──────────────────────────────────────────────────
+    _log("WhisperX: Transcribiendo audio...")
+    audio = whisperx.load_audio(wav_path)
+    result = model.transcribe(audio, language="en", batch_size=16)
+
+    n_segs = len(result.get("segments", []))
+    _log(f"WhisperX: Transcripción bruta → {n_segs} segmentos")
+
+    # Liberar modelo de transcripción de VRAM antes de alignment
+    del model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # ── 2. Forced Alignment (word-level timestamps) ───────────────────────
+    _log("WhisperX: Cargando modelo de alineación forzada...")
+    align_model, align_metadata = whisperx.load_align_model(
+        language_code="en", device=device,
+    )
+
+    _log("WhisperX: Alineando palabras (forced alignment)...")
+    result = whisperx.align(
+        result["segments"], align_model, align_metadata,
+        audio, device,
+        return_char_alignments=False,
+    )
+
+    # Liberar modelo de alineación
+    del align_model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # ── 3. Extraer todas las palabras alineadas ───────────────────────────
+    all_words = []
+    for seg in result.get("segments", []):
+        for w in seg.get("words", []):
+            if w.get("start") is not None and w.get("end") is not None:
+                all_words.append({
+                    "start": round(w["start"], 3),
+                    "end":   round(w["end"], 3),
+                    "word":  w.get("word", "").strip(),
+                })
+
+    _log(f"WhisperX: {len(all_words)} palabras alineadas con timestamps exactos")
+
+    if not all_words:
+        _log("WARN: No se obtuvieron palabras alineadas")
+        return []
+
+    # ── 4. Diarización Integrada (opcional) ──────────────────────────────
+    diarization_data = []
+    
+    # ── 4. Diarización Integrada (opcional) ──────────────────────────────
+    diarization_data = []
+    
+    # Si se pide diarización y hay token, la corremos aquí mismo
+    if hf_token:
+        _log("WhisperX: Iniciando diarización integrada (Pyannote directa)...")
+        
+        # --- BYPASS: Usamos Pyannote directo y creamos el DataFrame manual ---
+        from whisperx.diarize import assign_word_speakers
+        from pyannote.audio import Pipeline
+        import pandas as pd
+        import torch
+        
+        # Cargamos el modelo real saltándonos el wrapper roto de WhisperX
+        pyannote_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
+        if device == "cuda":
+            pyannote_model.to(torch.device("cuda"))
+            
+        # Formateamos el audio en memoria como a Pyannote le gusta: [1, samples]
+        audio_data = {
+            'waveform': torch.from_numpy(audio).unsqueeze(0),
+            'sample_rate': 16000
+        }
+        
+        # Ejecutamos la diarización
+        diarization_raw = pyannote_model(audio_data)
+        
+        # Convertimos el resultado a un DataFrame de Pandas (el formato estricto que exige WhisperX)
+        diarize_df = pd.DataFrame(diarization_raw.itertracks(yield_label=True), columns=['segment', 'label', 'speaker'])
+        diarize_df['start'] = diarize_df['segment'].apply(lambda x: x.start)
+        diarize_df['end'] = diarize_df['segment'].apply(lambda x: x.end)
+        
+        # Alinear locutores con los segmentos de texto de Whisper
+        result = assign_word_speakers(diarize_df, result)
+        
+        # Extraer los bloques para tu Cazador de Referencias
+        for _, row in diarize_df.iterrows():
+            diarization_data.append({
+                "start": round(row["start"], 3),
+                "end": round(row["end"], 3),
+                "speaker": row["speaker"]
+            })
+            
+        # Actualizar all_words con la información de speaker ya alineada
+        all_words = []
+        for seg in result.get("segments", []):
+            spk = seg.get("speaker", "SPEAKER_UNKNOWN")
+            for w in seg.get("words", []):
+                if w.get("start") is not None and w.get("end") is not None:
+                    all_words.append({
+                        "start": round(w["start"], 3),
+                        "end":   round(w["end"], 3),
+                        "word":  w.get("word", "").strip(),
+                        "speaker": spk
+                    })
+    else:
+        # Modo compatible: Cargar diarización de archivo si no hay token HF
+        if diarization_json_path and os.path.exists(diarization_json_path):
+            try:
+                with open(diarization_json_path, "r", encoding="utf-8") as f:
+                    diarization_data = json.load(f).get("results", [])
+            except Exception:
+                pass
+
+    # ── 5. Agrupar palabras en segmentos de 2-12s ─────────────────────────
+    _log(f"WhisperX: Agrupando palabras en frases ({min_seg_dur}-{max_seg_dur}s)...")
+    segments = _group_words_into_segments(
+        all_words,
+        min_dur=min_seg_dur,
+        max_dur=max_seg_dur,
+        gap_threshold=0.4,
+        diarization_data=diarization_data,
+    )
+
+    for seg in segments:
+        _log(f"  [{seg['start']:6.1f}s → {seg['end']:5.1f}s] "
+             f"[{seg['speaker']}] {seg['text'][:60]}")
+
+    _log(f"WhisperX: OK {len(segments)} segmentos finales "
+         f"({min_seg_dur}-{max_seg_dur}s por segmento)")
+    return segments
+
 
 def transcribe(wav_path: str, model_size: str = "base", diarization_json_path: str = None) -> list:
     """
-    Transcribe con faster-whisper.
+    Transcribe con faster-whisper (legacy, sin forced alignment).
     Retorna lista de dicts: {start, end, text}
     """
     from faster_whisper import WhisperModel
@@ -447,32 +891,252 @@ def transcribe(wav_path: str, model_size: str = "base", diarization_json_path: s
     return segments
 
 
-# ─── PASO 3: TRADUCCIÓN ───────────────────────────────────────────────────────
+# ─── PASO 3: TRADUCCIÓN Y ADAPTACIÓN (Qwen3.5-9B) ────────────────────────────
 
-def translate_segments(segments: list) -> list:
-    """Traduce cada segmento EN -> ES usando Google Translate (deep-translator)."""
-    from deep_translator import GoogleTranslator
-    translator = GoogleTranslator(source="en", target="es")
+# Ruta al modelo local Qwen3.5-9B (relativa al proyecto o absoluta)
+QWEN_TRANSLATE_MODEL = os.environ.get(
+    "QWEN_TRANSLATE_MODEL",
+    str(Path(__file__).parent / "Qwen3.5-9B"),
+)
 
-    print(f"  -> Traduciendo {len(segments)} segmentos...")
-    for i, seg in enumerate(segments):
-        raw = seg["text"]
-        if not raw:
-            seg["text_es"] = ""
+
+def _count_syllables_en(text: str) -> int:
+    """Estimación rápida de sílabas en inglés (heurística de vocales)."""
+    import re
+    text = text.lower().strip()
+    if not text:
+        return 0
+    # Contar grupos de vocales consecutivas
+    count = len(re.findall(r'[aeiouy]+', text))
+    # Ajuste: "e" final silenciosa
+    if text.endswith('e') and count > 1:
+        count -= 1
+    return max(count, 1)
+
+
+def translate_segments_qwen(
+    segments: list,
+    model_path: str = None,
+    device: str = "cuda",
+    progress_cb=None,
+) -> list:
+    """
+    Traduce/adapta cada segmento EN→ES usando Qwen3.5-9B como LLM local.
+
+    No es una traducción literal: es una ADAPTACIÓN DE GUION para doblaje.
+    El prompt le indica al modelo la duración original y el conteo de sílabas
+    para que genere una traducción concisa que quepa en el tiempo disponible.
+
+    Libera la VRAM del modelo al terminar (para dejar espacio al TTS).
+
+    Parámetros:
+        segments    — lista de dicts con {start, end, text, ...}
+        model_path  — ruta al directorio del modelo Qwen3.5-9B
+        device      — "cuda" o "cpu"
+        progress_cb — callback(done, total) para UI
+
+    Retorna la misma lista con text_es rellenado.
+    """
+    import torch
+    import gc
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_dir = model_path or QWEN_TRANSLATE_MODEL
+
+    if not Path(model_dir).exists():
+        raise FileNotFoundError(
+            f"Modelo Qwen3.5-9B no encontrado en {model_dir}. "
+            f"Descárgalo y colócalo en esa ruta antes de ejecutar el pipeline."
+        )
+
+    # Contar pendientes
+    pending = [(i, seg) for i, seg in enumerate(segments)
+               if seg.get("text", "").strip() and not seg.get("text_es")]
+    if not pending:
+        _log("Todos los segmentos ya tienen traducción")
+        return segments
+
+    _log(f"Cargando Qwen3.5-9B desde {model_dir} en {device}...")
+    t0 = time.time()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+        trust_remote_code=True,
+    )
+    model.eval()
+    _log(f"Qwen3.5-9B cargado en {time.time()-t0:.1f}s")
+
+    SYSTEM_PROMPT = (
+        "Eres un director de doblaje experto. Tu objetivo es traducir guiones del inglés al español "
+        "manteniendo una coherencia narrativa perfecta, respetando el género de los hablantes y "
+        "manteniendo el tuteo (tú) o formalidad (usted) consistente.\n\n"
+        "Recibirás un JSON con frases. Debes devolver el MISMO formato JSON exacto en una lista, "
+        "alterando únicamente el valor de 'texto_espanol', adaptando la longitud al 'target_duration_ms'."
+    )
+
+    BATCH_SIZE = 5
+    CONTEXT_SIZE = 2
+    
+    # Trabajamos sobre todos los segmentos para poder extraer contexto
+    for start_idx in range(0, len(segments), BATCH_SIZE):
+        batch_indices = range(start_idx, min(start_idx + BATCH_SIZE, len(segments)))
+        batch_segments = [segments[i] for i in batch_indices]
+        
+        # Filtrar si ya están traducidos (opcional, pero mejor procesar lote completo para coherencia)
+        # Si todos en el lote ya tienen text_es, saltamos.
+        if all(s.get("text_es") for s in batch_segments):
             continue
-        if seg.get("text_es"):          # ya traducido (p.ej. bloque cargado del cache)
-            continue
+
+        # 1. Obtener contexto previo (2 frases en inglés)
+        context_texts = []
+        if start_idx > 0:
+            for c_idx in range(max(0, start_idx - CONTEXT_SIZE), start_idx):
+                context_texts.append(segments[c_idx].get("text", ""))
+
+        # 2. Preparar bloque a traducir
+        bloque_input = []
+        for i in batch_indices:
+            seg = segments[i]
+            bloque_input.append({
+                "id": i,
+                "speaker": seg.get("speaker", "UNKNOWN"),
+                "texto_original": seg.get("text", "").strip(),
+                "target_duration_ms": int((seg.get("end", 0) - seg.get("start", 0)) * 1000)
+            })
+
+        user_input_json = {
+            "contexto_previo_no_traducir": context_texts,
+            "bloque_a_traducir": bloque_input
+        }
+
+        user_prompt = (
+            f"Traduce el siguiente JSON siguiendo las reglas de doblaje:\n\n"
+            f"```json\n{json.dumps(user_input_json, ensure_ascii=False, indent=2)}\n```"
+        )
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
         try:
-            seg["text_es"] = translator.translate(raw)
+            input_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=1024, # Aumentado por JSON batch
+                    temperature=0.2,    # Más bajo para JSON estable
+                    top_p=0.9,
+                    do_sample=True,
+                    repetition_penalty=1.1,
+                )
+
+            # Decodificar y extraer JSON
+            new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+            response_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+            
+            # Limpiar posibles bloques de código triple backtick
+            if "```json" in response_text:
+                json_str = response_text.split("```json")[-1].split("```")[0].strip()
+            elif "```" in response_text:
+                json_str = response_text.split("```")[-1].split("```")[0].strip()
+            else:
+                json_str = response_text
+
+            translated_data = json.loads(json_str)
+            
+            # Mapear de vuelta a segments
+            if isinstance(translated_data, list):
+                for item in translated_data:
+                    ver_id = item.get("id")
+                    txt_es = item.get("texto_espanol")
+                    if ver_id is not None and txt_es:
+                        segments[ver_id]["text_es"] = txt_es
+                        _log(f"  [{ver_id:3d}] {segments[ver_id]['text'][:30]}... → {txt_es[:30]}...")
+            else:
+                _log(f"  ERROR: El modelo no devolvió una lista JSON en lote {start_idx}")
+
         except Exception as e:
-            print(f"    WARN segmento {i}: {e}. Reintentando en 2s...")
-            time.sleep(2)
-            seg["text_es"] = translator.translate(raw)
+            _log(f"  ERROR en lote {start_idx}: {e}. Reintentando individuales o saltando...")
+            # Fallback opcional: si el lote falla, podrías intentar uno a uno aquí
+            # Por ahora marcamos vacíos para no bloquear
+            for i in batch_indices:
+                if not segments[i].get("text_es"):
+                    segments[i]["text_es"] = segments[i].get("text", "")
 
-        print(f"    [{i+1:3d}/{len(segments)}] {raw[:45]:45s} -> {seg['text_es'][:45]}")
-        time.sleep(0.08)   # evitar rate limiting
+        if progress_cb:
+            progress_cb(min(start_idx + BATCH_SIZE, len(segments)), len(segments))
 
+    # Liberar modelo de VRAM
+    _log("Liberando Qwen3.5-9B de VRAM...")
+    del model
+    del tokenizer
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    _log(f"Adaptación completada: {len(pending)} segmentos en {time.time()-t0:.1f}s")
     return segments
+
+
+def resummarize_text(text_en: str, target_dur_ms: int, model_path: str = None, device: str = "cuda") -> str:
+    """
+    LLM Fallback: Cuando un segmento es demasiado largo (>25%), se vuelve a llamar a Qwen
+    con instrucciones de resumen agresivo para que el texto traducido sea más corto.
+    """
+    import torch
+    import gc
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    model_dir = model_path or QWEN_TRANSLATE_MODEL
+    _log(f"Resummarize: Cargando LLM para acortar texto (objetivo: {target_dur_ms}ms)...")
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.bfloat16, device_map=device, trust_remote_code=True
+    )
+    
+    PROMPT = (
+        f"Eres un experto en doblaje. El siguiente texto en español es demasiado largo para el tiempo disponible ({target_dur_ms}ms).\n"
+        f"TAREA: Resume o parafrasea el texto agresivamente para que sea MUCHO MÁS CORTO pero mantenga el sentido esencial.\n"
+        f"Responde ÚNICAMENTE con el nuevo texto en español.\n\n"
+        f"Texto original: {text_en}"
+    )
+    
+    messages = [{"role": "user", "content": PROMPT}]
+    input_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+    
+    with torch.no_grad():
+        ids = model.generate(**inputs, max_new_tokens=128, temperature=0.2)
+        new_tokens = ids[0][inputs["input_ids"].shape[1]:]
+        short_text = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        
+    _log(f"Resummarize: '{text_en[:30]}...' -> '{short_text[:30]}...'")
+    
+    # Liberar memoria inmediatamente
+    del model
+    del tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return short_text
+
+
+def translate_segments(segments: list, progress_cb=None) -> list:
+    """
+    Punto de entrada de traducción — siempre usa Qwen3.5-9B.
+    """
+    _log("Usando Qwen3.5-9B para adaptación de guion...")
+    return translate_segments_qwen(segments, progress_cb=progress_cb)
+
 
 
 # ─── CHUNKING POR PAUSA NATURAL ──────────────────────────────────────────────
@@ -724,7 +1388,21 @@ def generate_tts_local(
                 raise ValueError("Múltiples locutores en el mismo lote, procesando 1 a 1...")
                 
             spk = list(spk_set)[0]
-            prompt_to_use = voice_prompts.get(spk) or voice_prompts.get("DEFAULT") or list(voice_prompts.values())[0]
+            base_prompt = voice_prompts.get(spk) or voice_prompts.get("DEFAULT") or list(voice_prompts.values())[0]
+            
+            # --- INYECCIÓN DE PROSODIA (EMOCIÓN) ---
+            emotion = batch[0][1].get("emotion", "neutral").lower()
+            style_map = {
+                "happy": "Habla con tono alegre y entusiasta.",
+                "angry": "Habla con tono firme, molesto y autoritario.",
+                "sad": "Habla con tono pausado y melancólico.",
+                "fear": "Habla con tono ansioso y temeroso.",
+                "surprise": "Habla con tono de asombro y sorpresa.",
+                "disgust": "Habla con tono de desprecio y desagrado.",
+                "neutral": "Habla con tono natural y equilibrado."
+            }
+            style_instruction = style_map.get(emotion, style_map["neutral"])
+            prompt_to_use = f"{style_instruction} {base_prompt}"
             
             with _Heartbeat(hb_label, interval=15):
                 wavs, sr = model.generate_voice_clone(
@@ -760,56 +1438,72 @@ def generate_tts_local(
         for (i, seg, _), wav in zip(batch, wavs):
             raw_path = os.path.join(tts_dir, f"seg_{i:04d}_raw.wav")
             adj_path = seg["tts_adjusted_path"]
-            target_dur  = seg["end"] - seg["start"]
+            target_dur = seg["end"] - seg["start"]
+            target_dur_ms = int(target_dur * 1000)
 
             if wav is None:
-                _log(f"WARN segmento {i+1} — omitido (sin audio generado)")
+                _log(f"WARN segmento {i+1} — omitido")
                 continue
 
             sf.write(raw_path, wav, sr)
             tts_dur = len(wav) / sr
+            ratio = tts_dur / max(target_dur, 0.001)
 
-            if FREE_FLOWING:
+            # --- ARQUITECTURA HÍBRIDA DE DECISIONES ---
+            
+            # CASO C: > 25% Excedido -> Re-traducción / Resúmen
+            if ratio > 1.25:
+                _log(f"  seg {i+1:3d} | ratio {ratio:.2f} EXCEDE 1.25. Re-traduciendo...")
+                new_text = resummarize_text(seg.get("text_es", ""), target_dur_ms)
+                seg["text_es"] = new_text
+                # Re-generar este segmento específico (fuera de lote para simplicidad)
+                try:
+                    spk = seg.get("speaker", "SPEAKER_UNKNOWN")
+                    prompt_to_use = voice_prompts.get(spk) or voice_prompts.get("DEFAULT")
+                    w_retry, _ = model.generate_voice_clone(
+                        text=[new_text], language=[language], voice_clone_prompt=prompt_to_use
+                    )
+                    wav = w_retry[0]
+                    sf.write(raw_path, wav, sr)
+                    tts_dur = len(wav) / sr
+                    ratio = tts_dur / max(target_dur, 0.001)
+                    _log(f"  seg {i+1:3d} | Nuevo ratio tras resumen: {ratio:.2f}")
+                except Exception as ex:
+                    _log(f"  ERROR en re-traducción seg {i+1}: {ex}")
+
+            # CASO B: 1.11 - 1.25 -> Video Freeze (Pads at end)
+            if 1.10 < ratio <= 1.25:
+                _log(f"  seg {i+1:3d} | ratio {ratio:.2f} -> Requiere VIDEO FREEZE")
+                seg["needs_video_freeze"] = True
+                seg["freeze_duration"] = tts_dur - target_dur
+                # En audio, lo dejamos natural (sin comprimir) para que el video lo espere
                 shutil.copy(raw_path, adj_path)
-                action = "NATURAL"
+                action = "FREEZE"
                 adj_dur = tts_dur
-                seg["tts_adjusted_dur"] = adj_dur
-                _log(f"  seg {i+1:3d} | {tts_dur:.2f}s | {action} | "
-                     f"{seg.get('text_es','')[:55]}")
-            else:
-                if i + 1 < len(segments):
-                    available   = segments[i + 1]["start"] - seg["start"]
-                    prev_en_end = segments[i - 1]["end"] if i > 0 else 0.0
-                    pre_gap     = max(0.0, seg["start"] - prev_en_end - MIN_GAP)
-                    pre_borrow  = min(pre_gap, MAX_PRE_BORROW)
-                    window      = available - MIN_GAP + pre_borrow
-                else:
-                    window = tts_dur  # último segmento: sin restricción de ventana
-
-                # Objetivo: estirar el TTS para llenar la ventana EN (limitado por MIN_SPEED),
-                # o comprimir si el TTS desborda la ventana.
-                # adj_target puede ser MAYOR que tts_dur (ESTIRADO) o MENOR (COMPRIMIDO).
-                adj_target = min(tts_dur / MIN_SPEED, window)
-
-                if tts_dur > window:
-                    # Caso compresión: mantener piso mínimo para no cortar demasiado
-                    adj_target = max(adj_target, target_dur * 0.80)
-
-                if abs(adj_target - tts_dur) / max(tts_dur, 0.001) < 0.03:
+            
+            # CASO A: <= 1.10 -> Audio Stretch (Time-stretch imperceptible)
+            elif ratio <= 1.10:
+                if FREE_FLOWING:
                     shutil.copy(raw_path, adj_path)
                     action = "NATURAL"
-                elif adj_target > tts_dur:
-                    adjust_duration(raw_path, adj_path, adj_target)
-                    action = "ESTIRADO"
                 else:
-                    adjust_duration(raw_path, adj_path, adj_target)
-                    action = "COMPRIMIDO"
-
+                    # Aplicar atempo para encajar exacto en target_dur (o ventana)
+                    adjust_duration(raw_path, adj_path, target_dur)
+                    action = "STRETCH"
                 adj_dur = get_duration(adj_path)
-                seg["tts_adjusted_dur"] = adj_dur
-                _log(f"  seg {i+1:3d} | {tts_dur:.2f}s→{adj_dur:.2f}s "
-                     f"(ventana:{window:.2f}s) | {action} | "
-                     f"{seg.get('text_es','')[:45]}")
+            
+            else:
+                # Si falló el resumen o ratio sigue alto, comprimimos al límite (1.25x)
+                # para que el freeze no sea eterno
+                adjust_duration(raw_path, adj_path, target_dur * 1.25)
+                seg["needs_video_freeze"] = True
+                seg["freeze_duration"] = get_duration(adj_path) - target_dur
+                action = "COMPRIMIDO+FREEZE"
+                adj_dur = get_duration(adj_path)
+
+
+            seg["tts_adjusted_dur"] = adj_dur
+            _log(f"  seg {i+1:3d} | {tts_dur:.2f}s → {adj_dur:.2f}s | {action} | {seg.get('text_es','')[:40]}")
 
         # Actualizar progress bar de Gradio si se proporcionó callback
         if progress_cb:
@@ -924,366 +1618,170 @@ def build_final_audio(
     free_flowing: bool = FREE_FLOWING,
 ):
     """
-    Construye el audio final ensamblando los segmentos TTS en orden.
-
-    Modo libre (free_flowing=True):
-        Concatena los segmentos con pausas naturales entre ellos (cappadas a
-        MAX_FREE_GAP). No hay sincronización con los timestamps originales.
-        El audio resultante tiene su propia duración natural.
-
-    Modo sincronizado (free_flowing=False):
-        Inserta silencios para alinear cada segmento con su timestamp original
-        en inglés. Usa compensación de drift y pre-borrow.
+    Ensamblado No-Lineal (Paralelo): Superpone los segmentos TTS en una línea 
+    de tiempo dinámica que permite Crosstalk (interrupciones).
     """
-    tmp_dir = tempfile.mkdtemp(prefix="qwen_dub_")
-    parts = []
+    from pydub import AudioSegment
+    import io
 
+    _log(f"Ensamblando audio PARALELO ({len(segments)} segmentos)...")
+    
+    # 1. Calcular duración total estimada del 'canvas'
+    extra_time = sum(s.get("freeze_duration", 0) for s in segments)
+    estimated_total_ms = int((total_duration + extra_time + 10.0) * 1000)
+    
+    canvas = AudioSegment.silent(duration=estimated_total_ms, frame_rate=sr)
+    canvas = canvas.set_channels(1)
+    
+    timeline_shift_ms = 0
+    MAX_FREE_GAP_MS = int(MAX_FREE_GAP * 1000)
+
+    for i, seg in enumerate(segments):
+        start_en_ms = int(seg["start"] * 1000)
+        
+        # Modo libre: reducir silencios pero preservar overlaps
+        if free_flowing and i > 0:
+            prev_end_en_ms = int(segments[i-1]["end"] * 1000)
+            gap_en_ms = start_en_ms - prev_end_en_ms
+            if gap_en_ms > MAX_FREE_GAP_MS:
+                timeline_shift_ms -= (gap_en_ms - MAX_FREE_GAP_MS)
+            
+        pos_es_ms = start_en_ms + timeline_shift_ms
+        if pos_es_ms < 0: pos_es_ms = 0
+
+        adj_path = seg.get("tts_adjusted_path", "")
+        if adj_path and os.path.exists(adj_path):
+            seg_audio = AudioSegment.from_file(adj_path).set_frame_rate(sr).set_channels(1)
+            canvas = canvas.overlay(seg_audio, position=pos_es_ms)
+            
+            # Freeze shift
+            freeze_dur_ms = int(seg.get("freeze_duration", 0) * 1000)
+            if freeze_dur_ms > 0:
+                timeline_shift_ms += freeze_dur_ms
+
+    canvas.export(output_wav, format="wav")
+    _log(f"Audio paralelo ensamblado: {output_wav}")
+
+
+def mix_voice_with_background(voice_path, bg_path, output_path, voice_vol=1.5, bg_vol=1.0, ducking=True):
+    """
+    Mezcla voz con fondo con Auto-Ducking tipo Netflix.
+    - El fondo baja al ~20% (-14dB) cuando hay voz.
+    - El fondo vuelve al 100% durante los silencios.
+    """
+    _log(f"Mezclando audio PRO: Voz={voice_vol} Fondo={bg_vol} Ducking={ducking}")
+    
+    if not ducking:
+        filter_str = f"[0:a]volume={voice_vol}[v];[1:a]volume={bg_vol}[bg];[v][bg]amix=inputs=2:duration=longest"
+    else:
+        # Sidechain compress optimizado para sensación documental (caída profunda, retorno gradual)
+        filter_str = (
+            f"[0:a]volume={voice_vol}[v];"
+            f"[1:a]volume={bg_vol},asidelp=threshold=0.03:ratio=12:attack=5:release=1000:sidechain=0[bg];"
+            f"[v][bg]amix=inputs=2:duration=longest"
+        )
+
+    run_cmd([
+        "ffmpeg", "-y",
+        "-i", voice_path,
+        "-i", bg_path,
+        "-filter_complex", filter_str,
+        "-ac", "2",
+        output_path
+    ])
+
+
+def merge_video_with_audio_hybrid(video_path: str, audio_path: str, segments: list, output_path: str):
+    """
+    ARQUITECTURA HÍBRIDA 2.0: Reconstruye el video manejando SOLAPAMIENTOS (Crosstalk)
+    agrupando segmentos que se pisan para evitar tartamudeo visual.
+    """
+    import tempfile
+    _log("Iniciando Fusión Híbrida PRO (Manejo de Crosstalk)...")
+    tmp_dir = tempfile.mkdtemp(prefix="hybrid_merge_")
+    chunk_list = os.path.join(tmp_dir, "chunks.txt")
+    
     try:
-        if free_flowing:
-            # ── Modo libre: concatenar en orden con pausas naturales cappadas ──
-            _log(f"Ensamblando audio libre ({len(segments)} segmentos)...")
-            for i, seg in enumerate(segments):
-                orig_start = seg["start"]
+        # 1. Agrupar segmentos que se solapan o están muy cerca
+        groups = []
+        if not segments: return
+        
+        current_group = [segments[0]]
+        for i in range(1, len(segments)):
+            prev_end = current_group[-1]["end"]
+            curr_start = segments[i]["start"]
+            
+            # Si el siguiente empieza antes de que el anterior termine (o < 0.1s de gap)
+            if curr_start < prev_end + 0.1:
+                current_group.append(segments[i])
+            else:
+                groups.append(current_group)
+                current_group = [segments[i]]
+        groups.append(current_group)
 
-                # Pausa antes de este segmento
-                if i == 0:
-                    leading = min(orig_start, MAX_FREE_GAP)
-                else:
-                    natural_gap = max(0.0, orig_start - segments[i - 1]["end"])
-                    leading = min(natural_gap, MAX_FREE_GAP)
-
-                if leading > 0.02:
-                    sil = os.path.join(tmp_dir, f"sil_{i:04d}.wav")
-                    _make_silence(sil, leading, sr)
-                    parts.append(sil)
-
-                adj = seg.get("tts_adjusted_path", "")
-                if adj and os.path.exists(adj):
-                    norm = os.path.join(tmp_dir, f"seg_{i:04d}.wav")
-                    run_cmd([
-                        "ffmpeg", "-y", "-i", adj,
-                        "-ar", str(sr), "-ac", "1",
-                        norm
-                    ])
-                    adj_dur = get_duration(norm) if os.path.exists(norm) else 0.0
-                    _log(f"  [{i+1:3d}/{len(segments)}] pausa={leading:.2f}s + audio={adj_dur:.2f}s  «{seg.get('text_es','')[:55]}»")
-                    parts.append(norm)
-                else:
-                    # Fallback: silencio por la duración original
-                    fallback_dur = seg["end"] - orig_start
-                    sil = os.path.join(tmp_dir, f"seg_sil_{i:04d}.wav")
-                    _make_silence(sil, fallback_dur, sr)
-                    _log(f"  [{i+1:3d}/{len(segments)}] pausa={leading:.2f}s + FALLBACK silencio={fallback_dur:.2f}s (sin TTS)")
-                    parts.append(sil)
-
-            concat_list = os.path.join(tmp_dir, "concat.txt")
-            with open(concat_list, "w") as f:
-                for p in parts:
-                    f.write(f"file '{p}'\n")
-
-            _log(f"Concatenando {len(parts)} partes → {output_wav}")
+        # 2. Procesar cada grupo como una unidad de video
+        processed_chunks = []
+        for i, group in enumerate(groups):
+            g_start = min(s["start"] for s in group)
+            g_end = max(s["end"] for s in group)
+            g_freeze = sum(s.get("freeze_duration", 0) for s in group)
+            
+            chunk_raw = os.path.join(tmp_dir, f"group_{i:04d}_raw.mp4")
+            chunk_final = os.path.join(tmp_dir, f"group_{i:04d}_final.mp4")
+            
+            # Recortar el bloque original del video
             run_cmd([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", concat_list,
-                "-ar", str(sr), "-ac", "1",
-                output_wav
-            ], "Ensamblando audio libre (free-flowing)")
-            final_dur = get_duration(output_wav) if os.path.exists(output_wav) else 0.0
-            _log(f"Audio libre ensamblado: {len(parts)} partes → {final_dur:.1f}s totales → {output_wav}")
-            return
-
-        # ── Modo sincronizado ────────────────────────────────────────────────
-        actual_pos = 0.0   # posición real acumulada en el audio doblado
-        for i, seg in enumerate(segments):
-            orig_start = seg["start"]
-            end        = seg["end"]
-
-            # Duración real del TTS ajustado (pre-computada en la generación TTS)
-            adj_path_for_dur = seg.get("tts_adjusted_path", "")
-            adj_dur = seg.get("tts_adjusted_dur") or (
-                get_duration(adj_path_for_dur)
-                if (adj_path_for_dur and os.path.exists(adj_path_for_dur))
-                else (end - orig_start)
-            )
-
-            # ── Gap-relative: insertar el silencio EXACTO del original entre segmentos ──
-            # El primer segmento se ancla al silencio de apertura del original.
-            # Los siguientes usan el gap real original (end[i-1] → start[i]).
-            # Así se preservan las pausas naturales sin generar silencios artificiales
-            # donde el original tenía voz continua.
-            if i == 0:
-                silence_needed = max(0.0, orig_start)
-            else:
-                prev_orig_end  = segments[i - 1]["end"]
-                orig_gap       = max(0.0, orig_start - prev_orig_end)
-                silence_needed = min(orig_gap, MAX_SEGMENT_GAP)
-
-            if silence_needed > 0.02:
-                sil = os.path.join(tmp_dir, f"sil_{i:04d}.wav")
-                _make_silence(sil, silence_needed, sr)
-                parts.append(sil)
-                actual_pos += silence_needed
-
-            # Audio TTS ajustado (o silencio si falló)
-            adj = seg.get("tts_adjusted_path", "")
-            if adj and os.path.exists(adj):
-                norm = os.path.join(tmp_dir, f"seg_{i:04d}.wav")
+                "ffmpeg", "-y", "-ss", str(g_start), "-to", str(g_end),
+                "-i", video_path, "-c", "copy", chunk_raw
+            ])
+            
+            if g_freeze > 0.05:
+                # Aplicar freeze acumulado al final de la interacción
+                _log(f"  Grupo {i+1}: Crosstalk detectado ({len(group)} segs). Aplicando Freeze acumulado de {g_freeze:.2f}s")
                 run_cmd([
-                    "ffmpeg", "-y", "-i", adj,
-                    "-ar", str(sr), "-ac", "1",
-                    norm
+                    "ffmpeg", "-y", "-i", chunk_raw,
+                    "-vf", f"tpad=stop_duration={g_freeze}:stop_mode=clone",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-an", chunk_final
                 ])
-                parts.append(norm)
-                actual_pos += get_duration(norm)   # rastrear duración REAL
             else:
-                seg_dur = end - orig_start
-                sil = os.path.join(tmp_dir, f"seg_sil_{i:04d}.wav")
-                _make_silence(sil, seg_dur, sr)
-                parts.append(sil)
-                actual_pos += seg_dur
+                run_cmd([
+                    "ffmpeg", "-y", "-i", chunk_raw,
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-an", chunk_final
+                ])
+            processed_chunks.append(chunk_final)
 
-        # Archivo de lista para concat
-        concat_list = os.path.join(tmp_dir, "concat.txt")
-        with open(concat_list, "w") as f:
-            for p in parts:
-                f.write(f"file '{p}'\n")
-
+        # 3. Concatenar y fusionar con audio paralelo
+        with open(chunk_list, "w") as f:
+            for c in processed_chunks:
+                f.write(f"file '{os.path.abspath(c)}'\n")
+        
+        merged_video = os.path.join(tmp_dir, "merged_video.mp4")
         run_cmd([
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-ar", str(sr), "-ac", "1",
-            output_wav
-        ], "Ensamblando audio final")
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", chunk_list,
+            "-c:v", "libx264", "-preset", "fast", "-crf", "22", merged_video
+        ])
+        
+        run_cmd([
+            "ffmpeg", "-y", "-i", merged_video, "-i", audio_path,
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-map", "0:v:0", "-map", "1:a:0",
+            output_path
+        ], "Fusión Final Híbrida 2.0")
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# ─── PASO 7: FUSIÓN VIDEO + AUDIO DOBLADO ────────────────────────────────────
-
-def merge_video_with_audio(video_path: str, audio_path: str, output_path: str):
-    """
-    Fusiona el video original con el audio doblado.
-
-    - Audio más corto que el video  → recorta el video al punto donde termina el audio.
-    - Audio más largo que el video  → extiende el video con pantalla negra al final
-                                      hasta que el audio termine.
-    """
-    video_dur = get_duration(video_path)
-    audio_dur = get_duration(audio_path)
-    diff = audio_dur - video_dur
-    _log(f"Fusión video+audio: video={video_dur:.1f}s  audio={audio_dur:.1f}s  diff={diff:+.1f}s")
-
-    if diff > 0.1:
-        # Audio más largo: extender video con pantalla negra
-        _log(f"Audio más largo que el video — extendiendo con pantalla negra ({diff:.2f}s)...")
-        probe_out = run_cmd([
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams", "-select_streams", "v:0",
-            video_path
-        ])
-        vstream = json.loads(probe_out)["streams"][0]
-        width  = vstream["width"]
-        height = vstream["height"]
-        fps_raw = vstream.get("r_frame_rate", "25/1")
-        num, den = fps_raw.split("/")
-        fps = float(num) / float(den)
-        _log(f"Resolución: {width}x{height} @ {fps:.2f}fps")
-
-        tmp_dir = tempfile.mkdtemp(prefix="qwen_merge_")
-        try:
-            black_clip = os.path.join(tmp_dir, "black.mp4")
-            _log(f"[1/3] Generando pantalla negra {width}x{height} ({diff:.2f}s)...")
-            run_cmd([
-                "ffmpeg", "-y",
-                "-f", "lavfi",
-                "-i", f"color=c=black:s={width}x{height}:r={fps:.4f}",
-                "-t", str(diff + 0.1),
-                "-an",
-                black_clip
-            ], f"Generando pantalla negra {width}x{height} ({diff:.2f}s)")
-
-            concat_list = os.path.join(tmp_dir, "concat.txt")
-            with open(concat_list, "w") as f:
-                f.write(f"file '{os.path.abspath(video_path)}'\n")
-                f.write(f"file '{os.path.abspath(black_clip)}'\n")
-
-            extended = os.path.join(tmp_dir, "extended.mp4")
-            _log(f"[2/3] Concatenando video original + pantalla negra...")
-            run_cmd([
-                "ffmpeg", "-y",
-                "-f", "concat", "-safe", "0",
-                "-i", concat_list,
-                "-c:v", "libx264", "-preset", "fast",
-                "-an",
-                extended
-            ], "Concatenando video + pantalla negra")
-
-            _log(f"[3/3] Fusionando video extendido + audio doblado → {output_path}")
-            run_cmd([
-                "ffmpeg", "-y",
-                "-i", extended,
-                "-i", audio_path,
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                output_path
-            ], "Fusionando video extendido + audio doblado")
-            _log(f"Fusión completa (ruta: pantalla negra) → {output_path}")
-
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    else:
-        # Audio más corto o igual: recortar video al final del audio
-        _log(f"Audio más corto que el video — recortando video a {audio_dur:.1f}s...")
-        _log(f"[1/1] Fusionando video (recortado a {audio_dur:.2f}s) + audio doblado → {output_path}")
-        run_cmd([
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-t", str(audio_dur),
-            "-c:v", "libx264", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "192k",
-            output_path
-        ], f"Fusionando video (recortado a {audio_dur:.2f}s) + audio doblado")
-        _log(f"Fusión completa (ruta: recorte) → {output_path}")
-
-
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
+    """CLI Entry Point (Modo básico para pruebas locales)"""
     print("=" * 65)
-    print("  EN -> ES Voice Dubbing Pipeline  |  Qwen3-TTS + Whisper")
+    print("  EN -> ES Voice Dubbing Pipeline  |  QAV PRO")
     print("=" * 65)
-
-    base = Path(__file__).parent
-    input_video   = base / INPUT_VIDEO
-    ref_audio     = base / REF_AUDIO
-    ref_text_file = base / REF_TEXT_FILE
-    out_dir       = base / OUTPUT_DIR
-
-    # Validar entradas
-    for p in [input_video, ref_audio, ref_text_file]:
-        if not p.exists():
-            print(f"ERROR: No encontrado: {p}")
-            sys.exit(1)
-
-    ref_text = ref_text_file.read_text(encoding="utf-8").strip()
-    os.makedirs(out_dir, exist_ok=True)
-
-    segments_json = out_dir / "segments.json"
-    tts_dir       = out_dir / "tts_segments"
-    tts_dir.mkdir(exist_ok=True)
-
-    steps = 7 if FREE_FLOWING else 6
-
-    # ── 1. Extraer audio ──────────────────────────────────────────────
-    print(f"\n[1/{steps}] Extrayendo audio...")
-    wav_path, mp3_path = extract_audio(str(input_video), str(out_dir))
-    total_dur = get_duration(wav_path)
-    print(f"  OK Duración: {total_dur:.1f}s  |  WAV: {wav_path}  |  MP3: {mp3_path}")
-
-    # ── 2. Transcribir ────────────────────────────────────────────────
-    print(f"\n[2/{steps}] Transcribiendo con Whisper '{WHISPER_MODEL}'...")
-    if segments_json.exists():
-        with open(segments_json, encoding="utf-8") as f:
-            segments = json.load(f)
-        print(f"  -> Cargando {len(segments)} segmentos cacheados de {segments_json.name}")
-    else:
-        segments = transcribe(wav_path, WHISPER_MODEL)
-        with open(segments_json, "w", encoding="utf-8") as f:
-            json.dump(segments, f, ensure_ascii=False, indent=2)
-    print(f"  OK {len(segments)} segmentos")
-
-    # ── 3. Chunk + Traducir (orden: chunk primero para traducción contextual) ──
-    # Si el checkpoint ya tiene chunks traducidos, saltar ambos pasos.
-    already_done = all(s.get("_chunked") and s.get("text_es") for s in segments)
-    if already_done:
-        print(f"\n[3/{steps}] Chunks y traducción cacheados ({len(segments)} chunks)")
-    else:
-        # 3a. Agrupar segmentos en chunks con texto EN bien puntuado
-        old_count = len(segments)
-        segments  = chunk_by_natural_pause(segments)
-        print(f"\n[3/{steps}] Chunking: {old_count} segmentos → {len(segments)} chunks")
-        for stale in list(tts_dir.glob("seg_*_adj.wav")) + list(tts_dir.glob("seg_*_raw.wav")):
-            stale.unlink(missing_ok=True)
-
-        # 3b. Traducir cada chunk completo (párrafo coherente → mejor traducción)
-        print(f"  -> Traduciendo {len(segments)} chunks EN->ES (texto completo por chunk)...")
-        segments = translate_segments(segments)
-        with open(segments_json, "w", encoding="utf-8") as f:
-            json.dump(segments, f, ensure_ascii=False, indent=2)
-    print("  OK")
-
-    # ── 4. Generar TTS (local GPU) ────────────────────────────────────
-    print(f"\n[4/{steps}] Generando TTS con Qwen3-TTS LOCAL...")
-    print(f"       Modelo: {TTS_LOCAL_MODEL}  |  Voz: {ref_audio.name}")
-
-    # Verificar qwen-tts
-    try:
-        import qwen_tts  # noqa: F401
-    except ImportError:
-        print("\n  ERROR: qwen-tts no instalado. Ejecuta: pip install -U qwen-tts")
-        sys.exit(1)
-
-    # Eliminar cache TTS previo de la API remota (archivos de 0 bytes o inválidos)
-    for f in tts_dir.glob("seg_*_adj.wav"):
-        if f.stat().st_size < 1000:   # menos de 1KB = archivo vacío/inválido
-            f.unlink()
-            raw = tts_dir / f.name.replace("_adj", "_raw")
-            if raw.exists():
-                raw.unlink()
-
-    tts_model = load_tts_model()
-
-    segments = generate_tts_local(
-        model=tts_model,
-        segments=segments,
-        ref_audio_path=str(ref_audio),
-        ref_text=ref_text,
-        tts_dir=str(tts_dir),
-        language=TGT_LANGUAGE,
-    )
-
-    # Guardar paths actualizados
-    with open(segments_json, "w", encoding="utf-8") as f:
-        json.dump(segments, f, ensure_ascii=False, indent=2)
-    print("  OK TTS completo")
-
-    # ── 5. Ensamblar ─────────────────────────────────────────────────
-    print(f"\n[5/{steps}] Ensamblando audio final...")
-    final_wav = str(out_dir / "final_es.wav")
-    build_final_audio(segments, total_dur, final_wav)
-    print(f"  OK WAV: {final_wav}")
-
-    # ── 6. Exportar MP3 ───────────────────────────────────────────────
-    print(f"\n[6/{steps}] Exportando MP3...")
-    final_mp3 = str(out_dir / "final_es.mp3")
-    run_cmd([
-        "ffmpeg", "-y", "-i", final_wav,
-        "-q:a", "2", "-ar", "44100",
-        final_mp3
-    ], "Convirtiendo a MP3")
-    print(f"  OK MP3: {final_mp3}")
-
-    # ── 7. Fusionar video + audio doblado ─────────────────────────────
-    if FREE_FLOWING:
-        print(f"\n[7/{steps}] Fusionando video + audio doblado...")
-        final_dubbed_mp4 = str(out_dir / "final_dubbed.mp4")
-        merge_video_with_audio(str(input_video), final_wav, final_dubbed_mp4)
-        print(f"  OK MP4 doblado: {final_dubbed_mp4}")
-
-    print("\n" + "=" * 65)
-    print("  LISTO")
-    print(f"  -> {final_mp3}")
-    if FREE_FLOWING:
-        print(f"  -> {final_dubbed_mp4}")
-    print("=" * 65)
-
+    print("Use app.py para la experiencia completa con UI.")
 
 if __name__ == "__main__":
     main()

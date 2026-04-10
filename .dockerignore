@@ -25,3 +25,6 @@ __pycache__/
 # Archivos WAV de prueba/output (excluir, pero NO voice_reference/)
 output/*.wav
 output/tts_segments/
+
+# Exclude local retalking directory
+video-retalking/

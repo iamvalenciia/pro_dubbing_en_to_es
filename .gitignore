@@ -59,3 +59,8 @@ shorts/short_video/
 
 # Ignore other potential zip files from archives
 *.zip
+
+#model
+Qwen3.5-9B/
+
+video-retalking/

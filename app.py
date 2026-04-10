@@ -103,11 +103,11 @@ from pipeline import (
     chunk_by_natural_pause,
     generate_tts_local,
     build_final_audio,
-    merge_video_with_audio,
     get_duration,
     run_cmd,
     FREE_FLOWING,
     _log,
+    transcribe_whisperx,
 )
 from subtitle_pipeline import generate_subtitled_video
 from shorts_pipeline import (
@@ -628,13 +628,11 @@ def startup():
     print(f"  TTS model         : {TTS_LOCAL_MODEL}")
     print(f"  TTS batch size    : {TTS_BATCH_SIZE}")
 
-    # ── Cargar Whisper ────────────────────────────────────────────
-    print(f"\n  [startup] Cargando Whisper '{WHISPER_MODEL}' en GPU (float16)...")
-    from faster_whisper import WhisperModel
-    WHISPER_INSTANCE = WhisperModel(
-        WHISPER_MODEL, device="cuda", compute_type="float16"
-    )
-    print("  [startup] OK Whisper listo")
+    # ── WhisperX: no precargamos — se carga/libera en cada llamada ────
+    # WhisperX gestiona su propio ciclo de vida del modelo para liberar VRAM
+    # después de la transcripción + forced alignment, dejando espacio al TTS.
+    WHISPER_INSTANCE = None  # ya no se usa; se llama a transcribe_whisperx()
+    print("  [startup] WhisperX se cargará bajo demanda (forced alignment)")
 
     # ── Cargar Qwen3-TTS ─────────────────────────────────────────
     import torch
@@ -710,309 +708,275 @@ def _compute_segs_from_json(segments_json) -> str | None:
         return None
 
 
-def run_dubbing(audio_file, progress=gr.Progress(track_tqdm=False)):
+
+
+def run_dubbing_phase1(audio_file, hf_token="", progress=gr.Progress(track_tqdm=False)):
     """
-    Pipeline completo con sistema de caché/checkpoint.
-    Cada job se guarda en cache/<hash>/ y se puede reanudar si falla.
+    FASE A: Análisis de Locutores y Extracción de Referencias.
+    1. Isolar voz (Demucs).
+    2. Transcribir y Diarizar (WhisperX + Pyannote).
+    3. Extraer monólogos limpios (extract_speaker_references).
     """
-    if audio_file is None:
-        yield None, "Por favor sube un archivo de audio / Please upload an audio file.", None
+    if not audio_file:
+        yield None, "Sube un archivo.", None
         return
 
-    # ── Calcular hash del archivo e inicializar job dir ───────────
-    print(f"\n{'='*55}")
     file_hash = get_file_hash(audio_file)
-    job_dir   = CACHE_DIR / file_hash
+    job_dir = CACHE_DIR / file_hash
     job_dir.mkdir(parents=True, exist_ok=True)
-
-    tts_dir        = job_dir / "tts"
-    segments_json  = job_dir / "segments.json"
-    final_mp3_path = job_dir / "final_es.mp3"
-    final_wav_path = job_dir / "final_es.wav"
-    wav_path       = job_dir / "input.wav"
-
-    print(f"  JOB INICIO")
-    print(f"  Input     : {audio_file}")
-    print(f"  Hash      : {file_hash}")
-    print(f"  Job dir   : {job_dir}")
-    print(f"  WAV existe: {wav_path.exists()}")
-    print(f"  Segs JSON : {segments_json.exists()}")
-    print(f"  Final MP3 : {final_mp3_path.exists()}")
+    
+    wav_path = job_dir / "input.wav"
+    vocals_path = job_dir / "vocals.wav"
+    background_path = job_dir / "background.wav"
+    segments_json = job_dir / "segments.json"
+    ref_dir = job_dir / "references"
 
     try:
-        # ── CACHE HIT TOTAL: resultado final ya existe ────────────
-        if final_mp3_path.exists():
-            total_dur = get_duration(str(wav_path)) if wav_path.exists() else 0
-            m, s = divmod(int(total_dur), 60)
-            print(f"  CACHE HIT COMPLETO: devolviendo resultado previo")
-            segs_content = _compute_segs_from_json(segments_json)
-            yield str(final_mp3_path), (
-                f"[CACHE] Job completado anteriormente — {m}m {s}s | hash={file_hash}"
-            ), segs_content
-            return
+        if hf_token:
+            os.environ["HF_TOKEN"] = hf_token.strip()
 
-        # ── PASO 1: Extraer audio ─────────────────────────────────
-        if wav_path.exists():
-            print(f"\n  [1/5] WAV ya en cache ({wav_path.stat().st_size/1e6:.1f} MB), saltando...")
-            progress(0.05, desc="[1/5] WAV en cache, saltando extracción...")
-        else:
-            progress(0.05, desc="[1/5] Extrayendo audio WAV...")
-            print(f"\n  [1/5] Extrayendo audio WAV 16kHz mono...")
+        # 1. Extraer audio base
+        if not wav_path.exists():
+            progress(0.05, desc="Extrayendo audio...")
             extract_audio(audio_file, str(job_dir))
-            print(f"  -> WAV guardado: {wav_path} ({wav_path.stat().st_size/1e6:.1f} MB)")
 
-        total_dur = get_duration(str(wav_path))
-        m_dur, s_dur = divmod(int(total_dur), 60)
-        print(f"  -> Duración total: {total_dur:.1f}s ({m_dur}m {s_dur}s)")
+        # 2. Isolar con Demucs
+        if not (vocals_path.exists() and background_path.exists()):
+            progress(0.10, desc="Aislando voz (Demucs)...")
+            demucs_temp = job_dir / "demucs_tmp"
+            v_isolated, msg = run_demucs_isolation(str(wav_path), str(demucs_temp))
+            if v_isolated and Path(v_isolated).exists():
+                shutil.copy2(v_isolated, vocals_path)
+                no_vocals = demucs_temp / "no_vocals.wav"
+                if no_vocals.exists():
+                    shutil.copy2(no_vocals, background_path)
+                shutil.rmtree(demucs_temp, ignore_errors=True)
+            else:
+                shutil.copy2(wav_path, vocals_path)
 
-        # ── PASO 2: Transcribir ───────────────────────────────────
-        if segments_json.exists():
-            print(f"\n  [2-3/5] CHECKPOINT: cargando segmentos de {segments_json.name}...")
-            progress(0.20, desc="[2-3/5] Cargando segmentos del checkpoint...")
-            with open(segments_json, encoding="utf-8") as f:
-                segments = json.load(f)
-            print(f"  -> {len(segments)} bloques cargados")
-        else:
-            # Transcribir con Whisper
-            progress(0.15, desc="[2/5] Transcribiendo con Whisper...")
-            print(f"\n  [2/5] Transcribiendo con Whisper '{WHISPER_MODEL}'...")
-            print(f"  -> Iniciando transcripción sobre {wav_path.name}...")
-            sys.stdout.flush()
-
-            diarization_file = job_dir / "diarization.json"
-            diarization_data = []
-            if diarization_file.exists():
-                try:
-                    with open(diarization_file, "r", encoding="utf-8") as f:
-                        diarization_data = json.load(f).get("results", [])
-                except Exception:
-                    pass
-
-            segments_iter, info = WHISPER_INSTANCE.transcribe(
-                str(wav_path),
-                language="en",
-                beam_size=5,
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 300},
+        # 3. Transcribir + Diarizar con WhisperX
+        if not segments_json.exists():
+            progress(0.30, desc="Transcribiendo y Diarizando (WhisperX)...")
+            from pipeline import transcribe_whisperx, detect_emotions_batch
+            
+            # Transcription + Diarization
+            segments = transcribe_whisperx(
+                wav_path=str(vocals_path),
+                model_size=WHISPER_MODEL,
+                hf_token=os.environ.get("HF_TOKEN"),
+                device="cuda",
             )
-            segments = []
-            for s in segments_iter:
-                if not s.text.strip():
-                    continue
-                    
-                start = round(s.start, 3)
-                end = round(s.end, 3)
-                
-                speaker = "SPEAKER_UNKNOWN"
-                if diarization_data:
-                    max_overlap = 0.0
-                    for d in diarization_data:
-                        overlap = max(0, min(end, d["end"]) - max(start, d["start"]))
-                        if overlap > max_overlap:
-                            max_overlap = overlap
-                            speaker = d["speaker"]
-                            
-                seg = {"start": start, "end": end, "text": s.text.strip(), "speaker": speaker}
-                segments.append(seg)
-                _log(f"  Whisper [{start:6.1f}s→{end:5.1f}s] [{speaker}] {s.text.strip()[:60]}")
-            if not segments:
-                yield None, "No se detectó habla en el audio / No speech detected.", None
-                return
-
-            print(f"  -> {len(segments)} segmentos detectados")
-            print(f"  -> Idioma: {info.language} ({info.language_probability:.0%})")
-            print(f"  -> Primer seg : [{segments[0]['start']:.1f}s - {segments[0]['end']:.1f}s]"
-                  f" '{segments[0]['text'][:70]}'")
-            print(f"  -> Ultimo seg : [{segments[-1]['start']:.1f}s - {segments[-1]['end']:.1f}s]"
-                  f" '{segments[-1]['text'][:70]}'")
-
-        # ── PASO 3: Chunk primero, luego traducir (orden correcto) ──────
-        # Si el checkpoint ya tiene chunks con traducción lista, saltar todo.
-        tts_dir.mkdir(exist_ok=True)
-        already_done = segments and all(
-            s.get("_chunked") and s.get("text_es") for s in segments
-        )
-
-        if already_done:
-            progress(0.35, desc="[3/5] Chunks y traducción cacheados...")
-            print(f"\n  [3/5] Chunks y traducción cacheados ({len(segments)} chunks)")
-        else:
-            # 3a. Chunk: agrupa segmentos en párrafos con texto EN bien puntuado.
-            # Debe ir ANTES de la traducción para que el traductor reciba párrafos
-            # completos en lugar de frases fragmentadas (mejora calidad de traducción).
-            old_count = len(segments)
-            segments  = chunk_by_natural_pause(segments)
-            new_count = len(segments)
-            print(f"\n  [3/5] Chunks: {old_count} segs → {new_count} chunks "
-                  f"(~{old_count // max(new_count, 1)} segs/chunk)")
-            # Borrar TTS obsoleto si cambió el número de chunks
-            for stale in list(tts_dir.glob("seg_*_adj.wav")) + list(tts_dir.glob("seg_*_raw.wav")):
-                stale.unlink(missing_ok=True)
-
-            # 3b. Traducir cada chunk como unidad completa → traducción contextual.
-            n_pending = sum(1 for s in segments if not s.get("text_es"))
-            if n_pending:
-                progress(0.30, desc=f"[3/5] Traduciendo {n_pending} chunks EN->ES...")
-                print(f"  -> Traduciendo {n_pending} chunks (párrafo completo por chunk)...")
-                segments = translate_segments(segments)
-
-            with open(segments_json, "w", encoding="utf-8") as f:
-                json.dump(segments, f, ensure_ascii=False, indent=2)
-            print(f"  -> CHECKPOINT GUARDADO: {segments_json}")
-
-        # ── PASO 4: TTS ───────────────────────────────────────────
-        tts_dir.mkdir(exist_ok=True)
-
-        # pipeline.py ya revisa si seg_XXXX_adj.wav existe y lo salta
-        done_tts  = sum(1 for i in range(len(segments))
-                        if (tts_dir / f"seg_{i:04d}_adj.wav").exists())
-        total_seg = len(segments)
-        pend_tts  = total_seg - done_tts
-
-        print(f"\n  [4/5] TTS estado: {done_tts}/{total_seg} segmentos ya generados en cache")
-
-        if pend_tts > 0:
-            progress(0.45, desc=f"[4/5] TTS: {done_tts} en cache, generando {pend_tts}...")
-            print(f"  -> Pendientes : {pend_tts} segmentos nuevos a generar")
-            print(f"  -> ref_audio  : {REF_AUDIO.name}")
-            print(f"  -> ref_text   : {REF_TEXT[:60]}...")
-            print(f"  -> batch_size : {TTS_BATCH_SIZE}")
-            print(f"  -> tts_dir    : {tts_dir}")
-            print(f"  -> Llamando model.create_voice_clone_prompt() ...")
-            sys.stdout.flush()
-
-            def _tts_progress(done: int, total: int) -> None:
-                frac = 0.45 + 0.40 * (done / max(total, 1))
-                progress(frac, desc=f"[4/5] TTS: {done}/{total} chunks generados...")
-
-            # Load speaker references from voice_reference folder if available
-            speaker_refs = {}
-            ref_dir = BASE_DIR / "voice_reference"
-            if ref_dir.exists():
-                for spk_wav in ref_dir.glob("*.wav"):
-                    spk_name = spk_wav.stem
-                    spk_txt = ref_dir / f"{spk_name}.txt"
-                    if spk_txt.exists():
-                        speaker_refs[spk_name] = {
-                            "audio": str(spk_wav),
-                            "text": spk_txt.read_text(encoding="utf-8").strip()
-                        }
-
-            segments = generate_tts_local(
-                model=TTS_MODEL_INSTANCE,
+            
+            # 3.5 Análisis de Prosodia (Emociones)
+            progress(0.60, desc="Analizando Prosodia (Detección de Emociones)...")
+            segments = detect_emotions_batch(
                 segments=segments,
-                ref_audio_path=str(REF_AUDIO),
-                ref_text=REF_TEXT,
-                tts_dir=str(tts_dir),
-                language="Spanish",
-                batch_size=TTS_BATCH_SIZE,
-                progress_cb=_tts_progress,
-                checkpoint_path=str(segments_json),
-                speaker_references=speaker_refs,
+                audio_path=str(vocals_path)
             )
-
-            # Actualizar checkpoint con tts_adjusted_path
+            
             with open(segments_json, "w", encoding="utf-8") as f:
                 json.dump(segments, f, ensure_ascii=False, indent=2)
-
-            done_after = sum(1 for i in range(len(segments))
-                             if (tts_dir / f"seg_{i:04d}_adj.wav").exists())
-            print(f"\n  -> TTS completados: {done_after}/{total_seg} segmentos")
-
         else:
-            print(f"  -> CACHE HIT TTS completo: todos los archivos adj.wav existen")
-            progress(0.88, desc="[4/5] TTS completo (cache)...")
-            for i, seg in enumerate(segments):
-                adj = tts_dir / f"seg_{i:04d}_adj.wav"
-                if adj.exists():
-                    seg["tts_adjusted_path"] = str(adj)
-                    if not seg.get("tts_adjusted_dur"):
-                        seg["tts_adjusted_dur"] = get_duration(str(adj))
+            with open(segments_json, "r", encoding="utf-8") as f:
+                segments = json.load(f)
 
-        segs_content = _compute_segs_from_json(segments_json)
-        if segs_content:
-            yield None, "TTS completado — ensamblando audio...", segs_content
-
-        # ── PASO 5: Ensamblar y exportar MP3 ─────────────────────
-        total_pasos = "6" if FREE_FLOWING else "5"
-        progress(0.88, desc=f"[5/{total_pasos}] Ensamblando y exportando MP3...")
-        print(f"\n  [5/{total_pasos}] Ensamblando audio final...")
-        print(f"  -> WAV de salida: {final_wav_path}")
-        build_final_audio(segments, total_dur, str(final_wav_path))
-
-        print(f"  -> Convirtiendo a MP3: {final_mp3_path}")
-        run_cmd(["ffmpeg", "-y", "-i", str(final_wav_path),
-                 "-q:a", "2", "-ar", "44100", str(final_mp3_path)])
-
-        # ── PASO 6: Fusionar video + audio doblado (FREE_FLOWING) ──
-        final_dubbed_mp4_path = None
-        if FREE_FLOWING:
-            input_ext = Path(audio_file).suffix.lower()
-            if input_ext in {".mp4", ".mkv", ".avi", ".mov", ".webm"}:
-                progress(0.95, desc=f"[6/{total_pasos}] Fusionando video + audio...")
-                print(f"\n  [6/{total_pasos}] Fusionando video + audio doblado...")
-                final_dubbed_mp4_path = job_dir / "final_dubbed.mp4"
-                if not final_dubbed_mp4_path.exists():
-                    merge_video_with_audio(
-                        audio_file, str(final_wav_path), str(final_dubbed_mp4_path)
-                    )
-                print(f"  -> MP4 doblado: {final_dubbed_mp4_path}")
-
-        progress(1.0, desc="Listo / Done!")
-
-        status = (
-            f"Doblaje completado — {m_dur}m {s_dur}s | "
-            f"{total_seg} segmentos | cache: {file_hash}"
+        # 4. Cazador de Referencias
+        progress(0.70, desc="Cazador de Referencias (Extrayendo voces)...")
+        from pipeline import extract_speaker_references
+        speaker_refs = extract_speaker_references(
+            wav_path=str(vocals_path),
+            segments=segments,
+            output_dir=str(ref_dir),
+            min_continuous_dur=5.0, # Umbral estricto
+            buffer_sec=1.0,         # Colchón de no-crosstalk
         )
-        if final_dubbed_mp4_path:
-            status += f" | MP4: {final_dubbed_mp4_path}"
-        print(f"\n  DONE: {status}")
-        print(f"{'='*55}\n")
-        segs_content = _compute_segs_from_json(segments_json)
-        yield str(final_mp3_path), status, segs_content
+        
+        # Formatear resultados para la UI
+        # header: ["Speaker", "Vista Previa Audio", "Texto Ref"]
+        ui_rows = []
+        for spk, ref in speaker_refs.items():
+            ui_rows.append([spk, ref["audio"], ref["text"]])
+
+        yield file_hash, "Análisis completado. Por favor, valida los locutores arriba.", ui_rows
 
     except Exception:
-        tb = traceback.format_exc()
-        print(f"\n  [ERROR CRITICO]\n{tb}")
-        print(f"  Progreso guardado en: {job_dir}")
-        print(f"  Al reiniciar, el job reanuda desde el ultimo checkpoint.")
-        yield None, f"Error (progreso guardado en cache/{file_hash}):\n{tb[-1500:]}", None
+        yield None, f"Error Fase A: {traceback.format_exc()[-1000:]}", None
 
 
-def run_dubbing_test(audio_file, progress=gr.Progress(track_tqdm=False)):
-    """Dobla solo los primeros 5 minutos del audio para prueba rápida."""
+def run_dubbing_phase2(file_hash, progress=gr.Progress(track_tqdm=False)):
+    """
+    FASE B: Traducción, TTS y Mezcla Final.
+    Usa las referencias extraídas en la Fase A.
+    """
+    if not file_hash:
+        yield None, "Hash de trabajo no válido.", None
+        return
+
+    job_dir = CACHE_DIR / file_hash
+    segments_json = job_dir / "segments.json"
+    wav_path = job_dir / "input.wav"
+    vocals_path = job_dir / "vocals.wav"
+    background_path = job_dir / "background.wav"
+    final_wav_path = job_dir / "final_es.wav"
+    final_mixed_wav = job_dir / "final_es_mixed.wav"
+    final_mp3_path = job_dir / "final_es.mp3"
+    ref_dir = job_dir / "references"
+    tts_dir = job_dir / "tts"
+    
+    try:
+        with open(segments_json, "r", encoding="utf-8") as f:
+            segments = json.load(f)
+        
+        total_dur = get_duration(str(wav_path))
+        
+        # 1. Cargar referencias
+        speaker_refs = {}
+        for ref_wav in ref_dir.glob("ref_*.wav"):
+            spk = ref_wav.stem.replace("ref_", "")
+            txt_file = ref_dir / f"ref_{spk}.txt"
+            speaker_refs[spk] = {
+                "audio": str(ref_wav),
+                "text": txt_file.read_text(encoding="utf-8") if txt_file.exists() else ""
+            }
+
+        # 2. Traducción
+        progress(0.10, desc="Adaptando guion (Qwen3.5-9B)...")
+        from pipeline import translate_segments_qwen
+        # Qwen ahora tiene el prompt de preservar speaker
+        segments = translate_segments_qwen(segments, progress_cb=None)
+        with open(segments_json, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=2)
+
+        # 3. TTS
+        tts_dir.mkdir(exist_ok=True)
+        progress(0.40, desc="Generando voces (Qwen3-TTS)...")
+        global TTS_MODEL_INSTANCE
+        if not TTS_MODEL_INSTANCE:
+            from pipeline import load_tts_model
+            TTS_MODEL_INSTANCE = load_tts_model()
+            
+        segments = generate_tts_local(
+            model=TTS_MODEL_INSTANCE,
+            segments=segments,
+            ref_audio_path=str(REF_AUDIO), # Fallback
+            ref_text=REF_TEXT,
+            tts_dir=str(tts_dir),
+            language="Spanish",
+            speaker_references=speaker_refs,
+            progress_cb=lambda d, t: progress(0.40 + 0.40*(d/t), desc=f"TTS: {d}/{t}...")
+        )
+        with open(segments_json, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=2)
+
+        # 4. Mezcla
+        progress(0.90, desc="Mezcla final con Ducking...")
+        build_final_audio(segments, total_dur, str(final_wav_path))
+        
+        if background_path.exists():
+            from pipeline import mix_voice_with_background
+            # Dubbing natural con Ducking activo (Balance 80/20)
+            mix_voice_with_background(
+                str(final_wav_path), str(background_path), str(final_mixed_wav),
+                voice_vol=1.0, bg_vol=0.25, ducking=True
+            )
+        else:
+            shutil.copy2(final_wav_path, final_mixed_wav)
+
+        run_cmd(["ffmpeg", "-y", "-i", str(final_mixed_wav),
+                 "-q:a", "2", "-ar", "44100", str(final_mp3_path)])
+
+        # 5. Fusión Híbrida de Video (Si aplica)
+        input_ext = Path(audio_file).suffix.lower()
+        final_file_to_yield = str(final_mp3_path)
+        status_msg = "Doblaje completado exitosamente."
+        
+        if input_ext in {".mp4", ".mkv", ".avi", ".mov", ".webm"}:
+            progress(0.95, desc="Fusión Híbrida: Sincronizando Video (Freeze/Stretch)...")
+            final_mp4 = job_dir / "final_es_hybrid.mp4"
+            from pipeline import merge_video_with_audio_hybrid
+            merge_video_with_audio_hybrid(
+                video_path=str(audio_file),
+                audio_path=str(final_mixed_wav),
+                segments=segments,
+                output_path=str(final_mp4)
+            )
+            final_file_to_yield = str(final_mp4)
+            status_msg = f"Doblaje Híbrido completado: {final_mp4.name}"
+
+        progress(1.0, desc="¡LISTO!")
+        segs_content = _compute_segs_from_json(segments_json)
+        yield final_file_to_yield, status_msg, segs_content
+
+    except Exception:
+        yield None, f"Error Fase B: {traceback.format_exc()[-1000:]}", None
+
+
+def run_dubbing_unified(audio_file, hf_token="", progress=gr.Progress(track_tqdm=False)):
+    """
+    Workflow unificado: Fase 1 (Análisis) + Fase 2 (Doblaje).
+    """
+    file_hash = None
+    ui_rows = []
+    
+    # ── Fase 1: Análisis ──
+    for res in run_dubbing_phase1(audio_file, hf_token, progress=progress):
+        file_hash, status, ui_rows = res
+        yield None, status, ui_rows, None
+        
+    if not file_hash:
+        return
+
+    # ── Fase 2: Doblaje ──
+    for res in run_dubbing_phase2(file_hash, progress=progress):
+        final_file, status, segs_content = res
+        # Mantenemos las ui_rows de Phase 1 para que no desaparezca la tabla de locutores
+        yield final_file, status, ui_rows, segs_content
+
+
+def run_dubbing_unified_test(audio_file, hf_token="", progress=gr.Progress(track_tqdm=False)):
+    """Doblaje de prueba: primeros 180 segundos (3 min)."""
     if audio_file is None:
         yield None, "Por favor sube un archivo de audio.", None
         return
+        
     import tempfile
     import subprocess as _sp
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    
+    # Determinar extensión original
+    suffix = Path(audio_file).suffix.lower()
+    if not suffix or suffix not in {".mp4", ".mkv", ".avi", ".mov", ".webm", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus"}:
+        suffix = ".mp3"
+        
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp.close()
+    
     try:
+        progress(0, desc="Recortando audio a 3 minutos para prueba rápida...")
+        # Usamos -c copy para que sea instantáneo si es posible, 
+        # o re-encodificamos mínimamente si es necesario.
         _sp.run(
-            ["ffmpeg", "-y", "-t", "300", "-i", audio_file,
-             "-c:a", "libmp3lame", "-q:a", "2", tmp.name],
+            ["ffmpeg", "-y", "-t", "180", "-i", audio_file,
+             "-c", "copy", tmp.name],
             check=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
         )
-        
-        # Copiar diarization si existe en la cache original
-        orig_hash = get_file_hash(audio_file)
-        orig_diarization = CACHE_DIR / orig_hash / "diarization.json"
-        
-        test_hash = get_file_hash(tmp.name)
-        test_dir = CACHE_DIR / test_hash
-        test_dir.mkdir(parents=True, exist_ok=True)
-        
-        if orig_diarization.exists():
-            import shutil
-            shutil.copy(orig_diarization, test_dir / "diarization.json")
-            
-        yield from run_dubbing(tmp.name, progress=progress)
+        yield from run_dubbing_unified(tmp.name, hf_token, progress=progress)
+    except Exception as e:
+        # Si falla el copy (por codecs raros), intentamos con encoding simple
+        try:
+            _sp.run(
+                ["ffmpeg", "-y", "-t", "180", "-i", audio_file, tmp.name],
+                check=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            yield from run_dubbing_unified(tmp.name, hf_token, progress=progress)
+        except Exception as e2:
+            yield None, f"Error preparando prueba de 3 min: {e2}", []
     finally:
         try:
+            import os
             os.unlink(tmp.name)
         except Exception:
             pass
+
 
 
 # ─── Interfaz Gradio ──────────────────────────────────────────────────────────
@@ -1354,6 +1318,7 @@ def _run_subtitles(
     video_file, audio_file, test_seconds,
     contrast=0, brightness=0, sharpness=0,
     do_orig_audio=False, orig_audio_path=None, orig_audio_db=-25,
+    do_lipsync=False,
     progress=gr.Progress(track_tqdm=False)
 ):
     if video_file is None:
@@ -1415,6 +1380,7 @@ def _run_subtitles(
             do_orig_audio=do_orig_audio,
             orig_audio_path=orig_path,
             orig_audio_db=orig_audio_db,
+            do_lipsync=do_lipsync,
         )
 
         progress(1.0, desc="Listo!")
@@ -1439,23 +1405,23 @@ def _run_subtitles(
 
 def run_subtitles_full(
     video_file, audio_file, contrast, brightness, sharpness,
-    do_orig_audio, orig_audio_file, orig_audio_db,
+    do_orig_audio, orig_audio_file, orig_audio_db, do_lipsync,
     progress=gr.Progress(track_tqdm=False)
 ):
     return _run_subtitles(
         video_file, audio_file, None, contrast, brightness, sharpness,
-        do_orig_audio, orig_audio_file, orig_audio_db, progress=progress
+        do_orig_audio, orig_audio_file, orig_audio_db, do_lipsync, progress=progress
     )
 
 
 def run_subtitles_test(
     video_file, audio_file, contrast, brightness, sharpness,
-    do_orig_audio, orig_audio_file, orig_audio_db,
+    do_orig_audio, orig_audio_file, orig_audio_db, do_lipsync,
     progress=gr.Progress(track_tqdm=False)
 ):
     return _run_subtitles(
         video_file, audio_file, 20, contrast, brightness, sharpness,
-        do_orig_audio, orig_audio_file, orig_audio_db, progress=progress
+        do_orig_audio, orig_audio_file, orig_audio_db, do_lipsync, progress=progress
     )
 
 
@@ -1794,6 +1760,56 @@ def preview_short_crop_frame(
 
 
 
+def run_demucs_isolation(audio_file, dest_folder, progress=gr.Progress()):
+    if not audio_file:
+        return None, "Sube un archivo de audio o video."
+    
+    dest_path = Path(dest_folder).resolve() if dest_folder else BASE_DIR / "aislamiento_voz"
+    dest_path.mkdir(parents=True, exist_ok=True)
+    
+    output_wav = dest_path / "voz_limpia.wav"
+    
+    import tempfile
+    import subprocess
+    import shutil
+    
+    progress(0.1, desc="Inicializando Demucs...")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # En Windows demucs.exe está en Scripts/demucs
+        cmd = [
+            "demucs",
+            "-n", "htdemucs",
+            "--two-stems", "vocals",
+            "-o", tmpdir,
+            audio_file
+        ]
+        try:
+            progress(0.3, desc="Ejecutando modelo Demucs (esto puede tardar unos minutos)...")
+            result = subprocess.run(cmd, capture_output=True, text=True, shell=(os.name == "nt"))
+            if result.returncode != 0:
+                err_msg = result.stderr or result.stdout
+                return None, f"Error en Demucs: {err_msg[-1000:]}"
+                
+            vocals_files = list(Path(tmpdir).rglob("vocals.wav"))
+            if not vocals_files:
+                return None, "Error: No se encontró el archivo extraído por Demucs."
+
+            progress(0.9, desc="Copiando archivos a la carpeta destino...")
+            # Copiar vocals.wav -> voz_limpia.wav (para retrocompatibilidad)
+            shutil.copy2(vocals_files[0], output_wav)
+            
+            # Buscar y copiar no_vocals.wav si existe (para mezcla de ambiente)
+            no_vocals_files = list(Path(tmpdir).rglob("no_vocals.wav"))
+            if no_vocals_files:
+                bg_out = dest_path / "no_vocals.wav"
+                shutil.copy2(no_vocals_files[0], bg_out)
+            
+            return str(output_wav), f"Éxito! Archivos guardados en: {dest_path}"
+        except Exception as e:
+            return None, f"Excepción durante extracción: {str(e)}"
+
+
 def build_ui(init=None):  # noqa: C901
     # init: dict of pre-computed values to avoid firing callables on page load
     if init is None:
@@ -1837,6 +1853,7 @@ def build_ui(init=None):  # noqa: C901
                 nav_doblaje_btn   = gr.Button("Doblaje EN → ES",       elem_classes=["nav-btn"])
                 nav_subtitulos_btn = gr.Button("Subtitulos y Mejoras",  elem_classes=["nav-btn"])
                 nav_shorts_btn    = gr.Button("Shorts",                elem_classes=["nav-btn"])
+
 
                 gr.Markdown("---")
                 with gr.Accordion("Guia RunPod", open=False) as runpod_accordion:
@@ -2101,26 +2118,52 @@ def build_ui(init=None):  # noqa: C901
 
                     # ── TAB 2: Doblaje EN→ES ──────────────────────────────
                     with gr.Tab("Doblaje EN → ES", id=2):
+                        gr.HTML("""
+                            <div style="background: #f8f9fa; border-left: 5px solid #000000; padding: 15px; margin-bottom: 20px; border-radius: 4px;">
+                                <p style="margin: 0; color: #333; font-size: 1.05em;">
+                                    <strong>🚀 Aislamiento de Voz Inteligente:</strong> He integrado <b>Demucs</b> directamente en el flujo principal. 
+                                    Cada vez que dobles un video, el sistema extraerá automáticamente el <b>ambiente</b> (ruidos de pizarra, tiza, eco de la sala) 
+                                    y lo separará de la voz del profesor para lograr un doblaje natural y profesional.
+                                </p>
+                            </div>
+                        """)
 
                         with gr.Row():
                             dob_yt_dd = gr.Dropdown(
                                 choices=_v("yt_all_choices", get_youtube_file_choices, include_video=True, include_audio=True),
-                                label="Seleccionar desde youtube_video/",
-                                value=None, scale=2,
+                                label="Seleccionar archivo local (youtube_video/)",
+                                value=None, scale=5,
                             )
                             dob_yt_refresh = gr.Button("↺", size="sm", scale=0)
-
-                        audio_input = gr.Audio(
-                            label="Archivo en inglés (MP3 · WAV · MP4 · M4A)",
-                            type="filepath", sources=["upload"],
-                        )
+                            audio_input = gr.Audio(
+                                label="O sube tu propio video/audio",
+                                type="filepath", sources=["upload"],
+                                scale=8,
+                            )
 
                         with gr.Row():
-                            dub_btn      = gr.Button("Doblar al Español / Dub to Spanish",
-                                                     variant="primary", size="lg", scale=2)
-                            dub_test_btn = gr.Button("Test 5 minutos",
-                                                     variant="secondary", size="lg", scale=1)
+                            hf_token_dub = gr.Textbox(
+                                label="HuggingFace Token (Obligatorio para Diarización)",
+                                placeholder="hf_...", type="password",
+                                value="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",
+                                scale=8
+                            )
+                        
+                        with gr.Row():
+                            full_dub_btn = gr.Button("🚀 Generar Doblaje Completo", variant="primary", scale=2)
+                            test_dub_btn = gr.Button("⏱️ Doblaje de Prueba (3 min)", variant="secondary", scale=2)
+                            
+                        job_hash_state = gr.State("")
 
+                        with gr.Accordion("Voces Detectadas (Cazador de Referencias)", open=True):
+                            gr.Markdown("Revisa los 10 segundos extraídos para cada locutor antes de proceder al doblaje final.")
+                            speaker_ref_gallery = gr.Dataframe(
+                                headers=["Speaker", "Audio de Referencia", "Texto Detectado"],
+                                datatype=["str", "str", "str"],
+                                label="Referencias extraídas automáticamente",
+                                interactive=False,
+                            )
+                        
                         audio_output = gr.Audio(
                             label="Audio doblado / Dubbed audio (ES)",
                             type="filepath", interactive=False,
@@ -2172,30 +2215,36 @@ def build_ui(init=None):  # noqa: C901
                                 lines=20, interactive=False,
                             )
 
-                        def _dub_and_download(audio_file, progress=gr.Progress(track_tqdm=False)):
-                            for result_path, status, segs_content in run_dubbing(audio_file, progress=progress):
+                        def _run_unified_ui(audio_file, hf_token, is_test=False, progress=gr.Progress(track_tqdm=False)):
+                            fn = run_dubbing_unified_test if is_test else run_dubbing_unified
+                            # Ambas funciones yield (final_file, status, ui_rows, segs_content)
+                            for final_file, status, ui_rows, segs_content in fn(audio_file, hf_token, progress=progress):
+                                # Si hay archivo final, actualizamos audio y descarga
+                                res_audio = final_file if final_file else gr.update()
+                                res_download = final_file if final_file else gr.update()
+                                
+                                # Visor de segmentos
                                 segs_upd = gr.update(value=segs_content or "", visible=bool(segs_content))
-                                if result_path:
-                                    yield result_path, result_path, status, segs_upd
-                                else:
-                                    yield gr.update(), gr.update(), status, segs_upd
+                                
+                                yield res_audio, res_download, status, ui_rows, segs_upd
 
-                        def _dub_test_and_download(audio_file, progress=gr.Progress(track_tqdm=False)):
-                            for result_path, status, segs_content in run_dubbing_test(audio_file, progress=progress):
-                                segs_upd = gr.update(value=segs_content or "", visible=bool(segs_content))
-                                if result_path:
-                                    yield result_path, result_path, status, segs_upd
-                                else:
-                                    yield gr.update(), gr.update(), status, segs_upd
+                        # --- TUS NUEVAS FUNCIONES WRAPPER ---
+                        def _run_full_wrapper(a, t, p=gr.Progress(track_tqdm=False)):
+                            yield from _run_unified_ui(a, t, is_test=False, progress=p)
 
-                        dub_btn.click(
-                            fn=_dub_and_download, inputs=[audio_input],
-                            outputs=[audio_output, dub_download, status_box, segs_auto_viewer],
+                        def _run_test_wrapper(a, t, p=gr.Progress(track_tqdm=False)):
+                            yield from _run_unified_ui(a, t, is_test=True, progress=p)
+                   
+                        full_dub_btn.click(
+                            fn=_run_full_wrapper, # <--- AHORA USA EL WRAPPER DIRECTAMENTE
+                            inputs=[audio_input, hf_token_dub],
+                            outputs=[audio_output, dub_download, status_box, speaker_ref_gallery, segs_auto_viewer],
                             show_progress="full",
                         )
-                        dub_test_btn.click(
-                            fn=_dub_test_and_download, inputs=[audio_input],
-                            outputs=[audio_output, dub_download, status_box, segs_auto_viewer],
+                        test_dub_btn.click(
+                            fn=_run_test_wrapper, # <--- AHORA USA EL WRAPPER DIRECTAMENTE
+                            inputs=[audio_input, hf_token_dub],
+                            outputs=[audio_output, dub_download, status_box, speaker_ref_gallery, segs_auto_viewer],
                             show_progress="full",
                         )
                         refresh_btn.click(fn=get_cache_status, outputs=[cache_status_box])
@@ -2270,6 +2319,7 @@ def build_ui(init=None):  # noqa: C901
                         gr.Markdown("---\n**Opciones Adicionales**")
                         with gr.Row():
                             sub_do_orig_audio = gr.Checkbox(label="Audio original de fondo", value=False, scale=1)
+                            sub_do_lipsync = gr.Checkbox(label="Aplicar Lip-Sync (Video-Retalking)", value=False, scale=1)
 
                         with gr.Group(visible=False) as sub_orig_audio_group:
                             gr.Markdown("**Audio original EN como fondo ambiental**")
@@ -2323,6 +2373,7 @@ def build_ui(init=None):  # noqa: C901
                             sub_yt_video_dd, sub_audio_dd, sub_video_upload, sub_audio_upload,
                             sub_contrast, sub_brightness, sub_sharpness,
                             sub_do_orig_audio, sub_yt_orig_dd, sub_orig_video, sub_audio_db,
+                            sub_do_lipsync,
                         ]
 
                         sub_full_btn.click(
@@ -2627,6 +2678,8 @@ def build_ui(init=None):  # noqa: C901
                             """
                         )
 
+
+
             # ─────────────────────── RIGHT SPACER ────────────────────────
             with gr.Column(scale=1, elem_id="right-spacer"):
                 pass
@@ -2638,6 +2691,7 @@ def build_ui(init=None):  # noqa: C901
         nav_doblaje_btn.click(fn=lambda: gr.update(selected=2), outputs=[main_tabs])
         nav_subtitulos_btn.click(fn=lambda: gr.update(selected=3), outputs=[main_tabs])
         nav_shorts_btn.click(fn=lambda: gr.update(selected=4), outputs=[main_tabs])
+
 
         archive_btn.click(
             fn=archive_project,

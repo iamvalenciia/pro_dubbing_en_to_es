@@ -475,13 +475,13 @@ def create_short(
     cmd = ["ffmpeg", "-y",
            "-i", str(temp_video),   # [0:v]
            "-i", str(seg_audio)]    # [1:a] voz doblada
-    audio_inputs = ["[1:a]volume=1.0[voice]"]
+    audio_inputs = ["[1:a]volume=0.8[voice]"]
     mix_labels   = ["[voice]"]
     next_idx     = 2
 
     if has_music:
         cmd += ["-stream_loop", "-1", "-i", str(bg_music_path)]  # [2:a]
-        audio_inputs.append(f"[{next_idx}:a]volume=0.075[music]")
+        audio_inputs.append(f"[{next_idx}:a]volume=0.20[music]")
         mix_labels.append("[music]")
         next_idx += 1
 
