@@ -1,30 +1,27 @@
-# Archivos de prueba local (no van en la imagen)
-output/
-audio_prueba_1minuto/
-*.mp4
-*.mp3
-
-# Scripts de desarrollo
-benchmark.py
-docker_start.bat
-*.bat
-
-# Python cache
+# Ignorar entornos virtuales y cachés pesadas
+venv/
+env/
+.env
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 
-# Git
+# Ignorar modelos pesados si existieran localmente
+models/
+weights/
+*.pth
+*.pt
+*.safetensors
+*.bin
+
+# Ignorar carpetas de resultados de video/audio
+youtube_video/
+output/
+input/
+cache/
+
+# Archivos de la máquina virtual o dependencias locales
 .git/
-.gitignore
-
-# Docs
-*.md
-
-# Archivos WAV de prueba/output (excluir, pero NO voice_reference/)
-output/*.wav
-output/tts_segments/
-
-# Exclude local retalking directory
-video-retalking/
+.dockerignore
+Dockerfile
+docker-compose.yml
+docker-clean-build.ps1

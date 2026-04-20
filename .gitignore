@@ -1,66 +1,45 @@
 # Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
 .pytest_cache/
 
-# Environment
-.env
-.venv/
+# Entornos virtuales
 venv/
-ENV/
+env/
+.venv/
+.env
+.env.local
 
-# Development / IDE
-.vscode/
+# Modelos y pesos (descargados en runtime)
+models/
+weights/
+*.pth
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+
+# Datos de entrada/salida y cachés
+input/
+output/
+temp_workspace/
+cache/
+youtube_video/
+shorts/
+
+# IDE / editores
 .claude/
+.vscode/
 .idea/
 *.swp
-*.swo
 
-# Project Output Folders & Caches
-cache/
-output/
-enhance_output/
-archives/
-subtitle_output/
-youtube_video/
-voice_reference/
-shorts_videos_lists/
-shorts/_cache/
+# SO
+.DS_Store
+Thumbs.db
 
-# Logs and specific files
-_app_log.txt
-app_out.txt
+# Logs
 *.log
-
-# Image previews / UI artefacts generated
-_preview_crop.jpg
-_preview_enhance.jpg
-configuraciones para video final.png
-*.jpg
-*.png
-
-# Media files
-*.mp4
-*.mp3
-*.wav
-*.m4a
-*.webm
-*.mkv
-*.avi
-*.mov
-
-# Extra shorts folders
-shorts/audio_original_en/
-shorts/background_music/
-shorts/short_audio_doblado/
-shorts/short_video/
-
-# Ignore other potential zip files from archives
-*.zip
-
-#model
-Qwen3.5-9B/
-
-video-retalking/
+logs/

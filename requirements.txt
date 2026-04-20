@@ -1,12 +1,41 @@
-# Transcripción (ya instalado)
-faster-whisper>=1.0.0
+# === BINDING ESTRICTO DE AUDIO Y NUCLEO MATEMATICO ===
+# Crítico: numpy 2.0 rompe la ABI C de librosa, soundfile y numba.
+numpy<2.0.0
+scipy==1.13.1
 
-# Traducción (ya instalado)
-deep-translator>=1.11.0
+# === MANIPULACION DE AUDIO (Fase 1 y 2) ===
+pyannote.audio==3.1.1
+demucs==4.0.1
+librosa==0.10.2
+soundfile==0.12.1
+pyrubberband==0.3.0
+pydub==0.25.1
 
-# TTS local (instalar si falta)
-qwen-tts>=0.1.0
-soundfile>=0.12.0
-python-dotenv>=1.0.0
-demucs>=4.0.0
-whisperx>=3.1.0
+# === HUGGINGFACE & TRANSFORMERS ===
+# transformers lo pinean qwen-tts (4.57.3) y qwen-asr (4.57.6) via Dockerfile en pasos secuenciales.
+# accelerate lo clava qwen-asr a 1.12.0.
+accelerate==1.12.0
+
+# NOTA: qwen-asr y qwen-tts se instalan en el Dockerfile en pasos separados
+# porque tienen pines exclusivos de transformers que pip no puede resolver juntos.
+
+# === INTEGRACION LLM & PIPELINE ===
+google-generativeai==0.8.2
+
+# === VIDEO & SUBS & UI ===
+opencv-python-headless==4.10.0.84
+moviepy==1.0.3
+ffmpeg-python==0.2.0
+pysubs2==1.7.3
+# Stack de Gradio fijado para evitar TypeError: 'bool' is not iterable en /info
+# (gradio_client parser no maneja additionalProperties: true de pydantic 2.10+)
+gradio==4.44.1
+gradio_client==1.3.0
+pydantic==2.8.2
+fastapi==0.112.4
+uvicorn==0.30.6
+
+# === UTILIDADES ===
+python-dotenv
+tqdm
+gdown
