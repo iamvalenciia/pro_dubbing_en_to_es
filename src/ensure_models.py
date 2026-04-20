@@ -11,11 +11,18 @@ QWEN_MODELS = [
     ("QWEN_ASR_PATH", "Qwen/Qwen3-ASR-1.7B", "/runpod-volume/models/Qwen/Qwen3-ASR-1.7B"),
     ("QWEN_ALIGNER_PATH", "Qwen/Qwen3-ForcedAligner-0.6B", "/runpod-volume/models/Qwen/Qwen3-ForcedAligner-0.6B"),
     ("QWEN_TTS_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "/runpod-volume/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+    # MarianMT EN->ES para Fase 3 (reemplaza Gemini). ~300MB, sin API key.
+    ("MARIAN_MODEL_PATH", "Helsinki-NLP/opus-mt-en-es", "/runpod-volume/models/Helsinki-NLP/opus-mt-en-es"),
 ]
 
 
 def _is_complete(local_dir: str) -> bool:
-    """Valida que el snapshot este completo: config.json + todos los shards del index."""
+    """Valida que el snapshot este completo: config.json + todos los shards del index.
+
+    Solo considera completo si hay model.safetensors (no pytorch_model.bin suelto)
+    — los .bin son bloqueados por transformers con torch < 2.6 (CVE-2025-32434),
+    asi que requerimos conversion a safetensors antes de marcar OK.
+    """
     if not os.path.isdir(local_dir):
         return False
     if not os.path.isfile(os.path.join(local_dir, "config.json")):
@@ -38,9 +45,44 @@ def _is_complete(local_dir: str) -> bool:
         return bool(required_shards)
 
     single = os.path.join(local_dir, "model.safetensors")
-    if os.path.isfile(single) and os.path.getsize(single) > 100 * 1024 * 1024:
+    if os.path.isfile(single) and os.path.getsize(single) > 50 * 1024 * 1024:
         return True
     return False
+
+
+def _convert_bin_to_safetensors(local_dir: str, log_) -> bool:
+    """Si hay pytorch_model.bin y falta model.safetensors, convierte.
+
+    Necesario para modelos legacy (ej. Helsinki-NLP/opus-mt-en-es) porque
+    transformers >=4.46 bloquea torch.load con torch <2.6 por CVE-2025-32434.
+    Devuelve True si al terminar hay un .safetensors utilizable.
+    """
+    st_path = os.path.join(local_dir, "model.safetensors")
+    bin_path = os.path.join(local_dir, "pytorch_model.bin")
+    if os.path.isfile(st_path):
+        return True
+    if not os.path.isfile(bin_path):
+        return False
+    try:
+        import torch
+        from safetensors.torch import save_file
+        log_.info(f"  Convirtiendo pytorch_model.bin -> model.safetensors en {local_dir}")
+        sd = torch.load(bin_path, map_location="cpu", weights_only=False)
+        # Marian y otros encoder-decoders comparten embeddings; safetensors
+        # requiere tensores independientes, asi que forzamos copia contigua.
+        sd = {k: (v.detach().contiguous().clone() if hasattr(v, "detach") else v)
+              for k, v in sd.items()}
+        save_file(sd, st_path)
+        log_.info(f"  OK: safetensors generado ({os.path.getsize(st_path)/1024**2:.1f} MB)")
+        try:
+            os.remove(bin_path)
+            log_.info("  pytorch_model.bin eliminado (ya no se usa)")
+        except OSError:
+            pass
+        return True
+    except Exception as e:
+        log_.error(f"  Conversion bin->safetensors fallo: {e}")
+        return False
 
 
 def _dir_size_mb(path: str) -> float:
@@ -71,6 +113,16 @@ def ensure_qwen_models():
                 log.info(f"  OK: {repo_id} ya presente ({size_mb:.1f} MB)")
                 continue
 
+            # Caso legacy: bajado antes con solo pytorch_model.bin. Convertir in-place
+            # sin re-descargar.
+            if os.path.isdir(local_dir) and os.path.isfile(os.path.join(local_dir, "pytorch_model.bin")) \
+               and not os.path.isfile(os.path.join(local_dir, "model.safetensors")):
+                log.info(f"  Convirtiendo legacy bin->safetensors para {repo_id}")
+                if _convert_bin_to_safetensors(local_dir, log) and _is_complete(local_dir):
+                    size_mb = _dir_size_mb(local_dir)
+                    log.info(f"  OK tras conversion: {repo_id} ({size_mb:.1f} MB)")
+                    continue
+
             log.warning(f"  INCOMPLETO: {repo_id} falta o esta roto. Descargando...")
             os.makedirs(local_dir, exist_ok=True)
             with step_timer(log, f"snapshot_download {repo_id}"):
@@ -86,3 +138,7 @@ def ensure_qwen_models():
                 dt = time.time() - t0
                 size_mb = _dir_size_mb(local_dir)
                 log.info(f"  Descargado {size_mb:.1f} MB en {dt:.1f}s")
+
+            # Post-download: si el modelo solo trae pytorch_model.bin, convertir
+            # a safetensors para evitar bloqueo por torch < 2.6.
+            _convert_bin_to_safetensors(local_dir, log)

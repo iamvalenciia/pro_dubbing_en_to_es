@@ -10,7 +10,6 @@ import traceback
 from src.logger import setup_pipeline_logger, get_logger, read_log_tail, clear_log
 from src.ensure_models import ensure_qwen_models
 from src.input_handler import download_and_prepare_media
-from src.phase1_audio_separation import run_phase1_audio_separation
 from src.phase2_asr_diarization import run_phase2_diarization_and_asr
 from src.phase3_llm_isochrone import run_phase3_llm_translation
 from src.phase4_tts_cloning import run_phase4_tts_cloning
@@ -292,17 +291,52 @@ def _ensure_dirs():
     setup_pipeline_logger("logs")
 
 
+def _log_storage_layout():
+    """Imprime al boot donde se va a escribir todo. Critico para diagnosticar
+    casos en que APP_DATA_DIR apunta a disco efimero/network en vez del volumen
+    persistente de RunPod (/runpod-volume). Si ves rutas que NO empiezan con
+    /runpod-volume y el pod tiene volumen montado, hay un mis-wiring del env."""
+    data_dir = os.environ.get("APP_DATA_DIR", "(no seteado)")
+    cwd = os.getcwd()
+    ui_log.info("=" * 80)
+    ui_log.info("STORAGE LAYOUT")
+    ui_log.info(f"  APP_DATA_DIR env     : {data_dir}")
+    ui_log.info(f"  cwd (tras _ensure)   : {cwd}")
+    for d in WORKSPACES + ["user_input", "logs"]:
+        abs_d = os.path.abspath(d)
+        exists = os.path.isdir(abs_d)
+        on_volume = abs_d.startswith("/runpod-volume")
+        tag = "OK-volume" if on_volume else ("OK-local " if exists else "MISSING  ")
+        ui_log.info(f"  [{tag}] {d:18s} -> {abs_d}")
+    # Free space en el disco del cwd
+    try:
+        import shutil as _sh
+        total, used, free = _sh.disk_usage(cwd)
+        gb = 1024 ** 3
+        ui_log.info(
+            f"  Disk @ cwd           : total={total/gb:.1f}G used={used/gb:.1f}G "
+            f"free={free/gb:.1f}G ({100*used/total:.0f}% usado)"
+        )
+        if free < 10 * gb:
+            ui_log.warning(
+                f"  ⚠ MENOS DE 10GB LIBRES — outputs grandes (>5GB MP4) pueden fallar "
+                "al copiarse al tmp de Gradio."
+            )
+    except Exception as e:
+        ui_log.warning(f"  disk_usage fallo: {e}")
+    ui_log.info("=" * 80)
+
+
 # -------------------------------------------------------------------------
 # Pipeline de doblaje como generator con thread en background
 # -------------------------------------------------------------------------
 
 PHASE_DEFINITIONS = [
-    ("FASE 1", "Separacion Demucs", 0.10, 0.22),
-    ("FASE 2", "ASR + Segmentacion", 0.22, 0.48),
-    ("FASE 3", "Traduccion Gemini", 0.48, 0.58),
-    ("FASE 4", "Clonacion TTS Qwen3", 0.58, 0.88),
-    ("FASE 5", "Alineamiento + Mezcla", 0.88, 0.96),
-    ("FASE 5b", "Mux video+audio final", 0.96, 1.00),
+    ("FASE 2", "ASR + Segmentacion", 0.05, 0.35),
+    ("FASE 3", "Traduccion MarianMT", 0.35, 0.45),
+    ("FASE 4", "Clonacion TTS Qwen3", 0.45, 0.88),
+    ("FASE 5", "Concat audio doblado", 0.88, 0.95),
+    ("FASE 5b", "Mux video+audio final", 0.95, 1.00),
 ]
 
 
@@ -506,11 +540,14 @@ def _run_dubbing_streamed(audio_path, video_path, progress_desc: str):
 
     def worker():
         try:
-            v_path, a_path = run_phase1_audio_separation(audio_path, "temp_workspace/p1")
-            json_path = run_phase2_diarization_and_asr(v_path, "temp_workspace/p2_data.json")
+            # Fase 1 (Demucs) eliminada: el pipeline nuevo no separa voz/ambiente.
+            # Fase 2 ASR corre directo sobre el audio original.
+            json_path = run_phase2_diarization_and_asr(audio_path, "temp_workspace/p2_data.json")
             json_path = run_phase3_llm_translation(json_path, "temp_workspace/p3_data.json")
-            json_path = run_phase4_tts_cloning(json_path, v_path, "temp_workspace/p4", "temp_workspace/p4/out")
-            final_audio = run_phase5_time_alignment(json_path, a_path, "output/final_audio_dubbed.wav")
+            json_path = run_phase4_tts_cloning(json_path, audio_path, "temp_workspace/p4", "temp_workspace/p4/out")
+            # Fase 5 ahora concatena los WAVs clonados con pausas naturales
+            # (sin mezcla con ambiente — Fase 6 LatentSync re-sincroniza labios).
+            final_audio = run_phase5_time_alignment(json_path, "output/final_audio_dubbed.wav")
             result["audio"] = final_audio
             result["json"] = json_path
 
@@ -1052,73 +1089,58 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
                                          step=0.01, interactive=False)
             ui_dub_status = gr.Textbox(label="Fase actual", interactive=False, lines=1)
 
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>3</span>Progreso en vivo</div>")
-            with gr.Row():
-                with gr.Column(scale=3):
-                    gr.HTML("<div class='qdp-hint'>Log (pipeline.log)</div>")
-                    ui_log_live = gr.Textbox(
-                        label="", interactive=False, lines=22,
-                        elem_id="qdp-log", autoscroll=True, show_copy_button=True,
-                    )
-                with gr.Column(scale=2):
-                    gr.HTML("<div class='qdp-hint'>Archivos generados</div>")
-                    ui_files_table = gr.DataFrame(
-                        headers=["Path", "Tamano", "Modif"],
-                        value=[], interactive=False, wrap=False,
-                        row_count=(10, "dynamic"), col_count=(3, "fixed"),
-                    )
-                    btn_refresh = gr.Button("Refrescar log + archivos", size="sm")
-
-            # ============================================================
-            # DESCARGA MANUAL POR RUTA (siempre funciona, no depende del
-            # auto-populate ni de la tabla)
-            # ============================================================
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>3b</span>Descargar archivo por ruta absoluta</div>")
-            gr.HTML("<div class='qdp-hint'>Si los archivos finales no aparecen automaticamente, "
-                    "pega aqui la ruta absoluta (ej: <code>/runpod-volume/output/FINAL_DUBBED_VIDEO.mp4</code>) "
-                    "y dale al boton. Funciona con cualquier archivo dentro de <code>/runpod-volume/</code> o <code>/app/</code>.</div>")
-            with gr.Row():
-                manual_dl_path = gr.Textbox(
-                    label="Ruta absoluta del archivo",
-                    value="/runpod-volume/output/FINAL_DUBBED_VIDEO.mp4",
-                    lines=1,
-                )
-                btn_manual_dl = gr.Button("⬇ Traer archivo", variant="primary")
-            manual_dl_file = gr.File(label="Archivo listo para descargar", interactive=False)
-            manual_dl_status = gr.Textbox(label="Estado", interactive=False, lines=1)
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>4</span>Resultado descargable</div>")
-            gr.HTML("<div class='qdp-hint'>Al terminar el doblaje, <b>aparecen aca listos para descargar</b> "
-                    "el MP4 final (video original + audio ES) y el WAV doblado, sin necesidad de SSH ni scp al pod. "
-                    "El MP4 se arma con <code>ffmpeg -c:v copy</code> (segundos, no minutos) y cae a NVENC/libx264 "
-                    "solo si el container no soporta stream-copy.</div>")
-            out_dubbed_video = gr.Video(label="Video doblado final (MP4 descargable)", interactive=False)
+            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>3</span>Resultado</div>")
+            gr.HTML("<div class='qdp-hint'>El MP4 final puede pesar varios GB. Para evitar que Gradio "
+                    "intente copiarlo al tmp interno (y mate el worker por presion de disco) "
+                    "mostramos <b>solo la ruta absoluta + descarga directa</b>. "
+                    "Si el widget <code>File</code> no carga por tamano, copia la ruta y usala "
+                    "en la caja de <b>Descarga por ruta absoluta</b> mas abajo, o descargala por SCP/rclone.</div>")
+            out_dubbed_video_path = gr.Textbox(
+                label="MP4 doblado final — RUTA ABSOLUTA (copiala si el download falla)",
+                interactive=False, lines=1, show_copy_button=True,
+            )
             with gr.Row():
                 out_dubbed_video_file = gr.File(
                     label="⬇ Descargar MP4 (FINAL_DUBBED_VIDEO.mp4)",
                     interactive=False,
                 )
-                out_dubbed = gr.Audio(label="Audio doblado final (WAV descargable)", interactive=False)
+                out_dubbed = gr.Audio(label="Audio doblado final (WAV)", interactive=False)
             out_json_path_display = gr.Textbox(label="JSON timeline generado (path)", interactive=False, lines=1)
+            # Placeholder invisible: el generador del pipeline sigue yieldando
+            # un path como primer output (compat); lo enchufamos al textbox + file
+            # mediante un .then() debajo. No se muestra el gr.Video pesado.
+            out_dubbed_video = gr.Textbox(visible=False)
 
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>5</span>Comparacion de traducciones (EN &harr; ES)</div>")
-            gr.HTML("<div class='qdp-hint'>Se va llenando en vivo conforme el pipeline avanza: "
-                    "al terminar la FASE 3 aparecen las traducciones, y al terminar la FASE 4 "
-                    "se agrega la duracion del TTS ES y el delta respecto al EN original.</div>")
-            ui_translation_compare = gr.DataFrame(
-                headers=["#", "Tiempo (s)", "Speaker", "EN (original)", "ES (traduccion)",
-                         "dur EN", "dur TTS ES", "delta"],
-                value=[], interactive=False, wrap=True,
-                row_count=(8, "dynamic"), col_count=(8, "fixed"),
-                elem_id="qdp-translation-compare",
-            )
+            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>4</span>Descarga por ruta absoluta (fallback para archivos grandes)</div>")
+            gr.HTML("<div class='qdp-hint'>Si el doblaje termino pero el UI se colgo (ej. WebSocket cortado durante un "
+                    "render largo), el MP4 sigue estando en disco. Pega aca la ruta absoluta "
+                    "(ej. <code>/runpod-volume/output/FINAL_DUBBED_VIDEO.mp4</code>) y te lo servimos para bajar.</div>")
+            with gr.Row():
+                manual_dl_path = gr.Textbox(
+                    label="Ruta absoluta del archivo a descargar",
+                    placeholder="/runpod-volume/output/FINAL_DUBBED_VIDEO.mp4",
+                    lines=1, scale=3,
+                )
+                btn_manual_dl = gr.Button("Traer archivo", scale=1)
+            manual_dl_status = gr.Textbox(label="Estado", interactive=False, lines=1)
+            manual_dl_file = gr.File(label="Archivo servido", interactive=False)
 
-            with gr.Accordion("Preview del archivo seleccionado (click fila de la tabla)", open=False):
-                preview_audio = gr.Audio(label="Preview audio", interactive=False)
-                preview_video = gr.Video(label="Preview video", interactive=False)
-                preview_text = gr.Textbox(label="Preview texto/JSON", interactive=False, lines=15,
-                                          show_copy_button=True)
-                preview_download = gr.File(label="Descargar archivo seleccionado", interactive=False)
+            with gr.Accordion("Log y archivos generados", open=False):
+                ui_log_live = gr.Textbox(
+                    label="pipeline.log", interactive=False, lines=18,
+                    elem_id="qdp-log", autoscroll=True, show_copy_button=True,
+                )
+                ui_files_table = gr.DataFrame(
+                    headers=["Path", "Tamano", "Modif"],
+                    value=[], interactive=False, wrap=False,
+                    row_count=(10, "dynamic"), col_count=(3, "fixed"),
+                )
+                btn_refresh = gr.Button("Refrescar log + archivos", size="sm")
+
+            # Estado invisible que reemplaza la tabla de comparacion EN<->ES
+            # (removida del UI). El generador sigue emitiendo filas; las
+            # descartamos hacia un gr.State para no romper la firma.
+            ui_translation_compare = gr.State([])
 
         # =================================================================
         # TAB 2: RENDER DE VIDEO
@@ -1268,10 +1290,11 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
                  ui_files_table, ui_log_live, ui_dub_progress,
                  ui_translation_compare],
     ).then(
-        # El gr.File descargable refleja el mismo MP4 que el gr.Video (si existe).
-        lambda v: v,
+        # Reflejar MP4 final en: (a) textbox con ruta absoluta (copy-paste-able),
+        # (b) gr.File para descarga directa (solo pasa el path, Gradio no lo precarga).
+        lambda v: (os.path.abspath(v) if v else "", v if v else None),
         inputs=[out_dubbed_video],
-        outputs=[out_dubbed_video_file],
+        outputs=[out_dubbed_video_path, out_dubbed_video_file],
     ).then(
         # Auto-populate Tab 2 (video + audio + json) y Tab 3 (json).
         # El master_lipsynced se auto-popula en Tab 3 DESPUÉS de Tab 2.
@@ -1287,9 +1310,9 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
                  ui_files_table, ui_log_live, ui_dub_progress,
                  ui_translation_compare],
     ).then(
-        lambda v: v,
+        lambda v: (os.path.abspath(v) if v else "", v if v else None),
         inputs=[out_dubbed_video],
-        outputs=[out_dubbed_video_file],
+        outputs=[out_dubbed_video_path, out_dubbed_video_file],
     ).then(
         lambda v, a, j: (v, a, j, j),
         inputs=[dub_video_prepared, out_dubbed, out_json_path_display],
@@ -1306,17 +1329,10 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
         inputs=[manual_dl_path],
         outputs=[manual_dl_file, manual_dl_status],
     )
-    # Enter en el textbox tambien dispara la descarga
     manual_dl_path.submit(
         manual_download,
         inputs=[manual_dl_path],
         outputs=[manual_dl_file, manual_dl_status],
-    )
-
-    ui_files_table.select(
-        on_files_df_select,
-        inputs=[ui_files_table],
-        outputs=[preview_audio, preview_video, preview_text, preview_download],
     )
 
     # --- Tab 2 wiring ---
@@ -1377,6 +1393,7 @@ if __name__ == "__main__":
     _ensure_dirs()
     setup_pipeline_logger("logs")
     ui_log.info("Booting Quantum Dubbing Pipeline UI")
+    _log_storage_layout()
     ensure_qwen_models()
     # allowed_paths: permite que gr.Audio/gr.Video/gr.File sirvan archivos
     # desde estos directorios (incluye user_input/ para uploads persistentes).

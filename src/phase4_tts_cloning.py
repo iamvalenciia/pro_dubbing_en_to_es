@@ -85,23 +85,13 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Stretch adaptativo post-TTS (Fix B del drift pipeline)
+# Sin stretch post-TTS — voz natural, lipsync arregla el timing (Fase 6).
 # ---------------------------------------------------------------------------
-# El castellano hablado es ~20-25% mas largo que el ingles. Qwen3-TTS respeta
-# la velocidad natural del texto recibido, asi que si Gemini (Fase 3) devolvio
-# una traduccion larga, el WAV sale largo y Fase 5 acumula drift.
-#
-# Fix: medimos duracion del WAV vs duracion del slot original; si el ratio supera
-# TTS_MIN_STRETCH_THRESHOLD, aceleramos con librosa.effects.time_stretch capado
-# a TTS_MAX_SPEED_RATIO (preserva pitch, fase vocoder).
-#
-# Por que 1.15x como cap: hasta ~1.15x es imperceptible para oyente casual;
-# arriba de 1.2x empieza a sonar apurado/metalico. Si una traduccion requiere
-# mas de 1.15x, dejamos el overrun residual y Fase 5 lo absorbe con micro-solapes.
-TTS_MAX_SPEED_RATIO = float(os.environ.get("TTS_MAX_SPEED_RATIO", "1.15"))
-# Margen antes de disparar stretch: si ratio <= 1.05x no hacemos nada
-# (mejor dejar el audio intacto que introducir artefactos por 50ms).
-TTS_MIN_STRETCH_THRESHOLD = float(os.environ.get("TTS_MIN_STRETCH_THRESHOLD", "1.05"))
+# La version previa medía duracion WAV vs slot original y aceleraba con
+# librosa.effects.time_stretch hasta 1.15x para compensar drift. Con la nueva
+# filosofia "LatentSync re-sincroniza labios al audio doblado natural", el
+# stretch es contraproducente: introduce artefactos y no hace falta — el video
+# final se mueve a la velocidad del audio doblado, no al reves.
 
 
 def get_speaker_reference(voices_path: str, start_sec: float, ref_out_path: str, max_duration_sec: float = REF_DURATION_S):
@@ -132,10 +122,49 @@ def _build_ref_text_for_window(timeline: list, speaker: str, ref_start: float, r
     return " ".join(parts).strip()
 
 
-USE_X_VECTOR_ONLY = False  # False: Copia la velocidad, ritmo y emoción del inglés original
-# Trade-off: voz mas plana/sin emocion, pero se entienden las palabras claramente.
-# La alternativa (False = ICL) copia prosodia+emocion del ref, pero arrastra el acento
-# del audio en ingles → pronunciacion agringada que cuesta entender.
+# =============================================================================
+# CLONING MODE — CRITICO PARA CALIDAD DEL DOBLAJE
+# =============================================================================
+# True  = x_vector_only: usa SOLO speaker embedding (timbre). El modelo pronuncia
+#         espanol nativo SIN contaminacion del ref EN. Voz mas plana pero:
+#           • se entienden las palabras al 100%
+#           • NO mezcla palabras en ingles
+#           • NO copia prosodia/ritmo del ingles (ideal para TTS doblado)
+# False = ICL: condiciona sobre (ref_audio, ref_text) juntos. En teoria copia
+#         prosodia + emocion del ref. En la practica con Qwen3-TTS:
+#           • en ~20-40% de segmentos, despues de terminar el ES el modelo
+#             eco-copia tokens del ref EN → palabras en ingles mezcladas
+#           • los sampling defaults agresivos (temp=0.9, top_p=1.0) amplifican
+#             el problema en segmentos largos
+# Default TRUE porque la calidad "faithful Spanish" >>> "prosody preserved".
+USE_X_VECTOR_ONLY = os.environ.get("QWEN_TTS_X_VECTOR_ONLY", "1") not in ("0", "false", "False")
+
+# =============================================================================
+# SAMPLING PARAMS — overrides al _merge_generate_kwargs del modelo
+# =============================================================================
+# Los hard_defaults del modelo (do_sample=True, temp=0.9, top_p=1.0,
+# rep_penalty=1.05) estan calibrados para generacion creativa, NO para dubbing
+# faithful. Para TTS fidelitario queremos:
+#   • temperature bajo → mas deterministico, menos creatividad
+#   • top_p moderado → evita tokens de baja probabilidad que meten ruido
+#   • repetition_penalty alto → CRITICO contra loops del codec ("disco rayado")
+QWEN_TTS_TEMPERATURE = float(os.environ.get("QWEN_TTS_TEMPERATURE", "0.7"))
+QWEN_TTS_TOP_P = float(os.environ.get("QWEN_TTS_TOP_P", "0.85"))
+QWEN_TTS_TOP_K = int(os.environ.get("QWEN_TTS_TOP_K", "30"))
+QWEN_TTS_REPETITION_PENALTY = float(os.environ.get("QWEN_TTS_REPETITION_PENALTY", "1.2"))
+
+# =============================================================================
+# RUNAWAY DETECTION — post-TTS duration sanity check
+# =============================================================================
+# Velocidad de habla en espanol natural: ~14-16 caracteres/segundo.
+# Si la duracion del WAV generado excede `len(text_es) / CHARS_PER_SEC *
+# RUNAWAY_FACTOR`, el modelo hizo runaway (no disparo EOS, loopeo, o eco del ref).
+# Cortamos al limite esperado — mejor un seg truncado que uno contaminado.
+QWEN_TTS_CHARS_PER_SEC = float(os.environ.get("QWEN_TTS_CHARS_PER_SEC", "14.0"))
+QWEN_TTS_RUNAWAY_FACTOR = float(os.environ.get("QWEN_TTS_RUNAWAY_FACTOR", "1.8"))
+# Margen absoluto adicional (segundos) que se tolera ANTES de marcar runaway.
+# Protege segmentos cortos (p.ej. "Si." de 3 chars → limite 0.21s sin margen).
+QWEN_TTS_RUNAWAY_FLOOR_S = float(os.environ.get("QWEN_TTS_RUNAWAY_FLOOR_S", "2.0"))
 
 
 def _batched_generate_serial_decode(
@@ -187,10 +216,32 @@ def _batched_generate_serial_decode(
 
     # 3) GENERATE BATCHED (flash_attn_2 — este es el paso pesado, VRAM sube aqui)
     languages = [language] * len(batch_texts)
-    # Cap explicito max_new_tokens: sin cap, un seg con loop/repeticion tira 2048
-    # tokens y el batch entero espera → chunk cuelga 5-10min. Con cap de 1024 y
-    # Fase 3 limitando chars por duracion, ningun seg legitimo se queda corto.
-    gen_kwargs = tts_model._merge_generate_kwargs(max_new_tokens=QWEN_TTS_MAX_NEW_TOKENS)
+
+    # max_new_tokens adaptativo por batch: el codec de Qwen3-TTS corre a 12Hz,
+    # pero genera *varios* codes por "step" (codebooks); en la practica medida
+    # empiricamente ~2.5 tokens de generate() por caracter de texto generado.
+    # Cap del batch = max(len(texts)) * 2.8 + 80 tokens de margen, floor 128,
+    # ceiling QWEN_TTS_MAX_NEW_TOKENS. Esto evita que el batch entero pague por
+    # un solo seg que no dispara EOS (antes: todos los segs quedaban esperando
+    # 1024 tokens, ahora se limita a lo que el seg mas largo legitimamente necesita).
+    longest_text = max((len(t) for t in batch_texts), default=0)
+    adaptive_max_new = max(128, min(QWEN_TTS_MAX_NEW_TOKENS, int(longest_text * 2.8) + 80))
+
+    # Sampling params tight — defaults del modelo (temp=0.9, top_p=1.0,
+    # rep_penalty=1.05) causan loops + contaminacion de lenguaje en dubbing.
+    # Pasamos explicitamente valores conservadores para faithful TTS.
+    gen_kwargs = tts_model._merge_generate_kwargs(
+        max_new_tokens=adaptive_max_new,
+        temperature=QWEN_TTS_TEMPERATURE,
+        top_p=QWEN_TTS_TOP_P,
+        top_k=QWEN_TTS_TOP_K,
+        repetition_penalty=QWEN_TTS_REPETITION_PENALTY,
+        # sub-talker replica los mismos params (genera los codebooks 2..N
+        # condicionados en el primero; mismos defaults sueltos aplican).
+        subtalker_temperature=QWEN_TTS_TEMPERATURE,
+        subtalker_top_p=QWEN_TTS_TOP_P,
+        subtalker_top_k=QWEN_TTS_TOP_K,
+    )
     talker_codes_list, _ = model.generate(
         input_ids=input_ids,
         ref_ids=ref_ids,
@@ -214,16 +265,57 @@ def _batched_generate_serial_decode(
     # 5) DECODE SERIAL (batch=1 → sin padding → sin bug SDPA)
     wavs_out = []
     sr = None
+    runaway_stats = []
     for i, codes in enumerate(codes_for_decode):
         wav_list, sr = model.speech_tokenizer.decode([{"audio_codes": codes}])
         wav = wav_list[0]
-        # Recortar el prefijo de ref_audio si corresponde
+        # Recortar el prefijo de ref_audio si corresponde (solo en ICL mode)
         if ref_code_list is not None and ref_code_list[i] is not None:
             ref_len = int(ref_code_list[i].shape[0])
             total_len = int(codes.shape[0])
             cut = int(ref_len / max(total_len, 1) * wav.shape[0])
             wav = wav[cut:]
+
+        # RUNAWAY GUARD: si la duracion excede lo esperado por el texto,
+        # el modelo no disparo EOS y esta generando garbage (loops, eco del
+        # ref, o silence padding). Truncar en seco al limite esperado evita
+        # contaminar la concat final con minutos de basura.
+        if sr is not None and sr > 0:
+            text_len = len(batch_texts[i])
+            expected_s = max(
+                0.1,
+                text_len / max(QWEN_TTS_CHARS_PER_SEC, 1e-3)
+            )
+            limit_s = expected_s * QWEN_TTS_RUNAWAY_FACTOR + QWEN_TTS_RUNAWAY_FLOOR_S
+            actual_s = wav.shape[0] / sr
+            if actual_s > limit_s:
+                limit_samples = int(limit_s * sr)
+                wav = wav[:limit_samples]
+                runaway_stats.append({
+                    "idx": i,
+                    "text_len": text_len,
+                    "expected_s": expected_s,
+                    "actual_s": actual_s,
+                    "truncated_to_s": limit_s,
+                    "preview": batch_texts[i][:50],
+                })
+
         wavs_out.append(wav)
+
+    # Report de runaways del chunk — si hay muchos, hay un problema sistemico
+    # (texto con caracteres raros, ref_audio dañado, params aun muy sueltos).
+    if runaway_stats:
+        log.warning(
+            f"RUNAWAY GUARD activo en {len(runaway_stats)}/{len(codes_for_decode)} "
+            f"segs del batch (texto excedio {QWEN_TTS_RUNAWAY_FACTOR}x + "
+            f"{QWEN_TTS_RUNAWAY_FLOOR_S}s). Truncados en seco."
+        )
+        for r in runaway_stats[:5]:
+            log.warning(
+                f"  runaway idx={r['idx']} text={r['text_len']}ch "
+                f"expected={r['expected_s']:.1f}s actual={r['actual_s']:.1f}s "
+                f"truncado={r['truncated_to_s']:.1f}s  '{r['preview']}'"
+            )
 
     return wavs_out, sr
 
@@ -263,6 +355,22 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
             f"vram={props.total_memory/1e9:.2f}GB "
             f"| tf32=ON cudnn.benchmark=ON compile={'ON' if QWEN_TTS_USE_COMPILE else 'OFF'} "
             f"chunk_size={QWEN_TTS_BATCH_SIZE}"
+        )
+        # Log explicito de params de sampling y clone-mode. Critico para debugear
+        # regresiones de calidad: si cambian los defaults del modelo o alguien
+        # pisa un env var, esto lo deja en el pipeline.log del run.
+        log.info(
+            f"TTS sampling: temp={QWEN_TTS_TEMPERATURE} top_p={QWEN_TTS_TOP_P} "
+            f"top_k={QWEN_TTS_TOP_K} rep_penalty={QWEN_TTS_REPETITION_PENALTY} "
+            f"max_new_tokens_cap={QWEN_TTS_MAX_NEW_TOKENS} (adaptativo por batch)"
+        )
+        log.info(
+            f"TTS clone-mode: x_vector_only={USE_X_VECTOR_ONLY} "
+            f"({'timbre-only, Spanish puro' if USE_X_VECTOR_ONLY else 'ICL con ref_text (riesgo de mezcla EN/ES)'})"
+        )
+        log.info(
+            f"TTS runaway guard: expected=len(text)/{QWEN_TTS_CHARS_PER_SEC}ch/s "
+            f"limit=expected*{QWEN_TTS_RUNAWAY_FACTOR}+{QWEN_TTS_RUNAWAY_FLOOR_S}s"
         )
 
         from qwen_tts import Qwen3TTSModel
@@ -499,58 +607,18 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
                         f"TTS retorno {len(all_wavs)} wavs pero esperabamos {N}"
                     )
 
-                # ---- STRETCH ADAPTATIVO POST-TTS ----------------------------
-                # Si el WAV es mas largo que el slot original del segmento,
-                # aceleramos con librosa time_stretch (preserva pitch). Cap a
-                # TTS_MAX_SPEED_RATIO para que no suene robotico. Si hace falta
-                # mas que el cap, dejamos el excedente — Fase 5 lo absorbe.
-                #
-                # Funciona sobre `all_wavs` en su orden bucketed. `sorted_indices`
-                # nos mapea cada wav al segmento original (con su start/end).
-                # Resultado: reemplazamos all_wavs in-place con np.ndarray float32.
-                stretched_count = 0
-                ratios_seen = []
-                over_cap_count = 0
-                t0_stretch = time.time()
-                for wav_i, (wav, idx) in enumerate(zip(all_wavs, sorted_indices)):
-                    seg = master_timeline[idx]
-                    target_dur = float(seg["end"]) - float(seg["start"])
-                    # Qwen3-TTS devuelve tensor torch; pasamos a numpy float32
-                    # (librosa lo requiere y sf.write lo acepta sin cost extra).
+                # ---- Convert tensor -> numpy float32 (sin stretch) -----------
+                # Qwen3-TTS devuelve tensor torch; pasamos a numpy para sf.write.
+                # Ya NO aplicamos time_stretch: el audio sale natural, el video
+                # se re-sincroniza con LatentSync en Fase 6.
+                for wav_i, wav in enumerate(all_wavs):
                     if hasattr(wav, "cpu"):
                         wav_np = wav.cpu().numpy()
                     else:
                         wav_np = np.asarray(wav)
                     if wav_np.dtype != np.float32:
                         wav_np = wav_np.astype(np.float32, copy=False)
-
-                    actual_dur = len(wav_np) / sr
-                    ratio = (actual_dur / target_dur) if target_dur > 0 else 1.0
-                    ratios_seen.append(ratio)
-
-                    if target_dur > 0 and ratio > TTS_MIN_STRETCH_THRESHOLD:
-                        # time_stretch rate>1 -> comprime (acorta duracion).
-                        effective_ratio = min(ratio, TTS_MAX_SPEED_RATIO)
-                        if ratio > TTS_MAX_SPEED_RATIO:
-                            over_cap_count += 1
-                        wav_np = librosa.effects.time_stretch(wav_np, rate=effective_ratio)
-                        stretched_count += 1
-
                     all_wavs[wav_i] = wav_np
-
-                dt_stretch = time.time() - t0_stretch
-                if ratios_seen:
-                    ratios_np = np.asarray(ratios_seen, dtype=np.float32)
-                    log.info(
-                        f"Stretch post-TTS: {stretched_count}/{N} acelerados "
-                        f"(trigger>{TTS_MIN_STRETCH_THRESHOLD:.2f}x, cap={TTS_MAX_SPEED_RATIO:.2f}x) "
-                        f"| over_cap={over_cap_count} (residual absorbe Fase 5) "
-                        f"| ratio mean={ratios_np.mean():.2f}x "
-                        f"median={float(np.median(ratios_np)):.2f}x "
-                        f"p95={float(np.percentile(ratios_np, 95)):.2f}x "
-                        f"max={ratios_np.max():.2f}x "
-                        f"| dt={dt_stretch:.2f}s"
-                    )
                 # -------------------------------------------------------------
 
                 # Re-mapear wavs (en orden bucketed) a segmentos (en orden timeline)
