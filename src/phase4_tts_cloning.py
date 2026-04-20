@@ -148,7 +148,7 @@ USE_X_VECTOR_ONLY = os.environ.get("QWEN_TTS_X_VECTOR_ONLY", "1") not in ("0", "
 #   • temperature bajo → mas deterministico, menos creatividad
 #   • top_p moderado → evita tokens de baja probabilidad que meten ruido
 #   • repetition_penalty alto → CRITICO contra loops del codec ("disco rayado")
-QWEN_TTS_TEMPERATURE = float(os.environ.get("QWEN_TTS_TEMPERATURE", "0.7"))
+QWEN_TTS_TEMPERATURE = float(os.environ.get("QWEN_TTS_TEMPERATURE", "0.9"))
 QWEN_TTS_TOP_P = float(os.environ.get("QWEN_TTS_TOP_P", "0.85"))
 QWEN_TTS_TOP_K = int(os.environ.get("QWEN_TTS_TOP_K", "30"))
 QWEN_TTS_REPETITION_PENALTY = float(os.environ.get("QWEN_TTS_REPETITION_PENALTY", "1.2"))
