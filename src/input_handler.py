@@ -8,6 +8,7 @@ import subprocess
 import gdown
 
 from src.logger import get_logger, phase_timer, step_timer, log_file_info
+from src.paths import LOCAL_INPUT, LOCAL_TEMP, NETWORK_DIR
 
 try:
     from src.hw_autotune import autotune, detect_gpu_name
@@ -77,16 +78,15 @@ def _fetch_source(spec: str, dest_raw: str, label: str) -> str:
     """
     if _looks_like_local_path(spec):
         log.info(f"  [{label}] detectado path local: {spec}")
-        with step_timer(log, f"symlink local -> {dest_raw}"):
-            try:
-                # Elimina si ya existe de una corrida previa
-                if os.path.exists(dest_raw):
-                    os.remove(dest_raw)
-                # Crea un acceso directo (symlink) que funciona entre discos distintos
-                os.symlink(os.path.abspath(spec), dest_raw)
-            except OSError:
-                # Fallback a copy tradicional si symlink falla
-                shutil.copyfile(spec, dest_raw)
+        # SPEC §2: Fase 0 DEBE copiar fisicamente al NVMe local. Nunca symlinks,
+        # porque un enlace mantendria los reads subsiguientes sobre el volumen
+        # de red y reintroduciria el cuello de botella de I/O.
+        src_on_network = os.path.abspath(spec).startswith(os.path.abspath(NETWORK_DIR))
+        tag = "copy from network -> NVMe" if src_on_network else "copy local -> NVMe"
+        with step_timer(log, f"{tag}: {spec} -> {dest_raw}"):
+            if os.path.exists(dest_raw) or os.path.islink(dest_raw):
+                os.remove(dest_raw)
+            shutil.copyfile(spec, dest_raw)
         log_file_info(log, dest_raw, f"raw_{label}")
         return dest_raw
 
@@ -339,7 +339,7 @@ def _normalize_video(raw_video: str, final_video: str, test_mode: bool) -> None:
         _run_ffmpeg_with_progress(enc_cmd, f"encode-{vcodec}", duration_s, timeout_s=7200)
 
 
-def download_and_prepare_media(video_url: str, audio_url: str, test_mode: bool, output_dir: str = "input"):
+def download_and_prepare_media(video_url: str, audio_url: str, test_mode: bool, output_dir: str = LOCAL_INPUT):
     """Resuelve video+audio (URL Drive o path local) y normaliza con ffmpeg.
     test_mode=True recorta a 30s.
 

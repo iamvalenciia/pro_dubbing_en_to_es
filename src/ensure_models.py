@@ -3,16 +3,17 @@ import os
 import time
 
 from src.logger import get_logger, phase_timer, step_timer
+from src.paths import NETWORK_MODELS
 
 log = get_logger("ensure_models")
 
 
 QWEN_MODELS = [
-    ("QWEN_ASR_PATH", "Qwen/Qwen3-ASR-1.7B", "/runpod-volume/models/Qwen/Qwen3-ASR-1.7B"),
-    ("QWEN_ALIGNER_PATH", "Qwen/Qwen3-ForcedAligner-0.6B", "/runpod-volume/models/Qwen/Qwen3-ForcedAligner-0.6B"),
-    ("QWEN_TTS_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "/runpod-volume/models/Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
+    ("QWEN_ASR_PATH", "Qwen/Qwen3-ASR-1.7B", f"{NETWORK_MODELS}/Qwen/Qwen3-ASR-1.7B"),
+    ("QWEN_ALIGNER_PATH", "Qwen/Qwen3-ForcedAligner-0.6B", f"{NETWORK_MODELS}/Qwen/Qwen3-ForcedAligner-0.6B"),
+    ("QWEN_TTS_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base", f"{NETWORK_MODELS}/Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
     # MarianMT EN->ES para Fase 3 (reemplaza Gemini). ~300MB, sin API key.
-    ("MARIAN_MODEL_PATH", "Helsinki-NLP/opus-mt-en-es", "/runpod-volume/models/Helsinki-NLP/opus-mt-en-es"),
+    ("MARIAN_MODEL_PATH", "Helsinki-NLP/opus-mt-en-es", f"{NETWORK_MODELS}/Helsinki-NLP/opus-mt-en-es"),
 ]
 
 

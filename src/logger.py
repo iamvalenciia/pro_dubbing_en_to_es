@@ -42,15 +42,18 @@ class _TeeStream:
         return False
 
 
-def setup_pipeline_logger(log_dir: str = "logs") -> str:
+def setup_pipeline_logger(log_dir: str | None = None) -> str:
     """Configura logger root con handler de archivo + stdout y tee de stdout/stderr.
     Idempotente: solo configura una vez por proceso.
     IMPORTANTE: log_dir debe estar FUERA de temp_workspace/output/input (que son
-    purgados por clear_workspace). Por defecto usa './logs/pipeline.log'.
+    purgados por clear_workspace). Por defecto usa LOCAL_LOGS (NVMe local).
     Retorna la ruta del archivo de log.
     """
     global _LOG_PATH, _CONFIGURED
 
+    if log_dir is None:
+        from src.paths import LOCAL_LOGS
+        log_dir = LOCAL_LOGS
     os.makedirs(log_dir, exist_ok=True)
     _LOG_PATH = os.path.join(log_dir, "pipeline.log")
 

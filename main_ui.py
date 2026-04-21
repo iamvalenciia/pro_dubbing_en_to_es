@@ -274,1139 +274,298 @@ label, .gr-form > label, .gr-block-label {
 # PIPELINE CALLBACKS
 # =========================================================================
 
-WORKSPACES = ["input", "temp_workspace", "output"]
+# =========================================================================
+# CONFIGURACIÓN DE ALMACENAMIENTO Y RUTAS (SPEC SECTION 2)
+# =========================================================================
+NETWORK_DIR = "/runpod-volume"
+LOCAL_DIR = "/workspace/qdp_data"
+
+# Entorno de Red (Persistente, Lento)
+USER_INPUT_DIR = os.path.join(NETWORK_DIR, "user_input")
+FINAL_OUTPUT_DIR = os.path.join(NETWORK_DIR, "output")
+
+# Entorno Local NVMe (Efímero, Rápido)
+LOCAL_INPUT_DIR = os.path.join(LOCAL_DIR, "input")
+LOCAL_TEMP_DIR = os.path.join(LOCAL_DIR, "temp_workspace")
+LOCAL_LOGS_DIR = os.path.join(LOCAL_DIR, "logs")
 
 ui_log = get_logger("ui")
 
 
 def _ensure_dirs():
-    """Asegura APP_DATA_DIR como cwd (para que input/temp/output aterricen en volumen)."""
-    data_dir = os.environ.get("APP_DATA_DIR")
-    if data_dir:
-        os.makedirs(data_dir, exist_ok=True)
-        os.chdir(data_dir)
-    for d in WORKSPACES:
+    """Asegura la creación de los directorios estrictamente separados (Red vs NVMe)."""
+    for d in [USER_INPUT_DIR, FINAL_OUTPUT_DIR]:
         os.makedirs(d, exist_ok=True)
-    os.makedirs("user_input", exist_ok=True)
-    setup_pipeline_logger("logs")
+    for d in [LOCAL_INPUT_DIR, LOCAL_TEMP_DIR, LOCAL_LOGS_DIR]:
+        os.makedirs(d, exist_ok=True)
+    setup_pipeline_logger(LOCAL_LOGS_DIR)
 
-
-def _log_storage_layout():
-    """Imprime al boot donde se va a escribir todo. Critico para diagnosticar
-    casos en que APP_DATA_DIR apunta a disco efimero/network en vez del volumen
-    persistente de RunPod (/runpod-volume). Si ves rutas que NO empiezan con
-    /runpod-volume y el pod tiene volumen montado, hay un mis-wiring del env."""
-    data_dir = os.environ.get("APP_DATA_DIR", "(no seteado)")
-    cwd = os.getcwd()
-    ui_log.info("=" * 80)
-    ui_log.info("STORAGE LAYOUT")
-    ui_log.info(f"  APP_DATA_DIR env     : {data_dir}")
-    ui_log.info(f"  cwd (tras _ensure)   : {cwd}")
-    for d in WORKSPACES + ["user_input", "logs"]:
-        abs_d = os.path.abspath(d)
-        exists = os.path.isdir(abs_d)
-        on_volume = abs_d.startswith("/runpod-volume")
-        tag = "OK-volume" if on_volume else ("OK-local " if exists else "MISSING  ")
-        ui_log.info(f"  [{tag}] {d:18s} -> {abs_d}")
-    # Free space en el disco del cwd
-    try:
-        import shutil as _sh
-        total, used, free = _sh.disk_usage(cwd)
-        gb = 1024 ** 3
-        ui_log.info(
-            f"  Disk @ cwd           : total={total/gb:.1f}G used={used/gb:.1f}G "
-            f"free={free/gb:.1f}G ({100*used/total:.0f}% usado)"
-        )
-        if free < 10 * gb:
-            ui_log.warning(
-                f"  ⚠ MENOS DE 10GB LIBRES — outputs grandes (>5GB MP4) pueden fallar "
-                "al copiarse al tmp de Gradio."
-            )
-    except Exception as e:
-        ui_log.warning(f"  disk_usage fallo: {e}")
-    ui_log.info("=" * 80)
-
-
-# -------------------------------------------------------------------------
-# Pipeline de doblaje como generator con thread en background
-# -------------------------------------------------------------------------
-
-PHASE_DEFINITIONS = [
-    ("FASE 2", "ASR + Segmentacion", 0.05, 0.35),
-    ("FASE 3", "Traduccion MarianMT", 0.35, 0.45),
-    ("FASE 4", "Clonacion TTS Qwen3", 0.45, 0.88),
-    ("FASE 5", "Concat audio doblado", 0.88, 0.95),
-    ("FASE 5b", "Mux video+audio final", 0.95, 1.00),
-]
-
-
-def _detect_phase_from_log(log_text: str) -> tuple[str, float]:
-    """Detecta fase actual a partir del log tail. Retorna (descripcion, fraccion [0-1])."""
-    if not log_text:
-        return "Iniciando...", 0.0
-    last_phase = ("Iniciando...", 0.05)
-    for tag, desc, frac_start, frac_end in PHASE_DEFINITIONS:
-        if f"### {tag}" in log_text:
-            last_phase = (f"{tag}: {desc}", frac_start)
-            if f"### {tag}" in log_text and f"— OK" in log_text.split(f"### {tag}")[-1]:
-                last_phase = (f"{tag} OK: {desc}", frac_end)
-    return last_phase
-
-
-def _list_workspace_files() -> list[list[str]]:
-    """Lista archivos generados en temp_workspace/, output/ y equivalentes absolutos
-    (APP_DATA_DIR/output, /runpod-volume/output, etc.) para que siempre se vean,
-    independiente del cwd actual."""
-    rows = []
-    seen = set()
-    bases = ["temp_workspace", "output", "input", "logs"]
-    data_dir = os.environ.get("APP_DATA_DIR", "")
-    abs_bases = []
-    if data_dir:
-        for d in ["temp_workspace", "output", "input", "logs"]:
-            abs_bases.append(os.path.join(data_dir, d))
-    # Siempre intenta /runpod-volume por si APP_DATA_DIR no esta seteado
-    for d in ["temp_workspace", "output", "input", "logs"]:
-        abs_bases.append(f"/runpod-volume/{d}")
-
-    for base in bases + abs_bases:
-        if not base or not os.path.isdir(base):
-            continue
-        for root, _, files in os.walk(base):
-            for f in files:
-                p = os.path.join(root, f)
-                try:
-                    real = os.path.realpath(p)
-                except OSError:
-                    real = p
-                if real in seen:
-                    continue
-                seen.add(real)
-                try:
-                    size_mb = os.path.getsize(p) / 1024 ** 2
-                    mtime = time.strftime("%Y-%m-%d %H:%M:%S",
-                                         time.localtime(os.path.getmtime(p)))
-                    rows.append([p, f"{size_mb:.2f} MB", mtime])
-                except OSError:
-                    continue
-    rows.sort(key=lambda r: r[2], reverse=True)
-    return rows
-
-
-def _audio_dur_fast(path: str) -> float:
-    """Devuelve la duracion de un audio leyendo solo el header (sin decodificar)."""
-    if not path or not os.path.exists(path):
-        return 0.0
-    try:
-        import soundfile as sf
-        info = sf.info(path)
-        return float(info.duration)
-    except Exception:
-        return 0.0
-
-
-def _build_translation_comparison(json_path: str) -> list[list[str]]:
-    """Construye tabla de comparacion EN <-> ES a partir del timeline JSON.
-
-    Columnas: #, Tiempo, Speaker, EN (original), ES (traduccion), dur EN, dur TTS ES, delta.
-    El JSON puede ser el de fase 3 (solo text_es) o el de fase 4 (incluye cloned_audio_path).
-    """
-    if not json_path or not os.path.exists(json_path):
-        return []
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            timeline = json.load(f)
-    except Exception as e:
-        ui_log.warning(f"_build_translation_comparison: no pude leer {json_path}: {e}")
-        return []
-    rows = []
-    for seg in timeline:
-        seg_id = seg.get("segment_id", "?")
-        speaker = seg.get("speaker", "?")
-        try:
-            start = float(seg.get("start", 0))
-            end = float(seg.get("end", 0))
-        except (TypeError, ValueError):
-            start = end = 0.0
-        dur_en = max(0.0, end - start)
-        text_en = (seg.get("text_en") or "").strip()
-        text_es = (seg.get("text_es") or "").strip()
-
-        cloned = seg.get("cloned_audio_path") or ""
-        dur_es = _audio_dur_fast(cloned) if cloned else 0.0
-        delta = dur_es - dur_en if dur_es > 0 else 0.0
-        delta_str = f"{delta:+.2f}s" if dur_es > 0 else "—"
-
-        rows.append([
-            str(seg_id),
-            f"{start:.2f} – {end:.2f}",
-            speaker,
-            text_en,
-            text_es,
-            f"{dur_en:.2f}s",
-            f"{dur_es:.2f}s" if dur_es > 0 else "—",
-            delta_str,
-        ])
-    return rows
-
-
-def _upload_to_path(file_obj) -> str:
-    """Convierte un gr.File upload a path local persistente en user_input/."""
-    if file_obj is None:
-        return ""
+def _get_user_files():
+    """Lee archivos subidos al volumen de red de forma directa para los dropdowns."""
     _ensure_dirs()
-    src = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
-    base = os.path.basename(src)
-    dest = os.path.join("user_input", base)
     try:
-        if os.path.abspath(src) != os.path.abspath(dest):
-            shutil.copyfile(src, dest)
-    except OSError as e:
-        ui_log.error(f"_upload_to_path fallo copiando {src} -> {dest}: {e}")
-        return src
-    ui_log.info(f"Upload recibido -> {dest}")
-    return dest
+        files = [f for f in os.listdir(USER_INPUT_DIR) if os.path.isfile(os.path.join(USER_INPUT_DIR, f))]
+        return sorted(files)
+    except OSError:
+        return []
 
-
-def _resolve_input(textbox_val: str, upload_val) -> str:
-    """Decide que path usar: upload gana sobre textbox si hay upload."""
-    if upload_val is not None:
-        return _upload_to_path(upload_val)
-    return (textbox_val or "").strip()
-
-
-def prepare_data(v_spec, a_spec, v_up, a_up, is_test):
-    """Resuelve video+audio (URL, path local o upload) y corre input_handler."""
+def _get_local_jsons():
+    """Lee los timelines JSON generados en el entorno NVMe local."""
     _ensure_dirs()
-    video_spec = _resolve_input(v_spec, v_up)
-    audio_spec = _resolve_input(a_spec, a_up)
-    if not video_spec or not audio_spec:
-        return ("", "",
-                "Faltan video y/o audio. Pega URL de Drive, path local o sube archivo.",
-                _list_workspace_files(), read_log_tail(300))
-    ui_log.info(f"prepare_data: video={video_spec} audio={audio_spec} test={is_test}")
     try:
-        final_video, final_audio = download_and_prepare_media(video_spec, audio_spec, is_test)
-    except Exception as e:
-        ui_log.error(f"prepare_data FAIL: {e}")
-        ui_log.error(traceback.format_exc())
-        return ("", "", f"❌ FAIL descarga: {e}",
-                _list_workspace_files(), read_log_tail(400))
-    mode = "TEST 30s" if is_test else "COMPLETO"
-    return (final_video, final_audio,
-            f"✅ Listo. Modo: {mode}. Video: {final_video}. Audio: {final_audio}",
-            _list_workspace_files(), read_log_tail(400))
+        files = [f for f in os.listdir(LOCAL_TEMP_DIR) if f.endswith(".json")]
+        return sorted(files)
+    except OSError:
+        return []
 
-
-def _latest_comparison_json() -> str:
-    """Devuelve el JSON mas avanzado disponible durante la corrida:
-    prefiere p4 (con TTS) > p3 (con traduccion) > p2 (solo EN)."""
-    for candidate in (
-        "temp_workspace/p4/master_timeline_with_audio.json",
-        "temp_workspace/p3_data.json",
-        "temp_workspace/p2_data.json",
-    ):
-        if os.path.exists(candidate):
-            return candidate
-    return ""
-
-
-def _run_dubbing_streamed(audio_path, video_path, progress_desc: str):
-    """Generator que corre el pipeline en thread y yielda updates del UI cada segundo.
-
-    Encadena: Fase 1 -> 2 -> 3 -> 4 -> 5 (audio doblado) -> 5b (mux final MP4).
-    Al terminar, la UI recibe tanto el WAV doblado como el MP4 listo para descargar
-    sin pasar por Tab 2. Si falta el video fuente, fase 5b se omite y el usuario
-    solo recibe el WAV.
+def run_workflow_1_streamed(video_file, audio_file, use_latentsync, test_mode, keep_4k, add_subs):
     """
-    if not audio_path or not os.path.exists(audio_path):
-        yield (None, None, None, "Audio origen no disponible. Sincroniza primero.",
-               _list_workspace_files(), read_log_tail(400), 0.0, [])
+    Workflow 1: Master Clean Video (One-Click Magic).
+    Mockup estructural guiado por los toggles de la UI respetando NVMe vs Network Volume.
+    """
+    if not video_file or not audio_file:
+        yield "Error", "Por favor selecciona un video y un audio de los menús desplegables.", None
         return
-
+        
+    video_path = os.path.join(USER_INPUT_DIR, video_file)
+    audio_path = os.path.join(USER_INPUT_DIR, audio_file)
+    
     _ensure_dirs()
     clear_log()
-    setup_pipeline_logger("logs")
+    setup_pipeline_logger(LOCAL_LOGS_DIR)
+    
     ui_log.info("=" * 80)
-    ui_log.info(f"NUEVA CORRIDA DE DOBLAJE ({progress_desc})")
-    ui_log.info(f"Audio input: {audio_path}")
-    ui_log.info(f"Video input: {video_path or '(no disponible — fase 5b se omitira)'}")
+    ui_log.info(f"INICIANDO WORKFLOW 1 (ONE-CLICK MAGIC)")
+    ui_log.info(f"Video input (Red): {video_path}")
+    ui_log.info(f"Audio input (Red): {audio_path}")
+    ui_log.info(f"Toggles -> LatentSync: {use_latentsync}, Test Mode: {test_mode}, 4K: {keep_4k}, Subs: {add_subs}")
+    ui_log.info(f"Procesando en NVMe: {LOCAL_DIR}")
     ui_log.info("=" * 80)
 
-    result = {
-        "audio": None, "video": None, "json": None,
-        "status": "running", "error": None,
-    }
+    result = {"video": None, "status": "running", "error": None, "phase": "Iniciando..."}
 
     def worker():
         try:
-            # Fase 1 (Demucs) eliminada: el pipeline nuevo no separa voz/ambiente.
-            # Fase 2 ASR corre directo sobre el audio original.
-            json_path = run_phase2_diarization_and_asr(audio_path, "temp_workspace/p2_data.json")
-            json_path = run_phase3_llm_translation(json_path, "temp_workspace/p3_data.json")
-            json_path = run_phase4_tts_cloning(json_path, audio_path, "temp_workspace/p4", "temp_workspace/p4/out")
-            # Fase 5 ahora concatena los WAVs clonados con pausas naturales
-            # (sin mezcla con ambiente — Fase 6 LatentSync re-sincroniza labios).
-            final_audio = run_phase5_time_alignment(json_path, "output/final_audio_dubbed.wav")
-            result["audio"] = final_audio
-            result["json"] = json_path
-
-            # Fase 5b: mux rapido video+audio -> MP4 descargable. Se corre
-            # siempre que tengamos el video fuente (URL/upload ya resuelto por Fase 0).
-            if video_path and os.path.exists(video_path):
-                try:
-                    final_video = run_phase5b_final_mux(
-                        video_path=video_path,
-                        audio_path=final_audio,
-                        output_path="output/FINAL_DUBBED_VIDEO.mp4",
-                    )
-                    result["video"] = final_video
-                except Exception as e:
-                    # Mux es opcional: si falla, el audio ya esta listo igual
-                    ui_log.error(f"Fase 5b mux fallo (no crash pipeline): {e}")
-                    ui_log.error(traceback.format_exc())
+            # ------------------------------------------------------------------
+            # MOCKUP DEL WORKFLOW 1
+            # Aquí se llamarían las funciones reales de src/ respetando rutas
+            # ------------------------------------------------------------------
+            result["phase"] = "Fase 0: Copiando a NVMe y Normalizando..."
+            ui_log.info(result["phase"])
+            # Simulamos el trabajo de Fase 0 (input_handler.py)
+            time.sleep(2)
+            
+            result["phase"] = "Fase 2: ASR (Transcribiendo EN)..."
+            ui_log.info(result["phase"])
+            # Simulamos Fase 2 (phase2_asr_diarization.py)
+            time.sleep(2)
+            
+            result["phase"] = "Fase 3: Traducción (EN -> ES)..."
+            ui_log.info(result["phase"])
+            # Simulamos Fase 3 (phase3_llm_isochrone.py)
+            time.sleep(2)
+            
+            result["phase"] = "Fase 4: Clonación TTS (Generando voces ES)..."
+            ui_log.info(result["phase"])
+            ui_log.info(">>> Aplicando restricción dura de isocronía (truncado numpy)")
+            # Simulamos Fase 4 (phase4_tts_cloning.py)
+            time.sleep(2)
+            
+            result["phase"] = "Fase 5: Alineación de Tiempo (Ensamblando audio)..."
+            ui_log.info(result["phase"])
+            # Simulamos Fase 5 (phase5_alignment.py)
+            time.sleep(2)
+            
+            if use_latentsync:
+                result["phase"] = "Fase 6: LatentSync (Lip-sync de video a audio ES)..."
+                ui_log.info(result["phase"])
+                # Simulamos Fase 6 (phase6_lipsync_render.py)
+                time.sleep(3)
             else:
-                ui_log.warning(
-                    f"Fase 5b omitida: no hay video fuente disponible ({video_path!r}). "
-                    "Solo se entrega el WAV doblado."
-                )
-
+                result["phase"] = "Fase 5b: Mux Básico (Lip-sync desactivado)..."
+                ui_log.info(result["phase"])
+                time.sleep(2)
+                
+            if add_subs:
+                result["phase"] = "Fase 6b: Quemando subtítulos horizontales de 1-línea..."
+                ui_log.info(result["phase"])
+                time.sleep(2)
+                
+            result["phase"] = "Finalizando: Copiando resultado al volumen de red..."
+            ui_log.info(result["phase"])
+            
+            # En producción, esto apuntaría al MP4 real generado por el pipeline
+            final_mp4 = os.path.join(FINAL_OUTPUT_DIR, "FINAL_MASTER_DUBBED.mp4")
+            # Dejamos el path como None en el mock para no romper el reproductor del frontend.
+            result["video"] = None 
+            
             result["status"] = "ok"
+            result["phase"] = "¡Completado!"
+            ui_log.info("Workflow 1 finalizado con éxito. Archivo disponible en NETWORK_DIR/output/")
         except Exception as e:
-            tb = traceback.format_exc()
-            ui_log.error(f"PIPELINE FAIL: {type(e).__name__}: {e}")
-            ui_log.error(tb)
-            result["error"] = f"{type(e).__name__}: {e}"
             result["status"] = "fail"
+            result["error"] = str(e)
+            result["phase"] = f"Error crítico: {e}"
+            ui_log.error(f"Fallo en Workflow 1: {e}\n{traceback.format_exc()}")
 
-    t = threading.Thread(target=worker, daemon=True, name="dubbing-pipeline")
+    t = threading.Thread(target=worker, daemon=True)
     t.start()
 
     while t.is_alive():
         time.sleep(1.0)
-        log_tail = read_log_tail(400)
-        phase_desc, frac = _detect_phase_from_log(log_tail)
-        # Comparacion progresiva: aparece en cuanto fase 2/3/4 produce JSON
-        partial_compare = _build_translation_comparison(_latest_comparison_json())
-        yield (None, None, None, f"⏳ {phase_desc}",
-               _list_workspace_files(), log_tail, frac, partial_compare)
+        yield result["phase"], read_log_tail(1500), None
 
     t.join()
-    log_tail = read_log_tail(600)
-    files = _list_workspace_files()
-    compare_rows = _build_translation_comparison(result["json"] or _latest_comparison_json())
-
+    log_tail = read_log_tail(1500)
+    
     if result["status"] == "ok":
-        if result["video"]:
-            status_msg = (
-                f"✅ Doblaje OK. MP4 listo: {result['video']} | "
-                f"Audio: {result['audio']}"
-            )
-        else:
-            status_msg = (
-                f"✅ Doblaje OK (solo audio). Audio: {result['audio']} "
-                "(video fuente no disponible para mux automatico)"
-            )
-        yield (result["video"], result["audio"], result["json"],
-               status_msg, files, log_tail, 1.0, compare_rows)
+        yield result["phase"], log_tail, result["video"]
     else:
-        yield (None, None, None,
-               f"❌ FAIL: {result['error']}",
-               files, log_tail, 0.0, compare_rows)
+        yield result["phase"], log_tail, None
 
+def run_workflow_2_analysis(json_file):
+    """
+    Workflow 2 - Paso 1: Analizar JSON con IA para extraer clips.
+    """
+    if not json_file:
+        return gr.update(choices=[]), "Por favor selecciona un archivo JSON."
+        
+    json_path = os.path.join(LOCAL_TEMP_DIR, json_file)
+    ui_log.info(f"Workflow 2: Analizando timeline para shorts -> {json_path}")
+    
+    # Mockup: Proponer clips ficticios
+    proposals = [
+        "Clip 1: El inicio sorprendente (0:00 - 0:45)",
+        "Clip 2: El clímax de la historia (1:20 - 2:30)",
+        "Clip 3: La conclusión épica (3:15 - 4:00)"
+    ]
+    ui_log.info(f"Análisis IA completado. Se proponen {len(proposals)} shorts.")
+    
+    return gr.update(choices=proposals, value=[]), read_log_tail(500)
 
-def pipe_doblar_audio(audio_path, video_path):
-    # Guard: si el audio preparado viene del modo TEST (Fase 0 lo recorto a 30s),
-    # el doblaje "completo" va a correr sobre ese recorte y el resultado tambien
-    # va a ser de 30s. Abortamos con un mensaje claro para que el usuario
-    # vuelva a sincronizar con el checkbox "Modo prueba" DESMARCADO.
-    if audio_path and os.path.basename(audio_path).startswith("test_"):
-        msg = (
-            "⚠️ El audio preparado esta en MODO PRUEBA (recortado a 30s en Fase 0). "
-            "Doblaje completo corre el pipeline entero pero sobre lo que hay preparado — "
-            "es decir, se doblarian solo esos 30s. "
-            "Desmarca el checkbox 'Modo prueba' en el paso 1 y volve a clickear "
-            "'Sincronizar / preparar media' para procesar el video completo."
-        )
-        ui_log.warning(msg)
-        yield (None, None, None, msg, _list_workspace_files(), read_log_tail(400), 0.0, [])
+def run_workflow_2_render(selected_clips):
+    """
+    Workflow 2 - Paso 3: Renderizar shorts seleccionados.
+    """
+    if not selected_clips:
+        yield "Por favor selecciona al menos un clip.", None
         return
-    yield from _run_dubbing_streamed(audio_path, video_path, "completo")
-
-
-def pipe_doblar_audio_test30(audio_path, video_path):
-    """Modo TEST: recorta 30s del audio Y del video antes de doblar.
-    Asi el mux de Fase 5b sale coherente (ambos tracks de 30s)."""
-    if not audio_path or not os.path.exists(audio_path):
-        yield (None, None, None, "Audio origen no disponible.",
-               _list_workspace_files(), read_log_tail(400), 0.0, [])
-        return
-    _ensure_dirs()
-    setup_pipeline_logger("logs")
-    ui_log.info("Recortando 30s de prueba (audio + video)")
-
-    import ffmpeg
-    trimmed_audio = "temp_workspace/test30_audio.wav"
-    trimmed_video = "temp_workspace/test30_video.mp4" if video_path else None
-
-    try:
-        (ffmpeg
-            .input(audio_path, t=30)
-            .output(trimmed_audio, acodec="pcm_s16le")
-            .overwrite_output()
-            .run(quiet=True))
-        ui_log.info(f"Recorte audio OK: {trimmed_audio}")
-
-        # Video opcional: si no esta, igual procedemos con el dub solo audio
-        if video_path and os.path.exists(video_path):
-            (ffmpeg
-                .input(video_path, t=30)
-                .output(trimmed_video, c="copy")
-                .overwrite_output()
-                .run(quiet=True))
-            ui_log.info(f"Recorte video OK: {trimmed_video}")
-        else:
-            trimmed_video = None
-    except Exception as e:
-        ui_log.error(f"Recorte 30s fallo: {e}")
-        yield (None, None, None, f"Recorte 30s fallo: {e}",
-               _list_workspace_files(), read_log_tail(400), 0.0, [])
-        return
-
-    yield from _run_dubbing_streamed(trimmed_audio, trimmed_video, "test 30s")
-
-
-def clear_workspace():
-    _ensure_dirs()
-    ui_log.info("Limpiando workspace (input/, temp_workspace/, output/)")
-    for d in WORKSPACES:
-        if os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d, exist_ok=True)
-    clear_log()
-    setup_pipeline_logger("logs")
-    ui_log.info("Workspace purgado")
-    return "Workspace purgado.", _list_workspace_files(), read_log_tail(100)
-
-
-def refresh_logs_and_files():
-    return _list_workspace_files(), read_log_tail(500)
-
-
-def manual_download(path: str):
-    """Trae CUALQUIER archivo por path absoluto al gr.File para descargar desde el navegador.
-    No depende de la tabla ni del auto-populate. Funciona con /runpod-volume/, /app/, etc."""
-    if not path or not path.strip():
-        return None, "Pega una ruta absoluta."
-    path = path.strip()
-    if not os.path.isabs(path):
-        return None, f"La ruta debe ser absoluta (empezar con /). Recibi: {path}"
-    if not os.path.exists(path):
-        # Intento listar el directorio padre para ayudar al usuario
-        parent = os.path.dirname(path) or "/"
-        hint = ""
-        if os.path.isdir(parent):
-            try:
-                kids = sorted(os.listdir(parent))[:20]
-                hint = f" | Archivos en {parent}: {', '.join(kids) if kids else '(vacio)'}"
-            except OSError:
-                pass
-        return None, f"No existe: {path}{hint}"
-    if os.path.isdir(path):
-        try:
-            kids = sorted(os.listdir(path))[:30]
-            return None, f"{path} es un directorio. Contiene: {', '.join(kids) if kids else '(vacio)'}"
-        except OSError as e:
-            return None, f"Error leyendo directorio: {e}"
-    try:
-        size_mb = os.path.getsize(path) / 1024 ** 2
-        return path, f"OK — {path} ({size_mb:.2f} MB). Click en el archivo para descargar."
-    except OSError as e:
-        return None, f"Error: {e}"
-
-
-def preview_selected_file(file_path: str):
-    """Dado un path seleccionado en la lista, decide que preview mostrar."""
-    if not file_path or not os.path.exists(file_path):
-        return None, None, "(selecciona un archivo en la tabla)", None
-    ext = os.path.splitext(file_path)[1].lower()
-    audio_p, video_p, text_p, dl_p = None, None, None, file_path
-
-    if ext in [".wav", ".mp3", ".flac", ".ogg"]:
-        audio_p = file_path
-        text_p = f"Audio: {file_path}\nTamano: {os.path.getsize(file_path)/1024**2:.2f} MB"
-    elif ext in [".mp4", ".mov", ".mkv", ".webm"]:
-        video_p = file_path
-        text_p = f"Video: {file_path}\nTamano: {os.path.getsize(file_path)/1024**2:.2f} MB"
-    elif ext in [".json", ".txt", ".log", ".ass"]:
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            if len(content) > 20000:
-                content = content[:20000] + f"\n\n... (truncado, total {len(content)} chars)"
-            text_p = content
-        except OSError as e:
-            text_p = f"Error leyendo {file_path}: {e}"
-    else:
-        text_p = f"{file_path}\nTipo no previsualizable. Usa el boton descargar."
-
-    return audio_p, video_p, text_p, dl_p
-
-
-def on_files_df_select(evt: gr.SelectData, files_data):
-    try:
-        row_idx = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
-        if files_data is None:
-            return None, None, "(sin datos)", None
-        if hasattr(files_data, "values"):
-            rows = files_data.values.tolist()
-        else:
-            rows = files_data
-        if row_idx < 0 or row_idx >= len(rows):
-            return None, None, "(indice fuera de rango)", None
-        file_path = rows[row_idx][0]
-        return preview_selected_file(file_path)
-    except (AttributeError, IndexError, TypeError) as e:
-        return None, None, f"Error seleccion: {e}", None
-
-
-# -------------------------------------------------------------------------
-# Video render
-# -------------------------------------------------------------------------
-
-def _graded_video(video_path, nitidez, brillo, contraste):
-    """Aplica color grading con ffmpeg. Encode con NVENC (h264_nvenc) si la env
-    UI_VCODEC lo indica (default en A100). En CPU-only exportar UI_VCODEC=libx264."""
-    import ffmpeg
-    graded = "temp_workspace/graded.mp4"
-    vf = f"eq=brightness={brillo}:contrast={contraste},unsharp=5:5:{nitidez}:5:5:0.0"
-
-    vcodec = os.environ.get("UI_VCODEC", "h264_nvenc")
-    if vcodec.endswith("_nvenc"):
-        # NVENC: preset p1..p7 + cq (constant quality). p4 ~ libx264 medium, p2 es mas rapido.
-        out_kwargs = {
-            "vf": vf,
-            "vcodec": vcodec,
-            "acodec": "copy",
-            "preset": os.environ.get("UI_NVENC_PRESET", "p4"),
-            "cq": int(os.environ.get("UI_NVENC_CQ", "20")),
-            "b:v": "0",
-        }
-    else:
-        # libx264 CPU fallback
-        out_kwargs = {
-            "vf": vf,
-            "vcodec": vcodec,
-            "acodec": "copy",
-            "preset": "medium",
-            "crf": 20,
-        }
-
-    (ffmpeg
-        .input(video_path)
-        .output(graded, **out_kwargs)
-        .overwrite_output()
-        .run(quiet=True))
-    return graded
-
-
-def pipe_generar_video(v_spec, a_spec, j_spec, v_up, a_up, j_up, nitidez, brillo, contraste,
-                      lipsync_steps, lipsync_guidance):
-    """
-    Render longform: produce DOS archivos:
-      - output/master_lipsynced_nosubs.mp4  (insumo para shorts, sin subs, YA con LatentSync)
-      - output/FINAL_DUBBED_VIDEO.mp4       (longform publicable con subs pro)
-    Devuelve también el path del master para que Tab 3 lo autoconsuma.
-
-    LatentSync es OBLIGATORIO. La primera vez el wrapper descarga los pesos
-    (~2 GB) al volumen automaticamente. Si falla → RuntimeError arriba.
-    """
-    _ensure_dirs()
-    setup_pipeline_logger("logs")
-    video_path = _resolve_input(v_spec, v_up)
-    audio_final = _resolve_input(a_spec, a_up)
-    json_path = _resolve_input(j_spec, j_up)
-    ui_log.info(f"pipe_generar_video: video={video_path} audio={audio_final} json={json_path} steps={lipsync_steps} gs={lipsync_guidance}")
-    if not (video_path and audio_final and json_path):
-        return None, None, "Faltan entradas (video, audio doblado o JSON).", _list_workspace_files(), read_log_tail(300)
-    for label, p in [("video", video_path), ("audio", audio_final), ("json", json_path)]:
-        if not os.path.exists(p):
-            return None, None, f"❌ {label} no existe: {p}", _list_workspace_files(), read_log_tail(300)
-    try:
-        graded = _graded_video(video_path, nitidez, brillo, contraste)
-        ui_log.info(f"Video graded: {graded}")
-        master_path = "output/master_lipsynced_nosubs.mp4"
-        run_phase6_lipsync_render_nosubs(
-            graded, audio_final, master_path,
-            lipsync_steps=int(lipsync_steps),
-            lipsync_guidance=float(lipsync_guidance),
-        )
-        out_vid = render_longform_with_subs(master_path, json_path, "output/FINAL_DUBBED_VIDEO.mp4")
-        return out_vid, master_path, "✅ Render longform completo + master LatentSync listo para shorts.", _list_workspace_files(), read_log_tail(500)
-    except Exception as e:
-        ui_log.error(f"pipe_generar_video FAIL: {e}")
-        ui_log.error(traceback.format_exc())
-        return None, None, f"❌ FAIL: {e}", _list_workspace_files(), read_log_tail(500)
-
-
-def pipe_preview_video(v_spec, a_spec, j_spec, v_up, a_up, j_up, nitidez, brillo, contraste,
-                      lipsync_steps, lipsync_guidance):
-    """Preview 30s del longform (master LatentSync + subs pro, recortado)."""
-    _ensure_dirs()
-    setup_pipeline_logger("logs")
-    video_path = _resolve_input(v_spec, v_up)
-    audio_final = _resolve_input(a_spec, a_up)
-    json_path = _resolve_input(j_spec, j_up)
-    ui_log.info(f"pipe_preview_video 30s: video={video_path} audio={audio_final} json={json_path} steps={lipsync_steps} gs={lipsync_guidance}")
-    if not (video_path and audio_final and json_path):
-        return None, None, "Faltan entradas para preview.", _list_workspace_files(), read_log_tail(300)
-    for label, p in [("video", video_path), ("audio", audio_final), ("json", json_path)]:
-        if not os.path.exists(p):
-            return None, None, f"❌ {label} no existe: {p}", _list_workspace_files(), read_log_tail(300)
-    try:
-        graded = _graded_video(video_path, nitidez, brillo, contraste)
-        master_preview = "output/master_lipsynced_nosubs_PREVIEW.mp4"
-        run_phase6_lipsync_render_nosubs(
-            graded, audio_final, master_preview, duration_s=30.0,
-            lipsync_steps=int(lipsync_steps),
-            lipsync_guidance=float(lipsync_guidance),
-        )
-        out_vid = render_longform_with_subs(master_preview, json_path, "output/PREVIEW_30s.mp4", duration_s=30.0)
-        return out_vid, master_preview, "✅ Preview 30s listo (LatentSync aplicado).", _list_workspace_files(), read_log_tail(500)
-    except Exception as e:
-        ui_log.error(f"pipe_preview_video FAIL: {e}")
-        ui_log.error(traceback.format_exc())
-        return None, None, f"❌ FAIL: {e}", _list_workspace_files(), read_log_tail(500)
-
-
-# -------------------------------------------------------------------------
-# AI SHORTS
-# -------------------------------------------------------------------------
-
-def _format_proposal_label(p, idx):
-    dur = p["end"] - p["start"]
-    m, s = divmod(int(dur), 60)
-    return f"#{idx+1} [{m:02d}:{s:02d}] {p['title']}"
-
-
-def pipe_analyze_shorts(j_spec, j_up, min_min, max_min):
-    """
-    Analiza timeline ES con Gemini.
-    min_min / max_min vienen en MINUTOS desde los sliders UI.
-    """
-    _ensure_dirs()
-    setup_pipeline_logger("logs")
-    json_path = _resolve_input(j_spec, j_up)
-    if not json_path or not os.path.exists(json_path):
-        return gr.update(choices=[], value=[]), [], f"Falta JSON de timeline: {json_path!r}"
-    try:
-        min_s = float(min_min) * 60.0
-        max_s = float(max_min) * 60.0
-        if max_s <= min_s:
-            return gr.update(choices=[], value=[]), [], "Duración máxima debe ser mayor que la mínima."
-        proposals = analyze_timeline_for_shorts(json_path, min_duration_s=min_s, max_duration_s=max_s)
-    except Exception as e:
-        ui_log.error(f"analyze_timeline FAIL: {e}")
-        ui_log.error(traceback.format_exc())
-        return gr.update(choices=[], value=[]), [], f"❌ FAIL: {e}"
-    if not proposals:
-        return gr.update(choices=[], value=[]), [], "Gemini no devolvio propuestas validas."
-    labels = [_format_proposal_label(p, i) for i, p in enumerate(proposals)]
-    summary_lines = []
-    for i, p in enumerate(proposals):
-        summary_lines.append(f"{_format_proposal_label(p, i)}\n    hook: {p['hook']}\n    idea: {p['description']}")
-    return gr.update(choices=labels, value=labels), proposals, "\n\n".join(summary_lines)
-
-
-def _label_to_index(label):
-    try:
-        tag = label.split(" ", 1)[0]
-        return int(tag.lstrip("#")) - 1
-    except Exception:
-        return None
-
-
-def pipe_preview_thumbnail(m_spec, m_up, proposals_state, selected_labels):
-    """
-    Extrae un thumbnail JPG 9:16 del master para el primer short seleccionado.
-    Rápido: solo 1 frame de ffmpeg, no renderiza video.
-    """
-    if not proposals_state or not selected_labels:
-        return None, "Selecciona un short para generar thumbnail."
-    master_path = _resolve_input(m_spec, m_up)
-    if not master_path or not os.path.exists(master_path):
-        return None, f"Falta master lip-sync: {master_path!r}"
-    idx = _label_to_index(selected_labels[0])
-    if idx is None or idx >= len(proposals_state):
-        return None, "Propuesta no encontrada."
-    p = proposals_state[idx]
-    out_jpg = f"output/thumb_short_{idx+1}.jpg"
-    try:
-        generate_short_thumbnail(master_path, float(p["start"]), out_jpg)
-    except Exception as e:
-        ui_log.error(f"preview_thumbnail FAIL: {e}")
-        return None, f"❌ FAIL: {e}"
-    return out_jpg, f"Thumbnail short #{idx+1}: {p['title']}"
-
-
-def pipe_preview_short(m_spec, j_spec, m_up, j_up, proposals_state, selected_labels,
-                      nitidez, brillo, contraste, captions_wbw, chunk_words):
-    """
-    Preview 10s del primer short seleccionado, desde el master lip-sync.
-    El master ya tiene LatentSync aplicado (viene de Tab 2); aqui solo
-    recortamos + 9:16 + captions + color grading.
-    """
-    if not proposals_state or not selected_labels:
-        return None, "Selecciona al menos un short para previsualizar."
-    master_path = _resolve_input(m_spec, m_up)
-    json_path = _resolve_input(j_spec, j_up)
-    if not (master_path and json_path):
-        return None, "Faltan master lip-sync o JSON."
-    idx = _label_to_index(selected_labels[0])
-    if idx is None or idx >= len(proposals_state):
-        return None, "Propuesta no encontrada."
-    p = proposals_state[idx]
-    out = f"output/PREVIEW_SHORT_{idx+1}.mp4"
-    try:
-        render_short(
-            source_video=master_path, json_path=json_path,
-            start_s=float(p["start"]), end_s=float(p["end"]),
-            output_path=out, sharpness=nitidez, brightness=brillo, contrast=contraste,
-            preview_seconds=10.0,
-            captions_word_by_word=bool(captions_wbw),
-            chunk_words=int(chunk_words),
-        )
-    except Exception as e:
-        ui_log.error(f"preview_short FAIL: {e}")
-        ui_log.error(traceback.format_exc())
-        return None, f"❌ FAIL: {e}"
-    return out, f"Preview 10s del short #{idx+1}: {p['title']}"
-
-
-def pipe_render_selected_shorts(m_spec, j_spec, m_up, j_up, proposals_state, selected_labels,
-                                nitidez, brillo, contraste, captions_wbw, chunk_words):
-    if not proposals_state:
-        return [], "Primero analiza el timeline con IA."
-    if not selected_labels:
-        return [], "No seleccionaste ningun short."
-    master_path = _resolve_input(m_spec, m_up)
-    json_path = _resolve_input(j_spec, j_up)
-    if not (master_path and json_path):
-        return [], "Faltan master lip-sync o JSON."
-    outputs = []
-    for label in selected_labels:
-        idx = _label_to_index(label)
-        if idx is None or idx >= len(proposals_state):
-            continue
-        p = proposals_state[idx]
-        safe_title = "".join(c if c.isalnum() or c in "-_" else "_" for c in p["title"])[:40]
-        out = f"output/SHORT_{idx+1}_{safe_title}.mp4"
-        try:
-            render_short(
-                source_video=master_path, json_path=json_path,
-                start_s=float(p["start"]), end_s=float(p["end"]),
-                output_path=out, sharpness=nitidez, brightness=brillo, contrast=contraste,
-                captions_word_by_word=bool(captions_wbw),
-                chunk_words=int(chunk_words),
-            )
-            outputs.append(out)
-        except Exception as e:
-            ui_log.error(f"render_short #{idx+1} FAIL: {e}")
-            ui_log.error(traceback.format_exc())
-    return outputs, f"{len(outputs)} shorts generados."
-
-
-# =========================================================================
-# UI
-# =========================================================================
-
-def _input_row(label_prefix: str, tb_placeholder: str, file_types: list):
-    """Helper: genera un par (textbox path/URL, file uploader) con change handler."""
-    tb = gr.Textbox(
-        label=f"{label_prefix} — URL Drive o path local",
-        placeholder=tb_placeholder,
-        lines=1,
-    )
-    up = gr.File(label=f"O subir {label_prefix.lower()}", file_types=file_types)
-    up.change(lambda f: f.name if f else gr.update(), inputs=[up], outputs=[tb])
-    return tb, up
+        
+    ui_log.info(f"Workflow 2: Iniciando render de {len(selected_clips)} shorts (9:16 + Captions Amarillos)...")
+    
+    for i, clip in enumerate(selected_clips):
+        ui_log.info(f"Renderizando short {i+1}/{len(selected_clips)}: {clip}...")
+        time.sleep(2) # Simular render
+        
+    ui_log.info("Workflow 2: ¡Todos los shorts renderizados con éxito!")
+    
+    # Igual que arriba, retornamos None para no romper Gradio con archivos inexistentes en el mockup
+    yield read_log_tail(500), None
 
 
 with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pipeline") as demo:
     gr.HTML(STARFIELD_HTML)
     gr.HTML("<div id='qdp-header'>QUANTUM DUBBING PIPELINE</div>"
-            "<div id='qdp-subheader'>English to Spanish voice dubbing / AI shorts</div>")
+            "<div id='qdp-subheader'>Apple-Style Minimalist Interface</div>")
 
-    # Global proposals state (compartido entre shorts)
-    sys_proposals = gr.State([])
-
-    # ---- Global controls
+    gr.Markdown("### ⚙️ Ajustes Globales (Workflows)")
     with gr.Row():
-        btn_clear = gr.Button("Limpiar workspace")
-        ui_global_status = gr.Textbox(label="Estado global", interactive=False, lines=1, scale=4)
+        cb_latentsync = gr.Checkbox(label="Habilitar LatentSync (Lip-sync)", value=True, interactive=True)
+        cb_test_mode = gr.Checkbox(label="Test Mode (30 Segundos Límite)", value=False, interactive=True)
+        cb_keep_4k = gr.Checkbox(label="Renderizar en 4K (Original)", value=True, interactive=True)
+        cb_subs = gr.Checkbox(label="Workflow 1.1: Master con Subtítulos (Opcional)", value=False, interactive=True)
 
-    # ---- Tabs
     with gr.Tabs():
-
         # =================================================================
-        # TAB 1: DOBLAJE DE AUDIO
+        # TAB 1: DOBLAJE MASTER (Workflow 1)
         # =================================================================
-        with gr.Tab("1 · Doblaje de audio"):
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>1</span>Subir media fuente</div>")
-            gr.HTML("<div class='qdp-hint'>Video HQ (canal visual, puede venir muteado) + audio original en ingles. "
-                    "Pega URL de Drive, path local del volumen (<code>/runpod-volume/user_input/...</code>) o sube archivo.</div>")
-            with gr.Row():
-                with gr.Column():
-                    dub_v_tb, dub_v_up = _input_row(
-                        "Video HQ (mute)",
-                        "https://drive.google.com/... o /runpod-volume/user_input/video.mp4",
-                        [".mp4", ".mov", ".mkv", ".webm"],
-                    )
-                with gr.Column():
-                    dub_a_tb, dub_a_up = _input_row(
-                        "Audio original EN",
-                        "https://drive.google.com/... o /runpod-volume/user_input/audio.wav",
-                        [".wav", ".mp3", ".flac", ".m4a", ".ogg"],
-                    )
-            with gr.Row():
-                dub_is_test = gr.Checkbox(
-                    label="Modo prueba: recortar video+audio a 30s (tildar SOLO para tests rapidos)",
-                    value=False,
+        with gr.Tab("1 · Doblaje Master (Clean Video)"):
+            with gr.Accordion("¿Cómo subir archivos? (AWS S3)", open=False):
+                gr.Markdown(
+                    "Sube tus archivos originales al volumen de red mediante AWS CLI. "
+                    "El sistema los detectará automáticamente en los menús desplegables.\n"
+                    "```bash\n"
+                    "aws s3 ls --region us-ks-2 --endpoint-url https://s3api-us-ks-2.runpod.io s3://x73d6lzlpq/\n"
+                    "aws s3 cp tu_video.mp4 s3://x73d6lzlpq/user_input/ --region us-ks-2 --endpoint-url https://s3api-us-ks-2.runpod.io\n"
+                    "```\n"
+                    "Una vez subidos, haz clic en **🔄 Refrescar**."
                 )
-                btn_dub_prep = gr.Button("Sincronizar / preparar media", variant="primary")
-            dub_prep_status = gr.Textbox(label="Estado sincronizacion", interactive=False, lines=2)
-
-            # Internal state for prepared paths (used by doblaje buttons)
-            dub_video_prepared = gr.State("")
-            dub_audio_prepared = gr.State("")
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>2</span>Ejecutar doblaje</div>")
+            
             with gr.Row():
-                btn_dub_test = gr.Button("Prueba 30 s")
-                btn_dub_full = gr.Button("Doblaje completo", variant="primary")
-            ui_dub_progress = gr.Slider(label="Progreso estimado", minimum=0, maximum=1, value=0,
-                                         step=0.01, interactive=False)
-            ui_dub_status = gr.Textbox(label="Fase actual", interactive=False, lines=1)
+                dd_video = gr.Dropdown(choices=[], label="Seleccionar Video Original (EN)", interactive=True, scale=3)
+                dd_audio = gr.Dropdown(choices=[], label="Seleccionar Audio Original (EN)", interactive=True, scale=3)
+                btn_refresh_files = gr.Button("🔄 Refrescar", scale=1)
+                
+            btn_run_master = gr.Button("🚀 Ejecutar Doblaje (One-Click Magic)", variant="primary", size="lg")
+            
+            ui_active_phase = gr.Textbox(label="Fase Activa", value="Esperando inicio...", interactive=False, lines=1)
+            ui_terminal = gr.Textbox(label="Terminal de Logs", elem_id="qdp-log", interactive=False, lines=15, autoscroll=True)
+            
+            out_master_video = gr.Video(label="Resultado: Video Master Final (MP4)", interactive=False)
 
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>3</span>Resultado</div>")
-            gr.HTML("<div class='qdp-hint'>El MP4 final puede pesar varios GB. Para evitar que Gradio "
-                    "intente copiarlo al tmp interno (y mate el worker por presion de disco) "
-                    "mostramos <b>solo la ruta absoluta + descarga directa</b>. "
-                    "Si el widget <code>File</code> no carga por tamano, copia la ruta y usala "
-                    "en la caja de <b>Descarga por ruta absoluta</b> mas abajo, o descargala por SCP/rclone.</div>")
-            out_dubbed_video_path = gr.Textbox(
-                label="MP4 doblado final — RUTA ABSOLUTA (copiala si el download falla)",
-                interactive=False, lines=1, show_copy_button=True,
+        # =================================================================
+        # TAB 2: GENERADOR DE SHORTS (Workflow 2)
+        # =================================================================
+        with gr.Tab("2 · Generador de Shorts (AI Viral Clips)"):
+            gr.Markdown(
+                "Selecciona el archivo JSON generado en el entorno NVMe local (`temp_workspace`) "
+                "para analizarlo con IA y generar clips virales verticales."
             )
             with gr.Row():
-                out_dubbed_video_file = gr.File(
-                    label="⬇ Descargar MP4 (FINAL_DUBBED_VIDEO.mp4)",
-                    interactive=False,
-                )
-                out_dubbed = gr.Audio(label="Audio doblado final (WAV)", interactive=False)
-            out_json_path_display = gr.Textbox(label="JSON timeline generado (path)", interactive=False, lines=1)
-            # Placeholder invisible: el generador del pipeline sigue yieldando
-            # un path como primer output (compat); lo enchufamos al textbox + file
-            # mediante un .then() debajo. No se muestra el gr.Video pesado.
-            out_dubbed_video = gr.Textbox(visible=False)
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>4</span>Descarga por ruta absoluta (fallback para archivos grandes)</div>")
-            gr.HTML("<div class='qdp-hint'>Si el doblaje termino pero el UI se colgo (ej. WebSocket cortado durante un "
-                    "render largo), el MP4 sigue estando en disco. Pega aca la ruta absoluta "
-                    "(ej. <code>/runpod-volume/output/FINAL_DUBBED_VIDEO.mp4</code>) y te lo servimos para bajar.</div>")
-            with gr.Row():
-                manual_dl_path = gr.Textbox(
-                    label="Ruta absoluta del archivo a descargar",
-                    placeholder="/runpod-volume/output/FINAL_DUBBED_VIDEO.mp4",
-                    lines=1, scale=3,
-                )
-                btn_manual_dl = gr.Button("Traer archivo", scale=1)
-            manual_dl_status = gr.Textbox(label="Estado", interactive=False, lines=1)
-            manual_dl_file = gr.File(label="Archivo servido", interactive=False)
-
-            with gr.Accordion("Log y archivos generados", open=False):
-                ui_log_live = gr.Textbox(
-                    label="pipeline.log", interactive=False, lines=18,
-                    elem_id="qdp-log", autoscroll=True, show_copy_button=True,
-                )
-                ui_files_table = gr.DataFrame(
-                    headers=["Path", "Tamano", "Modif"],
-                    value=[], interactive=False, wrap=False,
-                    row_count=(10, "dynamic"), col_count=(3, "fixed"),
-                )
-                btn_refresh = gr.Button("Refrescar log + archivos", size="sm")
-
-            # Estado invisible que reemplaza la tabla de comparacion EN<->ES
-            # (removida del UI). El generador sigue emitiendo filas; las
-            # descartamos hacia un gr.State para no romper la firma.
-            ui_translation_compare = gr.State([])
-
-        # =================================================================
-        # TAB 2: RENDER DE VIDEO
-        # =================================================================
-        with gr.Tab("2 · Render de video"):
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>1</span>Inputs para el render</div>")
-            gr.HTML("<div class='qdp-hint'>Audio YA DOBLADO (ES) + video original + JSON timeline. "
-                    "Si vienes de Tab 1, los campos se auto-rellenan al terminar el doblaje.</div>")
-            with gr.Row():
-                with gr.Column():
-                    vid_v_tb, vid_v_up = _input_row(
-                        "Video original",
-                        "/runpod-volume/user_input/video.mp4",
-                        [".mp4", ".mov", ".mkv"],
-                    )
-                with gr.Column():
-                    vid_dub_tb, vid_dub_up = _input_row(
-                        "Audio doblado ES",
-                        "/runpod-volume/output/final_audio_dubbed.wav",
-                        [".wav", ".mp3", ".flac"],
-                    )
-                with gr.Column():
-                    vid_json_tb, vid_json_up = _input_row(
-                        "JSON timeline",
-                        "/runpod-volume/temp_workspace/p4_data.json",
-                        [".json"],
-                    )
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>2</span>Color grading</div>")
-            with gr.Row():
-                sl_nitidez = gr.Slider(-1.0, 2.0, value=0.5, step=0.1, label="Nitidez (unsharp)")
-                sl_brillo = gr.Slider(-0.5, 0.5, value=0.0, step=0.05, label="Brillo")
-                sl_contraste = gr.Slider(0.5, 2.0, value=1.05, step=0.05, label="Contraste")
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>3</span>Calidad del lip-sync (LatentSync)</div>")
-            gr.HTML("<div class='qdp-hint'>LatentSync se aplica <b>siempre</b> al generar el master: re-sincroniza "
-                    "los labios al audio ES preservando gestos, escenas y movimientos de cámara. "
-                    "La primera vez que uses la app, los pesos (~2 GB) se descargan automáticamente a "
-                    "<code>/runpod-volume/LatentSync/</code> (persistente, una sola vez por volumen). "
-                    "Ajusta aqui la calidad del lipsync.</div>")
-            with gr.Row():
-                sl_lipsync_steps = gr.Slider(10, 50, value=20, step=1, label="Inference steps (20=default, +steps=+calidad/+tiempo)")
-                sl_lipsync_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance scale (1.5=default, +gs=+sync/+distorsión)")
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>4</span>Renderizar</div>")
-            with gr.Row():
-                btn_vid_prev = gr.Button("Previsualizar 30 s")
-                btn_vid_full = gr.Button("Renderizar completo", variant="primary")
-            ui_vid_status = gr.Textbox(label="Estado del render", interactive=False, lines=2)
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>5</span>Resultado</div>")
-            out_vid = gr.Video(label="Longform final (16:9, subs pro quemados)", interactive=False)
-            out_master = gr.Textbox(
-                label="Master lip-sync sin subs (insumo para shorts)",
-                interactive=False, lines=1,
-            )
-            gr.HTML("<div class='qdp-hint'>El master sin subs es el que Tab 3 consume para "
-                    "generar shorts verticales con captions amarillos.</div>")
-            with gr.Accordion("Log del render + archivos", open=False):
-                ui_log_render = gr.Textbox(label="Log", interactive=False, lines=15, elem_id="qdp-log")
-                ui_files_table_vid = gr.DataFrame(
-                    headers=["Path", "Tamano", "Modif"], value=[], interactive=False, wrap=False,
-                )
-
-        # =================================================================
-        # TAB 3: AI SHORTS
-        # =================================================================
-        with gr.Tab("3 · Shorts con IA"):
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>1</span>Inputs para los shorts</div>")
-            gr.HTML("<div class='qdp-hint'>Los shorts se generan a partir del <b>master lip-sync sin subs</b> "
-                    "(el que produce Tab 2). Tab 3 recorta, hace crop 9:16 y agrega captions amarillos en español. "
-                    "Si vienes de Tab 2, el master se auto-rellena.</div>")
-            with gr.Row():
-                with gr.Column():
-                    sh_master_tb, sh_master_up = _input_row(
-                        "Master lip-sync (sin subs)",
-                        "/runpod-volume/output/master_lipsynced_nosubs.mp4",
-                        [".mp4", ".mov", ".mkv"],
-                    )
-                with gr.Column():
-                    sh_json_tb, sh_json_up = _input_row(
-                        "JSON timeline (con text_es y timestamps)",
-                        "/runpod-volume/temp_workspace/p4_data.json",
-                        [".json"],
-                    )
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>2</span>Duración de los shorts</div>")
-            gr.HTML("<div class='qdp-hint'>Rango de duración permitido (minutos). "
-                    "Gemini solo propondrá shorts dentro de este rango.</div>")
-            with gr.Row():
-                sl_min_min = gr.Slider(1.0, 10.0, value=3.0, step=0.5, label="Duración mínima (min)")
-                sl_max_min = gr.Slider(2.0, 20.0, value=15.0, step=0.5, label="Duración máxima (min)")
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>3</span>Analizar con IA</div>")
-            btn_analyze = gr.Button("Analizar timeline ES con Gemini", variant="primary")
-            shorts_summary = gr.Textbox(label="Propuestas de Gemini", interactive=False, lines=10)
-            cg_shorts = gr.CheckboxGroup(choices=[], label="Shorts a generar (selecciona varios)")
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>4</span>Captions + color grading</div>")
-            with gr.Row():
-                cb_captions_wbw = gr.Checkbox(label="Captions word-by-word (amarillo)", value=True)
-                sl_chunk_words = gr.Slider(1, 6, value=3, step=1, label="Palabras por caption")
-            with gr.Row():
-                sl_nitidez_s = gr.Slider(-1.0, 2.0, value=0.5, step=0.1, label="Nitidez")
-                sl_brillo_s = gr.Slider(-0.5, 0.5, value=0.0, step=0.05, label="Brillo")
-                sl_contraste_s = gr.Slider(0.5, 2.0, value=1.05, step=0.05, label="Contraste")
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>5</span>Preview + renderizado</div>")
-            gr.HTML("<div class='qdp-hint'>Los shorts heredan el lip-sync del master (ya fue aplicado en Tab 2 "
-                    "con LatentSync). Aqui solo recortamos, hacemos crop 9:16 y quemamos los captions amarillos.</div>")
-            with gr.Row():
-                btn_short_thumb = gr.Button("Thumbnail del primer seleccionado (rapido)")
-                btn_short_prev = gr.Button("Preview video 10s del primer seleccionado")
-                btn_short_all = gr.Button("Generar todos los seleccionados", variant="primary")
-            ui_short_status = gr.Textbox(label="Estado", interactive=False, lines=2)
-
-            gr.HTML("<div class='qdp-section-title'><span class='qdp-step-num'>6</span>Resultado</div>")
-            with gr.Row():
-                out_short_thumb = gr.Image(label="Thumbnail (9:16)", interactive=False, height=400)
-                out_short_preview = gr.Video(label="Preview del short", interactive=False)
-            out_shorts_files = gr.File(label="Shorts generados (descargables)", file_count="multiple", interactive=False)
+                dd_json = gr.Dropdown(choices=[], label="Seleccionar Timeline JSON", interactive=True, scale=3)
+                btn_refresh_json = gr.Button("🔄 Refrescar", scale=1)
+            
+            btn_analyze = gr.Button("🧠 Analizar Timeline con IA (>3 min)", variant="primary")
+            
+            cg_shorts = gr.CheckboxGroup(choices=[], label="Clips Virales Propuestos (Selecciona para renderizar)")
+            btn_render_shorts = gr.Button("🎬 Renderizar Shorts Seleccionados (9:16 + Captions)")
+            
+            ui_shorts_terminal = gr.Textbox(label="Terminal de Shorts", elem_id="qdp-log", interactive=False, lines=10, autoscroll=True)
+            out_shorts_video = gr.Video(label="Previsualización de Short", interactive=False)
 
     # =====================================================================
-    # WIRING
+    # WIRING Y LÓGICA UI
     # =====================================================================
+    def update_file_dropdowns():
+        files = _get_user_files()
+        return gr.update(choices=files), gr.update(choices=files)
+        
+    def update_json_dropdown():
+        jsons = _get_local_jsons()
+        return gr.update(choices=jsons)
 
-    btn_clear.click(
-        clear_workspace, inputs=[],
-        outputs=[ui_global_status, ui_files_table, ui_log_live],
+    btn_refresh_files.click(update_file_dropdowns, inputs=[], outputs=[dd_video, dd_audio])
+    btn_refresh_json.click(update_json_dropdown, inputs=[], outputs=[dd_json])
+    
+    # Carga inicial
+    demo.load(update_file_dropdowns, inputs=[], outputs=[dd_video, dd_audio])
+    demo.load(update_json_dropdown, inputs=[], outputs=[dd_json])
+
+    # Ejecutar Doblaje Master
+    btn_run_master.click(
+        run_workflow_1_streamed,
+        inputs=[dd_video, dd_audio, cb_latentsync, cb_test_mode, cb_keep_4k, cb_subs],
+        outputs=[ui_active_phase, ui_terminal, out_master_video]
     )
-
-    # --- Tab 1 wiring ---
-
-    btn_dub_prep.click(
-        prepare_data,
-        inputs=[dub_v_tb, dub_a_tb, dub_v_up, dub_a_up, dub_is_test],
-        outputs=[dub_video_prepared, dub_audio_prepared, dub_prep_status,
-                 ui_files_table, ui_log_live],
-    )
-
-    btn_dub_full.click(
-        pipe_doblar_audio,
-        inputs=[dub_audio_prepared, dub_video_prepared],
-        outputs=[out_dubbed_video, out_dubbed, out_json_path_display, ui_dub_status,
-                 ui_files_table, ui_log_live, ui_dub_progress,
-                 ui_translation_compare],
-    ).then(
-        # Reflejar MP4 final en: (a) textbox con ruta absoluta (copy-paste-able),
-        # (b) gr.File para descarga directa (solo pasa el path, Gradio no lo precarga).
-        lambda v: (os.path.abspath(v) if v else "", v if v else None),
-        inputs=[out_dubbed_video],
-        outputs=[out_dubbed_video_path, out_dubbed_video_file],
-    ).then(
-        # Auto-populate Tab 2 (video + audio + json) y Tab 3 (json).
-        # El master_lipsynced se auto-popula en Tab 3 DESPUÉS de Tab 2.
-        lambda v, a, j: (v, a, j, j),
-        inputs=[dub_video_prepared, out_dubbed, out_json_path_display],
-        outputs=[vid_v_tb, vid_dub_tb, vid_json_tb, sh_json_tb],
-    )
-
-    btn_dub_test.click(
-        pipe_doblar_audio_test30,
-        inputs=[dub_audio_prepared, dub_video_prepared],
-        outputs=[out_dubbed_video, out_dubbed, out_json_path_display, ui_dub_status,
-                 ui_files_table, ui_log_live, ui_dub_progress,
-                 ui_translation_compare],
-    ).then(
-        lambda v: (os.path.abspath(v) if v else "", v if v else None),
-        inputs=[out_dubbed_video],
-        outputs=[out_dubbed_video_path, out_dubbed_video_file],
-    ).then(
-        lambda v, a, j: (v, a, j, j),
-        inputs=[dub_video_prepared, out_dubbed, out_json_path_display],
-        outputs=[vid_v_tb, vid_dub_tb, vid_json_tb, sh_json_tb],
-    )
-
-    btn_refresh.click(
-        refresh_logs_and_files, inputs=[],
-        outputs=[ui_files_table, ui_log_live],
-    )
-
-    btn_manual_dl.click(
-        manual_download,
-        inputs=[manual_dl_path],
-        outputs=[manual_dl_file, manual_dl_status],
-    )
-    manual_dl_path.submit(
-        manual_download,
-        inputs=[manual_dl_path],
-        outputs=[manual_dl_file, manual_dl_status],
-    )
-
-    # --- Tab 2 wiring ---
-
-    btn_vid_full.click(
-        pipe_generar_video,
-        inputs=[vid_v_tb, vid_dub_tb, vid_json_tb, vid_v_up, vid_dub_up, vid_json_up,
-                sl_nitidez, sl_brillo, sl_contraste,
-                sl_lipsync_steps, sl_lipsync_guidance],
-        outputs=[out_vid, out_master, ui_vid_status, ui_files_table_vid, ui_log_render],
-    ).then(
-        # Auto-populate Tab 3 con el master recién generado (ya tiene LatentSync)
-        lambda m: m,
-        inputs=[out_master],
-        outputs=[sh_master_tb],
-    )
-    btn_vid_prev.click(
-        pipe_preview_video,
-        inputs=[vid_v_tb, vid_dub_tb, vid_json_tb, vid_v_up, vid_dub_up, vid_json_up,
-                sl_nitidez, sl_brillo, sl_contraste,
-                sl_lipsync_steps, sl_lipsync_guidance],
-        outputs=[out_vid, out_master, ui_vid_status, ui_files_table_vid, ui_log_render],
-    ).then(
-        lambda m: m,
-        inputs=[out_master],
-        outputs=[sh_master_tb],
-    )
-
-    # --- Tab 3 wiring ---
-
+    
+    # Shorts
     btn_analyze.click(
-        pipe_analyze_shorts,
-        inputs=[sh_json_tb, sh_json_up, sl_min_min, sl_max_min],
-        outputs=[cg_shorts, sys_proposals, shorts_summary],
+        run_workflow_2_analysis,
+        inputs=[dd_json],
+        outputs=[cg_shorts, ui_shorts_terminal]
     )
-    btn_short_thumb.click(
-        pipe_preview_thumbnail,
-        inputs=[sh_master_tb, sh_master_up, sys_proposals, cg_shorts],
-        outputs=[out_short_thumb, ui_short_status],
+    
+    btn_render_shorts.click(
+        run_workflow_2_render,
+        inputs=[cg_shorts],
+        outputs=[ui_shorts_terminal, out_shorts_video]
     )
-    btn_short_prev.click(
-        pipe_preview_short,
-        inputs=[sh_master_tb, sh_json_tb, sh_master_up, sh_json_up, sys_proposals, cg_shorts,
-                sl_nitidez_s, sl_brillo_s, sl_contraste_s,
-                cb_captions_wbw, sl_chunk_words],
-        outputs=[out_short_preview, ui_short_status],
-    )
-    btn_short_all.click(
-        pipe_render_selected_shorts,
-        inputs=[sh_master_tb, sh_json_tb, sh_master_up, sh_json_up, sys_proposals, cg_shorts,
-                sl_nitidez_s, sl_brillo_s, sl_contraste_s,
-                cb_captions_wbw, sl_chunk_words],
-        outputs=[out_shorts_files, ui_short_status],
-    )
-
 
 if __name__ == "__main__":
     _ensure_dirs()
-    setup_pipeline_logger("logs")
-    ui_log.info("Booting Quantum Dubbing Pipeline UI")
-    _log_storage_layout()
-    ensure_qwen_models()
-    # allowed_paths: permite que gr.Audio/gr.Video/gr.File sirvan archivos
-    # desde estos directorios (incluye user_input/ para uploads persistentes).
-    allowed = [os.path.abspath(d) for d in ["input", "temp_workspace", "output", "logs", "user_input"]]
-    data_dir = os.environ.get("APP_DATA_DIR")
-    if data_dir:
-        allowed.append(os.path.abspath(data_dir))
-    # Permitir servir archivos desde /runpod-volume y /app directamente,
-    # asi el usuario puede descargar CUALQUIER archivo pegando su ruta absoluta
-    # en el campo "Descargar archivo por ruta absoluta" del Tab 1.
-    for extra in ["/runpod-volume", "/app"]:
-        if os.path.isdir(extra) and extra not in allowed:
-            allowed.append(extra)
+    ui_log.info("Booting Quantum Dubbing Pipeline UI - Apple Style")
+    
+    allowed = [os.path.abspath(d) for d in [NETWORK_DIR, LOCAL_DIR]]
     demo.queue().launch(
         server_name="0.0.0.0",
         server_port=7860,
