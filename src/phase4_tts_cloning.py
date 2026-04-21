@@ -172,6 +172,7 @@ def _batched_generate_serial_decode(
     batch_texts: list,
     batch_refs: list,
     batch_ref_texts: list,
+    batch_original_durations: list,
     language: str = "Spanish",
     x_vector_only_mode: bool = USE_X_VECTOR_ONLY,
 ):
@@ -287,6 +288,9 @@ def _batched_generate_serial_decode(
                 text_len / max(QWEN_TTS_CHARS_PER_SEC, 1e-3)
             )
             limit_s = expected_s * QWEN_TTS_RUNAWAY_FACTOR + QWEN_TTS_RUNAWAY_FLOOR_S
+            orig_dur = batch_original_durations[i]
+            if orig_dur > 0:
+                limit_s = min(limit_s, orig_dur)
             actual_s = wav.shape[0] / sr
             if actual_s > limit_s:
                 limit_samples = int(limit_s * sr)
@@ -294,7 +298,7 @@ def _batched_generate_serial_decode(
                 runaway_stats.append({
                     "idx": i,
                     "text_len": text_len,
-                    "expected_s": expected_s,
+                    "expected_s": orig_dur if orig_dur > 0 else expected_s,
                     "actual_s": actual_s,
                     "truncated_to_s": limit_s,
                     "preview": batch_texts[i][:50],
@@ -454,6 +458,7 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
         batch_texts: list[str] = []
         batch_refs: list[str] = []
         batch_text_en: list[str] = []
+        batch_orig_durs: list[float] = []
 
         for i, seg in enumerate(master_timeline):
             text_es = (seg.get("text_es") or "").strip()
@@ -468,6 +473,7 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
             # IMPORTANTE: ref_text debe corresponder al ref_audio (misma ventana),
             # no al text_en del segmento actual. ICL condiciona sobre (ref_audio, ref_text) juntos.
             batch_text_en.append(speaker_ref_texts[spk])
+            batch_orig_durs.append(float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)))
 
         if not batch_texts:
             log.warning("No hay segmentos con text_es — nada que sintetizar")
@@ -483,6 +489,7 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
             sorted_texts = [batch_texts[i] for i in order]
             sorted_refs = [batch_refs[i] for i in order]
             sorted_ref_texts = [batch_text_en[i] for i in order]
+            sorted_orig_durs = [batch_orig_durs[i] for i in order]
             sorted_indices = [batch_indices[i] for i in order]
 
             num_chunks = (N + QWEN_TTS_BATCH_SIZE - 1) // QWEN_TTS_BATCH_SIZE
@@ -535,6 +542,7 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
                     ct = sorted_texts[chunk_start:chunk_end]
                     cr = sorted_refs[chunk_start:chunk_end]
                     crt = sorted_ref_texts[chunk_start:chunk_end]
+                    cod = sorted_orig_durs[chunk_start:chunk_end]
 
                     # Log explicito ANTES del step_timer. Si se cuelga adentro,
                     # al menos sabemos que fue en este chunk exacto.
@@ -553,6 +561,7 @@ def run_phase4_tts_cloning(json_path: str, voices_path: str, temp_workspace: str
                                 batch_texts=ct,
                                 batch_refs=cr,
                                 batch_ref_texts=crt,
+                                batch_original_durations=cod,
                                 language="Spanish",
                             )
                             dt = time.time() - t0

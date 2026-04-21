@@ -288,6 +288,7 @@ FINAL_OUTPUT_DIR = os.path.join(NETWORK_DIR, "output")
 LOCAL_INPUT_DIR = os.path.join(LOCAL_DIR, "input")
 LOCAL_TEMP_DIR = os.path.join(LOCAL_DIR, "temp_workspace")
 LOCAL_LOGS_DIR = os.path.join(LOCAL_DIR, "logs")
+LOCAL_OUTPUT_DIR = os.path.join(LOCAL_DIR, "output")
 
 ui_log = get_logger("ui")
 
@@ -296,39 +297,109 @@ def _ensure_dirs():
     """Asegura la creación de los directorios estrictamente separados (Red vs NVMe)."""
     for d in [USER_INPUT_DIR, FINAL_OUTPUT_DIR]:
         os.makedirs(d, exist_ok=True)
-    for d in [LOCAL_INPUT_DIR, LOCAL_TEMP_DIR, LOCAL_LOGS_DIR]:
+    for d in [LOCAL_INPUT_DIR, LOCAL_TEMP_DIR, LOCAL_LOGS_DIR, LOCAL_OUTPUT_DIR]:
         os.makedirs(d, exist_ok=True)
     setup_pipeline_logger(LOCAL_LOGS_DIR)
 
-def _get_user_files():
-    """Lee archivos subidos al volumen de red de forma directa para los dropdowns."""
+_VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
+_AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".aac", ".opus")
+
+
+def _list_network_files(extensions: tuple[str, ...]) -> list[str]:
+    """Lista nombres de archivo en NETWORK_DIR/user_input/ filtrados por extension.
+
+    Retorna strings planos tipo 'nombre.mp4  (4.89 GB)'. El callback reconstruye
+    el path absoluto desde USER_INPUT_DIR + nombre. Usamos strings en lugar de
+    tuplas (label,value) porque algunas versiones de Gradio no renderizan bien
+    los value-con-slashes y el dropdown termina vacio.
+    """
     _ensure_dirs()
-    try:
-        files = [f for f in os.listdir(USER_INPUT_DIR) if os.path.isfile(os.path.join(USER_INPUT_DIR, f))]
-        return sorted(files)
-    except OSError:
+    if not os.path.isdir(USER_INPUT_DIR):
         return []
+    try:
+        names = os.listdir(USER_INPUT_DIR)
+    except OSError as e:
+        ui_log.warning(f"No se puede leer {USER_INPUT_DIR}: {e}")
+        return []
+    rows = []
+    for name in names:
+        abs_path = os.path.join(USER_INPUT_DIR, name)
+        if not os.path.isfile(abs_path):
+            continue
+        if not name.lower().endswith(extensions):
+            continue
+        try:
+            size = os.path.getsize(abs_path)
+        except OSError:
+            continue
+        if size >= 1024 ** 3:
+            size_str = f"{size/1024**3:.2f} GB"
+        else:
+            size_str = f"{size/1024**2:.1f} MB"
+        rows.append(f"{name}  ({size_str})")
+    rows.sort(key=str.lower)
+    return rows
+
+
+def _parse_dropdown_choice(choice: str, base_dir: str) -> str | None:
+    """Extrae el nombre de archivo del label 'nombre.ext  (1.2 GB)' y lo
+    concatena con base_dir para devolver el path absoluto."""
+    if not choice:
+        return None
+    # El label termina con '  (tamano)'. Cortamos en el ultimo doble espacio
+    # antes del parentesis para recuperar el nombre exacto.
+    name = choice.rsplit("  (", 1)[0].strip()
+    if not name:
+        return None
+    return os.path.join(base_dir, name)
+
+
+def _get_user_videos():
+    """Videos disponibles en el volumen de red."""
+    return _list_network_files(_VIDEO_EXTS)
+
+
+def _get_user_audios():
+    """Audios disponibles en el volumen de red."""
+    return _list_network_files(_AUDIO_EXTS)
+
 
 def _get_local_jsons():
-    """Lee los timelines JSON generados en el entorno NVMe local."""
+    """Lee los timelines JSON generados en el entorno NVMe local.
+    Retorna strings 'nombre.json  (12.3 KB)' — la reconstruccion a path
+    absoluto la hace el callback via _parse_dropdown_choice."""
     _ensure_dirs()
+    if not os.path.isdir(LOCAL_TEMP_DIR):
+        return []
     try:
-        files = [f for f in os.listdir(LOCAL_TEMP_DIR) if f.endswith(".json")]
-        return sorted(files)
+        names = [f for f in os.listdir(LOCAL_TEMP_DIR) if f.endswith(".json")]
     except OSError:
         return []
+    rows = []
+    for name in sorted(names):
+        abs_path = os.path.join(LOCAL_TEMP_DIR, name)
+        try:
+            size_kb = os.path.getsize(abs_path) / 1024
+        except OSError:
+            continue
+        rows.append(f"{name}  ({size_kb:.1f} KB)")
+    return rows
 
 def run_workflow_1_streamed(video_file, audio_file, use_latentsync, test_mode, keep_4k, add_subs):
     """
     Workflow 1: Master Clean Video (One-Click Magic).
-    Mockup estructural guiado por los toggles de la UI respetando NVMe vs Network Volume.
+    Ejecuta de forma secuencial Fases 0 a 6 integrando directamente los módulos
+    del pipeline bajo las políticas estrictas de rutas de NVMe y Volume Network.
     """
     if not video_file or not audio_file:
         yield "Error", "Por favor selecciona un video y un audio de los menús desplegables.", None
         return
-        
-    video_path = os.path.join(USER_INPUT_DIR, video_file)
-    audio_path = os.path.join(USER_INPUT_DIR, audio_file)
+
+    video_path = _parse_dropdown_choice(video_file, USER_INPUT_DIR)
+    audio_path = _parse_dropdown_choice(audio_file, USER_INPUT_DIR)
+    if not video_path or not audio_path or not os.path.isfile(video_path) or not os.path.isfile(audio_path):
+        yield "Error", f"Archivo invalido. video={video_path} audio={audio_path}", None
+        return
     
     _ensure_dirs()
     clear_log()
@@ -346,58 +417,61 @@ def run_workflow_1_streamed(video_file, audio_file, use_latentsync, test_mode, k
 
     def worker():
         try:
-            # ------------------------------------------------------------------
-            # MOCKUP DEL WORKFLOW 1
-            # Aquí se llamarían las funciones reales de src/ respetando rutas
-            # ------------------------------------------------------------------
             result["phase"] = "Fase 0: Copiando a NVMe y Normalizando..."
             ui_log.info(result["phase"])
-            # Simulamos el trabajo de Fase 0 (input_handler.py)
-            time.sleep(2)
+            final_video, final_audio = download_and_prepare_media(video_path, audio_path, test_mode, LOCAL_INPUT_DIR)
             
             result["phase"] = "Fase 2: ASR (Transcribiendo EN)..."
             ui_log.info(result["phase"])
-            # Simulamos Fase 2 (phase2_asr_diarization.py)
-            time.sleep(2)
+            json_path = run_phase2_diarization_and_asr(final_audio, LOCAL_TEMP_DIR)
             
             result["phase"] = "Fase 3: Traducción (EN -> ES)..."
             ui_log.info(result["phase"])
-            # Simulamos Fase 3 (phase3_llm_isochrone.py)
-            time.sleep(2)
+            json_path = run_phase3_llm_translation(json_path, LOCAL_TEMP_DIR)
             
             result["phase"] = "Fase 4: Clonación TTS (Generando voces ES)..."
             ui_log.info(result["phase"])
-            ui_log.info(">>> Aplicando restricción dura de isocronía (truncado numpy)")
-            # Simulamos Fase 4 (phase4_tts_cloning.py)
-            time.sleep(2)
+            tts_out_dir = os.path.join(LOCAL_TEMP_DIR, "tts_out")
+            json_path = run_phase4_tts_cloning(json_path, final_audio, LOCAL_TEMP_DIR, tts_out_dir)
             
             result["phase"] = "Fase 5: Alineación de Tiempo (Ensamblando audio)..."
             ui_log.info(result["phase"])
-            # Simulamos Fase 5 (phase5_alignment.py)
-            time.sleep(2)
+            final_es_audio = run_phase5_time_alignment(json_path, LOCAL_TEMP_DIR)
+            
+            output_filename = "FINAL_MASTER_DUBBED.mp4"
+            local_final_mp4 = os.path.join(LOCAL_OUTPUT_DIR, output_filename)
             
             if use_latentsync:
                 result["phase"] = "Fase 6: LatentSync (Lip-sync de video a audio ES)..."
                 ui_log.info(result["phase"])
-                # Simulamos Fase 6 (phase6_lipsync_render.py)
-                time.sleep(3)
+                master_nosubs = run_phase6_lipsync_render_nosubs(final_video, final_es_audio, local_final_mp4)
+                local_final_mp4 = master_nosubs
+                
+                if add_subs:
+                    result["phase"] = "Fase 6b: Quemando subtítulos horizontales de 1-línea..."
+                    ui_log.info(result["phase"])
+                    subs_mp4 = os.path.join(LOCAL_OUTPUT_DIR, "FINAL_MASTER_DUBBED_SUBS.mp4")
+                    render_longform_with_subs(master_nosubs, json_path, subs_mp4)
+                    local_final_mp4 = subs_mp4
             else:
                 result["phase"] = "Fase 5b: Mux Básico (Lip-sync desactivado)..."
                 ui_log.info(result["phase"])
-                time.sleep(2)
+                run_phase5b_final_mux(final_video, final_es_audio, local_final_mp4)
                 
-            if add_subs:
-                result["phase"] = "Fase 6b: Quemando subtítulos horizontales de 1-línea..."
-                ui_log.info(result["phase"])
-                time.sleep(2)
+                if add_subs:
+                    result["phase"] = "Fase 6b: Quemando subtítulos horizontales de 1-línea..."
+                    ui_log.info(result["phase"])
+                    subs_mp4 = os.path.join(LOCAL_OUTPUT_DIR, "FINAL_MASTER_DUBBED_SUBS.mp4")
+                    render_longform_with_subs(local_final_mp4, json_path, subs_mp4)
+                    local_final_mp4 = subs_mp4
                 
             result["phase"] = "Finalizando: Copiando resultado al volumen de red..."
             ui_log.info(result["phase"])
             
-            # En producción, esto apuntaría al MP4 real generado por el pipeline
-            final_mp4 = os.path.join(FINAL_OUTPUT_DIR, "FINAL_MASTER_DUBBED.mp4")
-            # Dejamos el path como None en el mock para no romper el reproductor del frontend.
-            result["video"] = None 
+            network_final_mp4 = os.path.join(FINAL_OUTPUT_DIR, os.path.basename(local_final_mp4))
+            shutil.copy2(local_final_mp4, network_final_mp4)
+            
+            result["video"] = local_final_mp4
             
             result["status"] = "ok"
             result["phase"] = "¡Completado!"
@@ -426,11 +500,14 @@ def run_workflow_1_streamed(video_file, audio_file, use_latentsync, test_mode, k
 def run_workflow_2_analysis(json_file):
     """
     Workflow 2 - Paso 1: Analizar JSON con IA para extraer clips.
+    json_file viene como path absoluto desde el Dropdown.
     """
     if not json_file:
         return gr.update(choices=[]), "Por favor selecciona un archivo JSON."
-        
-    json_path = os.path.join(LOCAL_TEMP_DIR, json_file)
+
+    json_path = _parse_dropdown_choice(json_file, LOCAL_TEMP_DIR)
+    if not json_path or not os.path.isfile(json_path):
+        return gr.update(choices=[]), f"JSON no existe: {json_path}"
     ui_log.info(f"Workflow 2: Analizando timeline para shorts -> {json_path}")
     
     # Mockup: Proponer clips ficticios
@@ -492,8 +569,14 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
                 )
             
             with gr.Row():
-                dd_video = gr.Dropdown(choices=[], label="Seleccionar Video Original (EN)", interactive=True, scale=3)
-                dd_audio = gr.Dropdown(choices=[], label="Seleccionar Audio Original (EN)", interactive=True, scale=3)
+                dd_video = gr.Dropdown(
+                    choices=_get_user_videos(), value=None,
+                    label="Seleccionar Video Original (EN)", interactive=True, scale=3,
+                )
+                dd_audio = gr.Dropdown(
+                    choices=_get_user_audios(), value=None,
+                    label="Seleccionar Audio Original (EN)", interactive=True, scale=3,
+                )
                 btn_refresh_files = gr.Button("🔄 Refrescar", scale=1)
                 
             btn_run_master = gr.Button("🚀 Ejecutar Doblaje (One-Click Magic)", variant="primary", size="lg")
@@ -512,11 +595,15 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
                 "para analizarlo con IA y generar clips virales verticales."
             )
             with gr.Row():
-                dd_json = gr.Dropdown(choices=[], label="Seleccionar Timeline JSON", interactive=True, scale=3)
+                dd_json = gr.Dropdown(
+                    choices=_get_local_jsons(), value=None,
+                    label="Seleccionar Timeline JSON", interactive=True, scale=3,
+                )
                 btn_refresh_json = gr.Button("🔄 Refrescar", scale=1)
             
             btn_analyze = gr.Button("🧠 Analizar Timeline con IA (>3 min)", variant="primary")
             
+            state_shorts_data = gr.State([])
             cg_shorts = gr.CheckboxGroup(choices=[], label="Clips Virales Propuestos (Selecciona para renderizar)")
             btn_render_shorts = gr.Button("🎬 Renderizar Shorts Seleccionados (9:16 + Captions)")
             
@@ -527,19 +614,19 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
     # WIRING Y LÓGICA UI
     # =====================================================================
     def update_file_dropdowns():
-        files = _get_user_files()
-        return gr.update(choices=files), gr.update(choices=files)
-        
+        videos = _get_user_videos()
+        audios = _get_user_audios()
+        ui_log.info(
+            f"Refresh {USER_INPUT_DIR}: {len(videos)} video(s), {len(audios)} audio(s)"
+        )
+        return gr.update(choices=videos), gr.update(choices=audios)
+
     def update_json_dropdown():
         jsons = _get_local_jsons()
         return gr.update(choices=jsons)
 
-    btn_refresh_files.click(update_file_dropdowns, inputs=[], outputs=[dd_video, dd_audio])
-    btn_refresh_json.click(update_json_dropdown, inputs=[], outputs=[dd_json])
-    
-    # Carga inicial
-    demo.load(update_file_dropdowns, inputs=[], outputs=[dd_video, dd_audio])
-    demo.load(update_json_dropdown, inputs=[], outputs=[dd_json])
+    btn_refresh_files.click(update_file_dropdowns, inputs=None, outputs=[dd_video, dd_audio])
+    btn_refresh_json.click(update_json_dropdown, inputs=None, outputs=[dd_json])
 
     # Ejecutar Doblaje Master
     btn_run_master.click(
@@ -552,12 +639,12 @@ with gr.Blocks(theme=gr.themes.Monochrome(), css=CSS, title="Quantum Dubbing Pip
     btn_analyze.click(
         run_workflow_2_analysis,
         inputs=[dd_json],
-        outputs=[cg_shorts, ui_shorts_terminal]
+        outputs=[cg_shorts, ui_shorts_terminal, state_shorts_data]
     )
     
     btn_render_shorts.click(
         run_workflow_2_render,
-        inputs=[cg_shorts],
+        inputs=[dd_json, cg_shorts, state_shorts_data],
         outputs=[ui_shorts_terminal, out_shorts_video]
     )
 
