@@ -1,10 +1,10 @@
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 # Variables para evadir bloqueos interactivos y compilar C++ suavemente
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
-# Forzar optimizaciones en compilaciones de CUDA para arquitecturas de Data Center (A100=80, Ada=89, Hopper=90a)
-ENV TORCH_CUDA_ARCH_LIST="8.0" 
+# Forzar optimizaciones en compilaciones de CUDA para A100 (8.0), RTX Ada (8.9) y Hopper (9.0a)
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0a" 
 
 # 1. Dependencias maestras de SO (FFmpeg, Rubberband-cli, Compiladores Ninja y C++)
 # 1. Dependencias maestras de SO con un Loop Resiliente Anti-Caídas de DNS en WSL
@@ -32,19 +32,24 @@ RUN pip install --no-cache-dir --upgrade pip wheel setuptools packaging
 # Copia de requerimientos anclados
 COPY requirements.txt .
 
-# 2. MATCH PERFECTO: PyTorch 2.4.0 envuelto en CUDA 12.1 (Garantía A100)
-RUN pip install --no-cache-dir torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+# 2. MATCH PERFECTO: PyTorch 2.5.1 envuelto en CUDA 12.4 (Garantía Ada, Hopper, Blackwell)
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 
 # 3. COMPILACION / INSTALACION ACELERADA Y COMPATIBLE
-# xformers 0.0.27.post2 está pre-buildeado y verificado oficialmente para PyTorch 2.4.0+cu121
-RUN pip install --no-cache-dir xformers==0.0.27.post2
+# xformers compatible con PyTorch 2.5.1+cu124
+RUN pip install --no-cache-dir xformers==0.0.28.post3
 
 # flash-attn: Con Ninja y Build-Essential presentes, el flag --no-build-isolation garantiza 
-# que use el torch 2.4 ya instalado en vez de bajar uno conflictivo al crear el wheel.
+# que use el torch 2.5 ya instalado en vez de bajar uno conflictivo al crear el wheel.
 RUN pip install --no-cache-dir psutil && \
-    pip install --no-cache-dir flash-attn==2.6.3 --no-build-isolation
+    pip install --no-cache-dir flash-attn==2.7.0.post2 --no-build-isolation
 # 4. Instalación de librerías del Pipeline Pinneadas
 RUN pip install --no-cache-dir -r requirements.txt
+
+# 4.5 LatentSync (Build-time setup controlado)
+RUN git clone --depth 1 https://github.com/bytedance/LatentSync.git /app/LatentSync && \
+    egrep -v "^(torch|torchvision|torchaudio|transformers|accelerate|xformers|gradio|numpy)" /app/LatentSync/requirements.txt > /app/LatentSync/req_filtered.txt && \
+    pip install --no-cache-dir -r /app/LatentSync/req_filtered.txt
 
 # 5. Qwen3-TTS primero, luego Qwen3-ASR.
 # Ambos clavan transformers exacto (4.57.3 vs 4.57.6) — pip no resuelve juntos.

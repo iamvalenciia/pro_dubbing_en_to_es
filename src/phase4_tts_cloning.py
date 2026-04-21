@@ -161,7 +161,7 @@ QWEN_TTS_REPETITION_PENALTY = float(os.environ.get("QWEN_TTS_REPETITION_PENALTY"
 # RUNAWAY_FACTOR`, el modelo hizo runaway (no disparo EOS, loopeo, o eco del ref).
 # Cortamos al limite esperado — mejor un seg truncado que uno contaminado.
 QWEN_TTS_CHARS_PER_SEC = float(os.environ.get("QWEN_TTS_CHARS_PER_SEC", "14.0"))
-QWEN_TTS_RUNAWAY_FACTOR = float(os.environ.get("QWEN_TTS_RUNAWAY_FACTOR", "1.8"))
+QWEN_TTS_RUNAWAY_FACTOR = float(os.environ.get("QWEN_TTS_RUNAWAY_FACTOR", "2.0"))
 # Margen absoluto adicional (segundos) que se tolera ANTES de marcar runaway.
 # Protege segmentos cortos (p.ej. "Si." de 3 chars → limite 0.21s sin margen).
 QWEN_TTS_RUNAWAY_FLOOR_S = float(os.environ.get("QWEN_TTS_RUNAWAY_FLOOR_S", "2.0"))
@@ -277,32 +277,36 @@ def _batched_generate_serial_decode(
             cut = int(ref_len / max(total_len, 1) * wav.shape[0])
             wav = wav[cut:]
 
-        # RUNAWAY GUARD: si la duracion excede lo esperado por el texto,
-        # el modelo no disparo EOS y esta generando garbage (loops, eco del
-        # ref, o silence padding). Truncar en seco al limite esperado evita
-        # contaminar la concat final con minutos de basura.
+        # RUNAWAY GUARD Y CERO TIME-STRETCH:
+        # No aplicamos time-stretch para evitar voces robotizadas. Dejamos que 
+        # el audio fluya de corrido. Solo haremos el corte brutal (al original)
+        # si el modelo se volvio loco y genero un audio gigantesco (>1.4x).
         if sr is not None and sr > 0:
             text_len = len(batch_texts[i])
-            expected_s = max(
-                0.1,
-                text_len / max(QWEN_TTS_CHARS_PER_SEC, 1e-3)
-            )
-            limit_s = expected_s * QWEN_TTS_RUNAWAY_FACTOR + QWEN_TTS_RUNAWAY_FLOOR_S
             orig_dur = batch_original_durations[i]
-            if orig_dur > 0:
-                limit_s = min(limit_s, orig_dur)
             actual_s = wav.shape[0] / sr
-            if actual_s > limit_s:
-                limit_samples = int(limit_s * sr)
-                wav = wav[:limit_samples]
-                runaway_stats.append({
-                    "idx": i,
-                    "text_len": text_len,
-                    "expected_s": orig_dur if orig_dur > 0 else expected_s,
-                    "actual_s": actual_s,
-                    "truncated_to_s": limit_s,
-                    "preview": batch_texts[i][:50],
-                })
+            
+            if orig_dur > 0:
+                max_allowed_s = orig_dur * QWEN_TTS_RUNAWAY_FACTOR
+                if actual_s > max_allowed_s:
+                    # Corte brutal en seco al limite exacto del original
+                    limit_samples = int(orig_dur * sr)
+                    wav = wav[:limit_samples]
+                    runaway_stats.append({
+                        "idx": i,
+                        "text_len": text_len,
+                        "expected_s": orig_dur,
+                        "actual_s": actual_s,
+                        "truncated_to_s": orig_dur,
+                        "preview": batch_texts[i][:50],
+                    })
+            else:
+                # Fallback si no hay original_duration
+                expected_s = max(0.1, text_len / max(QWEN_TTS_CHARS_PER_SEC, 1e-3))
+                limit_s = expected_s * QWEN_TTS_RUNAWAY_FACTOR + QWEN_TTS_RUNAWAY_FLOOR_S
+                if actual_s > limit_s:
+                    limit_samples = int(expected_s * sr)
+                    wav = wav[:limit_samples]
 
         wavs_out.append(wav)
 

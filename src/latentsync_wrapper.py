@@ -39,7 +39,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-
 import ffmpeg
 
 from src.logger import get_logger
@@ -57,15 +56,17 @@ LATENTSYNC_ALLOW_PATTERNS = ["latentsync_unet.pt", "whisper/tiny.pt"]
 
 
 def _repo_path() -> str:
-    return os.environ.get("LATENTSYNC_PATH", "/runpod-volume/LatentSync")
+    return os.environ.get("LATENTSYNC_PATH", "/app/LatentSync")
 
+def _weights_path() -> str:
+    return os.environ.get("LATENTSYNC_WEIGHTS_PATH", "/runpod-volume/models/LatentSync")
 
 def _unet_ckpt() -> str:
-    return os.path.join(_repo_path(), "checkpoints", "latentsync_unet.pt")
+    return os.path.join(_weights_path(), "latentsync_unet.pt")
 
 
 def _whisper_ckpt() -> str:
-    return os.path.join(_repo_path(), "checkpoints", "whisper", "tiny.pt")
+    return os.path.join(_weights_path(), "whisper", "tiny.pt")
 
 
 def _default_unet_config() -> str:
@@ -78,10 +79,6 @@ def _default_unet_config() -> str:
         "LATENTSYNC_UNET_CONFIG",
         "configs/unet/stage2_512.yaml",  # relativo al repo
     )
-
-
-def _deps_marker() -> str:
-    return os.path.join(_repo_path(), ".deps_installed")
 
 
 # =========================================================================
@@ -128,101 +125,49 @@ def status_report() -> dict:
             if os.path.isfile(whisper) else 0,
         },
         "unet_config": _default_unet_config(),
-        "deps_installed": os.path.isfile(_deps_marker()),
         "ready": is_code_available() and is_models_available(),
     }
 
 
 # =========================================================================
-# Bootstrap (clone repo + download weights + install deps) — AUTOMATICO
+# Bootstrap (download weights if missing) — AUTOMATICO Y SIN PIP
 # =========================================================================
-
-def _clone_repo():
-    repo = _repo_path()
-    parent = os.path.dirname(repo) or "."
-    os.makedirs(parent, exist_ok=True)
-    log.info(f"[bootstrap 1/3] Cloning LatentSync from {LATENTSYNC_REPO_URL} -> {repo}")
-    subprocess.run(
-        ["git", "clone", "--depth", "1", LATENTSYNC_REPO_URL, repo],
-        check=True,
-    )
-
 
 def _download_weights():
     from huggingface_hub import snapshot_download
 
-    ckpt_dir = os.path.join(_repo_path(), "checkpoints")
+    ckpt_dir = _weights_path()
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(os.path.join(ckpt_dir, "whisper"), exist_ok=True)
 
     token = os.environ.get("HF_TOKEN")
     log.info(
-        f"[bootstrap 2/3] Downloading LatentSync weights from "
+        f"[LatentSync] Descargando pesos desde "
         f"{LATENTSYNC_HF_REPO} -> {ckpt_dir} (~2 GB, solo la primera vez)"
     )
     snapshot_download(
         repo_id=LATENTSYNC_HF_REPO,
         local_dir=ckpt_dir,
-        local_dir_use_symlinks=False,
         token=token,
-        resume_download=True,
         max_workers=4,
         allow_patterns=LATENTSYNC_ALLOW_PATTERNS,
     )
 
 
-def _install_requirements():
-    repo = _repo_path()
-    req = os.path.join(repo, "requirements.txt")
-    if not os.path.isfile(req):
-        log.warning(
-            f"[bootstrap 3/3] requirements.txt ausente en {req} — saltando pip install."
-        )
-        return
-    log.info(
-        f"[bootstrap 3/3] pip install -r {req} "
-        f"(rapido si ya estan instalados, lento solo la primera vez)"
-    )
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-cache-dir", "-r", req],
-        check=False,  # No matar el render por issues menores de pip (deps opcionales)
-    )
-
-
 def ensure_latentsync_ready(install_deps: bool = True) -> None:
     """
-    Bootstrap completo e idempotente. Se llama automaticamente desde
-    `lipsync_video_to_video`. Podes llamarla explicitamente al boot del
-    app si queres pre-calentar.
-
-    - Primera vez (volumen vacio): clona repo (~20 MB) + baja pesos
-      (~2 GB) + pip install. Tarda ~3-5 minutos segun red.
-    - Siguientes veces (volumen con todo): no hace nada (solo checks por
-      archivos). Instantaneo.
-    - Tras restart del pod: repo y pesos persisten en /runpod-volume.
-      pip install se re-corre solo la primera llamada del nuevo pod
-      (porque el env del pod es efimero), luego el sentinel .deps_installed
-      lo salta. El sentinel vive en el volumen, asi que si queres forzar
-      re-install tras un `pip uninstall` manual, borralo.
-
-    Lanza RuntimeError si algo falla. NO hay fallback.
+    Verifica código y pesos sin intervenir paquetes.
     """
-    # Paso 1: clonar repo si no esta
+    target_repo = _repo_path()
     if not is_code_available():
-        try:
-            _clone_repo()
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Fallo clonando LatentSync desde {LATENTSYNC_REPO_URL}: {e}. "
-                f"Verifica conexion de red y que {_repo_path()} sea escribible."
-            ) from e
-        if not is_code_available():
-            raise RuntimeError(
-                f"Clone completado pero scripts/inference.py no aparece en "
-                f"{_repo_path()}. El repo podria haber cambiado de layout."
-            )
+        if os.path.exists("/app/LatentSync/scripts/inference.py") and target_repo != "/app/LatentSync":
+            log.info(f"Copiando código pre-empaquetado de /app/LatentSync a {target_repo}")
+            os.makedirs(target_repo, exist_ok=True)
+            shutil.copytree("/app/LatentSync", target_repo, dirs_exist_ok=True)
+        else:
+            raise RuntimeError(f"El código de LatentSync no se encuentra pre-empaquetado. Reconstruye la imagen.")
 
-    # Paso 2: descargar pesos si faltan
+    # Paso 2: descargar pesos si faltan en volumen de red
     if not is_models_available():
         try:
             _download_weights()
@@ -239,16 +184,16 @@ def ensure_latentsync_ready(install_deps: bool = True) -> None:
                 f"  whisper: {_whisper_ckpt()}"
             )
 
-    # Paso 3: pip install (marker evita re-run en subsecuentes calls)
-    if install_deps and not os.path.isfile(_deps_marker()):
-        _install_requirements()
+    # Crear symlink a los pesos dentro del repo si es necesario para inference.py
+    ckpt_symlink = os.path.join(target_repo, "checkpoints")
+    if not os.path.exists(ckpt_symlink):
         try:
-            with open(_deps_marker(), "w") as f:
-                f.write("ok\n")
-        except OSError:
-            pass  # marker es optimizacion, no critico
+            os.symlink(_weights_path(), ckpt_symlink)
+            log.info(f"Symlink de checkpoints creado en {ckpt_symlink}")
+        except OSError as e:
+            log.warning(f"No se pudo crear symlink de checkpoints: {e}")
 
-    log.info("LatentSync listo (repo + pesos + deps).")
+    log.info("LatentSync listo (código y pesos verificados).")
 
 
 # =========================================================================
@@ -278,16 +223,26 @@ def _normalize_inputs(video_path: str, audio_path: str, workdir: str) -> tuple[s
     # preset=p1 es el mas rapido; esta pre-normalizacion es solo setup, no calidad final.
     vcodec = os.environ.get("LATENTSYNC_NORM_VCODEC", "h264_nvenc")
     preset = "p1" if vcodec.endswith("_nvenc") else "ultrafast"
-    (
-        ffmpeg.input(video_path)
-        .output(v_out, r=25, vcodec=vcodec, acodec="aac", preset=preset)
-        .overwrite_output().run(quiet=True)
-    )
-    (
-        ffmpeg.input(audio_path)
-        .output(a_out, ar=16000, ac=1, acodec="pcm_s16le")
-        .overwrite_output().run(quiet=True)
-    )
+
+    ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+
+    # 1. Normalizar Video con Fallback (Si NVENC falla por version de ffmpeg o driver)
+    cmd_v = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-r", "25", "-c:v", vcodec, "-preset", preset, "-c:a", "aac", v_out]
+    res_v = subprocess.run(cmd_v, capture_output=True, text=True)
+    if res_v.returncode != 0:
+        log.warning(f"NVENC falló en LatentSync norm: {res_v.stderr}")
+        log.info("Usando fallback libx264 silenciosamente (esto tardará mucho en videos largos)...")
+        cmd_v_fallback = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", video_path, "-r", "25", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", v_out]
+        res_v2 = subprocess.run(cmd_v_fallback, capture_output=True, text=True)
+        if res_v2.returncode != 0:
+            raise RuntimeError(f"Fallo normalizando video LatentSync (incluso con libx264): {res_v2.stderr}")
+
+    # 2. Normalizar Audio
+    cmd_a = [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-y", "-i", audio_path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", a_out]
+    res_a = subprocess.run(cmd_a, capture_output=True, text=True)
+    if res_a.returncode != 0:
+        raise RuntimeError(f"Fallo normalizando audio LatentSync: {res_a.stderr}")
+
     return v_out, a_out
 
 
@@ -336,7 +291,9 @@ def lipsync_video_to_video(
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    workdir = tempfile.mkdtemp(prefix="latentsync_")
+    temp_base = os.environ.get("LOCAL_TEMP_DIR", "/workspace/qdp_data/temp_workspace")
+    os.makedirs(temp_base, exist_ok=True)
+    workdir = tempfile.mkdtemp(prefix="latentsync_", dir=temp_base)
     try:
         if normalize_inputs:
             v_in, a_in = _normalize_inputs(video_path, audio_path, workdir)
