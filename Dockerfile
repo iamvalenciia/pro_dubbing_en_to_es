@@ -48,7 +48,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 4.5 LatentSync (Build-time setup controlado)
 RUN git clone --depth 1 https://github.com/bytedance/LatentSync.git /app/LatentSync && \
-    egrep -v "^(torch|torchvision|torchaudio|transformers|accelerate|xformers|gradio|numpy)" /app/LatentSync/requirements.txt > /app/LatentSync/req_filtered.txt && \
+    egrep -i -v "^(torch|torchvision|torchaudio|transformers|accelerate|xformers|gradio|numpy|scikit-image|scipy|insightface|opencv-python)" /app/LatentSync/requirements.txt > /app/LatentSync/req_filtered.txt && \
     pip install --no-cache-dir -r /app/LatentSync/req_filtered.txt
 
 # 5. Qwen3-TTS primero, luego Qwen3-ASR.

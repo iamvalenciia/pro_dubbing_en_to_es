@@ -150,7 +150,7 @@ body { background: transparent !important; }
   text-align: center; color: var(--qdp-muted); font-size: 12px;
   letter-spacing: 0.24em; margin-bottom: 18px; text-transform: uppercase;
 }
-.gr-group, .gr-panel, .gr-box {
+.gr-group, .gr-panel {
   background: var(--qdp-surface) !important;
   border: 1px solid var(--qdp-border) !important;
   border-radius: 12px !important;
@@ -184,10 +184,15 @@ body { background: transparent !important; }
   color: var(--qdp-surface) !important;
 }
 .dark .gr-button.qdp-solid, .dark button.primary.qdp-solid { color: #0a0a0a !important; }
-input, textarea, .gr-textbox textarea, .gr-textbox input {
+input[type="text"], input[type="number"], textarea, .gr-textbox textarea, .gr-textbox input {
   background: transparent !important;
   color: var(--qdp-text) !important;
   border-color: var(--qdp-border) !important;
+}
+/* Restaurar reactividad y visibilidad de checkboxes en Gradio */
+input[type="checkbox"], .gr-checkbox label {
+  cursor: pointer !important;
+  pointer-events: auto !important;
 }
 label, .gr-form > label, .gr-block-label {
   color: var(--qdp-muted) !important;

@@ -32,6 +32,10 @@ faster-whisper>=1.1.1
 # (shorts con Gemini). Si no usas shorts, podes sacarlo.
 google-generativeai==0.8.2
 
+# === LATENTSYNC (Pre-empting ABI Numpy crash) ===
+scikit-image<0.23.0
+insightface==0.7.3
+
 # === VIDEO & SUBS & UI ===
 opencv-python-headless==4.10.0.84
 moviepy==1.0.3
