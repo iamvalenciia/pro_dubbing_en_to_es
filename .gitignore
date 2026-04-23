@@ -10,8 +10,12 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv-py310/
 .env
 .env.local
+
+# UI runtime cache
+.gradio/
 
 # Modelos y pesos (descargados en runtime)
 models/
@@ -29,6 +33,14 @@ temp_workspace/
 cache/
 youtube_video/
 shorts/
+
+# Vendored pyvideotrans runtime artifacts (do not commit)
+pyvideotrans/models/
+pyvideotrans/output/
+pyvideotrans/tmp/
+pyvideotrans/logs/
+pyvideotrans/__pycache__/
+pyvideotrans/.git/
 
 # IDE / editores
 .claude/

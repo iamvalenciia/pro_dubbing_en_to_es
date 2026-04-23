@@ -1,59 +1,52 @@
-"""Sistema de logs centralizado para el pipeline.
+"""Simple pipeline logger used by the Gradio wrapper."""
 
-Cada fase usa get_logger(name) para emitir logs estructurados.
-Todos los logs se escriben a disco (pipeline.log) y a stdout del container.
-El UI lee el tail del archivo para mostrar progreso en vivo.
-"""
+from __future__ import annotations
+
 import logging
 import os
 import sys
-import time
-from contextlib import contextmanager
 from typing import Optional
-
 
 _LOG_PATH: Optional[str] = None
 _CONFIGURED = False
 
 
 class _TeeStream:
-    """Duplica escrituras a stdout original + archivo de log.
-    Necesario para capturar prints de librerias que no usan logging (tqdm, hf, etc.)
-    """
     def __init__(self, *streams):
         self.streams = streams
 
     def write(self, data):
-        for s in self.streams:
+        for stream in self.streams:
             try:
-                s.write(data)
-                s.flush()
-            except (ValueError, OSError):
+                stream.write(data)
+                stream.flush()
+            except Exception:
                 pass
 
     def flush(self):
-        for s in self.streams:
+        for stream in self.streams:
             try:
-                s.flush()
-            except (ValueError, OSError):
+                stream.flush()
+            except Exception:
                 pass
 
-    def isatty(self):
+    def isatty(self) -> bool:
+        for stream in self.streams:
+            try:
+                return bool(stream.isatty())
+            except Exception:
+                continue
         return False
 
 
 def setup_pipeline_logger(log_dir: str | None = None) -> str:
-    """Configura logger root con handler de archivo + stdout y tee de stdout/stderr.
-    Idempotente: solo configura una vez por proceso.
-    IMPORTANTE: log_dir debe estar FUERA de temp_workspace/output/input (que son
-    purgados por clear_workspace). Por defecto usa LOCAL_LOGS (NVMe local).
-    Retorna la ruta del archivo de log.
-    """
     global _LOG_PATH, _CONFIGURED
 
     if log_dir is None:
         from src.paths import LOCAL_LOGS
+
         log_dir = LOCAL_LOGS
+
     os.makedirs(log_dir, exist_ok=True)
     _LOG_PATH = os.path.join(log_dir, "pipeline.log")
 
@@ -70,124 +63,48 @@ def setup_pipeline_logger(log_dir: str | None = None) -> str:
         datefmt="%H:%M:%S",
     )
 
-    fh = logging.FileHandler(_LOG_PATH, mode="a", encoding="utf-8")
-    fh.setFormatter(fmt)
-    fh.setLevel(logging.DEBUG)
-    root.addHandler(fh)
+    file_handler = logging.FileHandler(_LOG_PATH, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
 
-    sh = logging.StreamHandler(sys.__stdout__)
-    sh.setFormatter(fmt)
-    sh.setLevel(logging.INFO)
-    root.addHandler(sh)
+    stdout_handler = logging.StreamHandler(sys.__stdout__)
+    stdout_handler.setLevel(logging.INFO)
+    stdout_handler.setFormatter(fmt)
+    root.addHandler(stdout_handler)
 
-    log_file_raw = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
-    sys.stdout = _TeeStream(sys.__stdout__, log_file_raw)
-    sys.stderr = _TeeStream(sys.__stderr__, log_file_raw)
+    try:
+        log_raw = open(_LOG_PATH, "a", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStream(sys.__stdout__, log_raw)
+        sys.stderr = _TeeStream(sys.__stderr__, log_raw)
+    except Exception:
+        pass
 
     _CONFIGURED = True
-
-    root.info("=" * 80)
-    root.info(f"Pipeline logger inicializado. Archivo: {_LOG_PATH}")
-    root.info("=" * 80)
+    root.info("Pipeline logger inicializado en %s", _LOG_PATH)
     return _LOG_PATH
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Retorna logger namespaced bajo 'qdp.<name>'."""
     return logging.getLogger(f"qdp.{name}")
 
 
 def read_log_tail(lines: int = 300) -> str:
-    """Lee las ultimas N lineas del archivo de log.
-    Usado por el UI para mostrar progreso en vivo.
-    """
     if not _LOG_PATH or not os.path.exists(_LOG_PATH):
         return "(log vacio — pipeline no ha iniciado)"
     try:
         with open(_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
             all_lines = f.readlines()
         return "".join(all_lines[-lines:])
-    except OSError as e:
-        return f"(error leyendo log: {e})"
+    except OSError as exc:
+        return f"(error leyendo log: {exc})"
 
 
-def clear_log():
-    """Marca un reset visual en el log. No trunca el archivo para no invalidar
-    el file handle del FileHandler (que escribiria en inode fantasma). El UI
-    solo muestra el tail reciente, asi que el separador es suficiente.
-    """
-    root = logging.getLogger("qdp")
-    if not root.handlers:
-        return
-    root.info("")
-    root.info("#" * 80)
-    root.info("# LOG RESET — NUEVA CORRIDA")
-    root.info("#" * 80)
-    root.info("")
-
-
-def log_gpu_snapshot(log: logging.Logger, tag: str = ""):
-    """Loguea estado de CUDA: device count, memoria usada/libre, nombre del device."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            log.info(f"[GPU {tag}] CUDA NO disponible (torch.cuda.is_available=False)")
-            return
-        n = torch.cuda.device_count()
-        dev = torch.cuda.current_device()
-        name = torch.cuda.get_device_name(dev)
-        alloc = torch.cuda.memory_allocated(dev) / 1024 ** 3
-        reserved = torch.cuda.memory_reserved(dev) / 1024 ** 3
-        total = torch.cuda.get_device_properties(dev).total_memory / 1024 ** 3
-        log.info(
-            f"[GPU {tag}] dev={dev}/{n} name='{name}' "
-            f"alloc={alloc:.2f}GB reserved={reserved:.2f}GB total={total:.2f}GB "
-            f"cuda_version={torch.version.cuda}"
-        )
-    except (ImportError, RuntimeError) as e:
-        log.warning(f"[GPU {tag}] no se pudo obtener snapshot: {e}")
-
-
-def log_file_info(log: logging.Logger, path: str, label: str = ""):
-    """Loguea tamano y existencia de un archivo."""
-    if not os.path.exists(path):
-        log.error(f"[FILE {label}] NO EXISTE: {path}")
-        return
-    size_mb = os.path.getsize(path) / 1024 ** 2
-    log.info(f"[FILE {label}] {path} ({size_mb:.2f} MB)")
-
-
-@contextmanager
-def phase_timer(log: logging.Logger, phase_name: str):
-    """Context manager que loguea inicio/fin de una fase con duracion."""
-    log.info("#" * 70)
-    log.info(f"### {phase_name} — INICIO")
-    log.info("#" * 70)
-    t0 = time.time()
-    try:
-        yield
-    except Exception as e:
-        dt = time.time() - t0
-        log.error(f"### {phase_name} — FALLO tras {dt:.2f}s: {type(e).__name__}: {e}")
-        raise
-    else:
-        dt = time.time() - t0
-        log.info("#" * 70)
-        log.info(f"### {phase_name} — OK en {dt:.2f}s")
-        log.info("#" * 70)
-
-
-@contextmanager
-def step_timer(log: logging.Logger, step_name: str):
-    """Context manager para sub-pasos dentro de una fase."""
-    log.info(f"  -> {step_name} ...")
-    t0 = time.time()
-    try:
-        yield
-    except Exception as e:
-        dt = time.time() - t0
-        log.error(f"  <- {step_name} FALLO tras {dt:.2f}s: {type(e).__name__}: {e}")
-        raise
-    else:
-        dt = time.time() - t0
-        log.info(f"  <- {step_name} OK ({dt:.2f}s)")
+def clear_log() -> None:
+    logger = logging.getLogger("qdp")
+    if logger.handlers:
+        logger.info("")
+        logger.info("#" * 72)
+        logger.info("# LOG RESET — NUEVA CORRIDA")
+        logger.info("#" * 72)
+        logger.info("")

@@ -1,27 +1,33 @@
-# Ignorar entornos virtuales y cachés pesadas
+# Local envs and caches
+.venv/
+.venv-py310/
 venv/
 env/
-.env
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Ignorar modelos pesados si existieran localmente
+# Secrets/local-only files
+.env
+.gradio/
+
+# Heavy local artifacts (models, generated media, temp)
 models/
 weights/
 *.pth
 *.pt
 *.safetensors
 *.bin
-
-# Ignorar carpetas de resultados de video/audio
-youtube_video/
-output/
 input/
+output/
+temp_workspace/
+youtube_video/
 cache/
 
-# Archivos de la máquina virtual o dependencias locales
+# VCS and editor extras
 .git/
-.dockerignore
-Dockerfile
+.claude/
+*.png
+tests/
 docker-compose.yml
 docker-clean-build.ps1

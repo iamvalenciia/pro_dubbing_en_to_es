@@ -3,49 +3,23 @@
 numpy<2.0.0
 scipy==1.13.1
 
-# === MANIPULACION DE AUDIO (Fase 2 y 5) ===
-# NOTA: demucs y pyannote.audio removidos — la fase 1 (separacion voz/ambiente)
-# fue eliminada del pipeline. pyrubberband tambien removido (no hay time-stretch).
-librosa==0.10.2
-soundfile==0.12.1
-pydub==0.25.1
-
-# === HUGGINGFACE & TRANSFORMERS ===
-# transformers lo pinean qwen-tts (4.57.3) y qwen-asr (4.57.6) via Dockerfile en pasos secuenciales.
-# accelerate lo clava qwen-asr a 1.12.0.
-# sentencepiece es requerido por MarianTokenizer (Fase 3).
-accelerate==1.12.0
-sentencepiece>=0.1.99
-# sacremoses: recomendado por MarianTokenizer para tokenizacion EN->ES de calidad.
-sacremoses>=0.1.1
-# safetensors: requerido para convertir pytorch_model.bin de MarianMT post-download
-# (dodge del bloqueo CVE-2025-32434 que transformers aplica con torch < 2.6).
-safetensors>=0.4.0
-faster-whisper>=1.1.1
-
-# NOTA: qwen-asr y qwen-tts se instalan en el Dockerfile en pasos separados
-# porque tienen pines exclusivos de transformers que pip no puede resolver juntos.
-
 # === INTEGRACION LLM & PIPELINE ===
-# google-generativeai removido — Fase 3 ahora usa MarianMT (local, sin API).
-# Se mantiene instalable si el modulo phase7_ai_shorts.py lo sigue usando
-# (shorts con Gemini). Si no usas shorts, podes sacarlo.
+# Utilizado por phase7_ai_shorts.py para generar plan de Shorts con Gemini.
 google-generativeai==0.8.2
 
-# === LATENTSYNC (Pre-empting ABI Numpy crash) ===
-scikit-image<0.23.0
-insightface==0.7.3
-
-# === VIDEO & SUBS & UI ===
-opencv-python-headless==4.10.0.84
-moviepy==1.0.3
-ffmpeg-python==0.2.0
-pysubs2==1.7.3
+# === UI / SERVIDOR ===
 gradio>=5.0.0
 fastapi>=0.115.0
 uvicorn>=0.32.0
+
+# === VIDEO ===
+ffmpeg-python==0.2.0
+faster-whisper==1.1.1
+librosa==0.10.2.post1
+soundfile==0.12.1
 
 # === UTILIDADES ===
 python-dotenv
 tqdm
 gdown
+Pillow>=10.0.0
