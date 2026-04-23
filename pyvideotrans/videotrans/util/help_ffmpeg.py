@@ -613,15 +613,34 @@ def cut_from_audio(*, ss, to, audio_file, out_file):
     from pathlib import Path
     if not Path(audio_file).exists():
         return False
+
+    # Guard against zero/invalid trims that make ffmpeg fail
+    # with "-to value smaller than -ss".
+    try:
+        ss_val = float(ss)
+    except Exception:
+        ss_val = 0.0
+    try:
+        to_val = float(to)
+    except Exception:
+        to_val = ss_val
+
+    if ss_val < 0:
+        ss_val = 0.0
+    if to_val <= ss_val:
+        to_val = ss_val + 0.05
+
+    duration_val = max(0.05, to_val - ss_val)
+
     Path(out_file).parent.mkdir(exist_ok=True,parents=True)
     cmd = [
         "-y",
         "-i",
         audio_file,
         "-ss",
-        help_srt.format_time(ss, '.'),
-        "-to",
-        help_srt.format_time(to, '.'),
+        help_srt.ms_to_time_string(seconds=ss_val, sepflag='.'),
+        "-t",
+        f"{duration_val:.3f}",
         "-ar",
         "16000",
         "-c:a",

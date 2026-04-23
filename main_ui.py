@@ -537,6 +537,34 @@ def _ensure_dirs():
     ensure_local_dirs()
     setup_pipeline_logger(LOCAL_LOGS)
 
+
+def _warmup_nllb200():
+    if os.environ.get("QDP_WARMUP_NLLB", "1").lower() in {"0", "false", "no"}:
+        ui_log.info("NLLB warm-up deshabilitado por QDP_WARMUP_NLLB")
+        return
+
+    try:
+        ui_log.info("Iniciando warm-up de NLLB-200(Local)...")
+        from pyvideotrans.videotrans.translator._nllb200 import NLLB200Trans
+
+        warmup = NLLB200Trans(
+            translate_type=2,
+            text_list=[],
+            source_code="en",
+            target_code="es",
+            target_language_name="Spanish",
+            is_test=True,
+        )
+        warmup._download()
+        warmup._unload()
+        ui_log.info("Warm-up de NLLB-200(Local) completado")
+    except Exception as exc:
+        ui_log.warning(f"Warm-up de NLLB-200(Local) falló: {exc}")
+
+
+def _start_background_warmups():
+    threading.Thread(target=_warmup_nllb200, name="nllb-warmup", daemon=True).start()
+
 _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 _AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".aac", ".opus")
 
@@ -1652,6 +1680,7 @@ with gr.Blocks(
 if __name__ == "__main__":
     _ensure_dirs()
     ui_log.info("Booting Quantum Dubbing Pipeline UI - Apple Style")
+    _start_background_warmups()
     
     
     allowed = [os.path.abspath(d) for d in [NETWORK_DIR, LOCAL_DIR]]

@@ -12,6 +12,7 @@ from videotrans.util import tools
 GOOGLE_INDEX = 0
 MICROSOFT_INDEX = 1
 M2M100_INDEX=2
+NLLB200_INDEX = M2M100_INDEX
 
 
 CHATGPT_INDEX = 3
@@ -66,7 +67,7 @@ AI_TRANS_CHANNELS=[
 _ID_NAME_DICT = {
     GOOGLE_INDEX:tr('Google'),
     MICROSOFT_INDEX:tr('Microsoft'),
-    M2M100_INDEX:f'M2M100({tr("Local")})',
+    M2M100_INDEX:f'NLLB-200({tr("Local")})',
     
     
     CHATGPT_INDEX:tr('OpenAI ChatGPT'),
@@ -1037,8 +1038,8 @@ def run(*, translate_type=0,
         from videotrans.translator._minimax import MiniMax
         return MiniMax(**kwargs).run()
     if translate_type == M2M100_INDEX:
-        from videotrans.translator._m2m100 import M2M100Trans
-        return M2M100Trans(**kwargs).run()
+        from videotrans.translator._nllb200 import NLLB200Trans
+        return NLLB200Trans(**kwargs).run()
     if translate_type == CAMB_INDEX:
         from videotrans.translator._camb import CambTranslator
         return CambTranslator(**kwargs).run()

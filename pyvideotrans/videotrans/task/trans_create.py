@@ -1121,15 +1121,24 @@ class TransCreate(BaseTask):
                 for dur, it in seg_list:
                     if total_ms >= MAX_REF_MS:
                         break
+
+                    start_raw = int(it.get('startraw', it.get('start_time', 0)) or 0)
+                    end_raw = int(it.get('endraw', it.get('end_time', 0)) or 0)
+                    if end_raw <= start_raw:
+                        logger.debug(
+                            f"Skip invalid ref segment for {ref_wav}: start={start_raw}, end={end_raw}"
+                        )
+                        continue
+
                     clip_path = f"{it['ref_wav']}.clip{len(tmp_clips)}.wav"
                     tools.cut_from_audio(
                         audio_file=vocal,
-                        ss=it['startraw'],
-                        to=it['endraw'],
+                        ss=start_raw,
+                        to=end_raw,
                         out_file=clip_path
                     )
                     tmp_clips.append(clip_path)
-                    total_ms += dur
+                    total_ms += max(0, end_raw - start_raw)
 
                 if not tmp_clips:
                     return
