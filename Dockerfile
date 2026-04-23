@@ -36,7 +36,12 @@ RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Model runtimes.
-RUN pip install --no-cache-dir qwen-tts==0.1.1 qwen-asr==0.0.6
+# qwen-tts==0.1.1 pins transformers 4.57.3 while qwen-asr==0.0.6 pins 4.57.6.
+# We keep a single transformers version (4.57.6) and install qwen-tts without deps
+# because the required runtime deps are already installed from requirements.
+RUN pip install --no-cache-dir transformers==4.57.6 accelerate==1.12.0 einops sox \
+  && pip install --no-cache-dir qwen-asr==0.0.6 \
+  && pip install --no-cache-dir --no-deps qwen-tts==0.1.1
 
 # Optional speedups (do not fail image build if unavailable).
 ARG INSTALL_XFORMERS=1

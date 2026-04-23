@@ -6,13 +6,17 @@ import os
 import re
 import sys
 import tempfile
+import locale
 from functools import lru_cache
 from pathlib import Path
 from queue import Queue
 from dataclasses import dataclass, field
 from typing import Dict, Any, List
 
-from PySide6.QtCore import QLocale
+try:
+    from PySide6.QtCore import QLocale
+except Exception:
+    QLocale = None
 from videotrans.util.contants import (
     no_proxy, DEFAULT_GEMINI_MODEL, OPENAITTS_ROLES, ChatTTS_VOICE, Qwentts_Models,
     Whisper_Models, Zijiehuoshan_Model, Zhipuai_Model, Localllm_Model, Azure_Model,
@@ -98,7 +102,12 @@ def _init_language():
     try:
         _defaulelang = os.environ.get('PYVIDEOTRANS_LANG', settings.lang)
         if not _defaulelang:
-            _defaulelang = QLocale.system().name()[:2].lower()
+            if QLocale is not None:
+                _defaulelang = QLocale.system().name()[:2].lower()
+            else:
+                # Headless/CLI runtime fallback when Qt is not installed.
+                sys_lang = locale.getlocale()[0] or locale.getdefaultlocale()[0]
+                _defaulelang = (sys_lang or "en")[:2].lower()
     except:
         _defaulelang = "en"
 

@@ -24,6 +24,14 @@ temp_workspace/
 youtube_video/
 cache/
 
+# Vendored pyvideotrans runtime artifacts
+pyvideotrans/models/
+pyvideotrans/output/
+pyvideotrans/tmp/
+pyvideotrans/logs/
+pyvideotrans/__pycache__/
+pyvideotrans/.git/
+
 # VCS and editor extras
 .git/
 .claude/
