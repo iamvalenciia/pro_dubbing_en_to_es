@@ -89,7 +89,7 @@ class NLLB200Trans(BaseTrans):
             return max(current, 32)
 
         if free_gb >= 70:
-            target = 256
+            target = 512
         elif free_gb >= 40:
             target = 160
         elif free_gb >= 24:
@@ -232,9 +232,11 @@ class NLLB200Trans(BaseTrans):
             pass
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
         generated = self.model.generate(
             **inputs,
             forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(self.to_lang),
+            pad_token_id=eos_id,
             num_beams=4,
             max_new_tokens=512,
             length_penalty=1.0,

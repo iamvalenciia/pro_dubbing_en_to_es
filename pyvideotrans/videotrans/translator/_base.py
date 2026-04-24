@@ -1,5 +1,6 @@
 import json
 import time
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Union
@@ -108,12 +109,28 @@ class BaseTrans(BaseCon):
     def _run_text(self,split_source_text):
         # 传统翻译渠道或AI翻译渠道以按行形式翻译
         target_list=[]
+        total_batches = len(split_source_text)
+        total_lines = len(self.text_list)
+        done_lines = 0
+        run_started_at = time.time()
         for i, it in enumerate(split_source_text):
             """ it=['你好啊我的朋友','第二行'] 
                 此时 _item_task 接收的是 list[str]
             """
             if self._exit(): return
-            self._signal(text=tr('starttrans') + f' {i} ')
+            batch_no = i + 1
+            elapsed = max(time.time() - run_started_at, 0.001)
+            avg_batch_sec = elapsed / batch_no
+            remaining_batches = max(total_batches - batch_no, 0)
+            eta_sec = max(int(math.ceil(avg_batch_sec * remaining_batches)), 0)
+            eta_min, eta_rem_sec = divmod(eta_sec, 60)
+            eta_text = f"{eta_min:02d}:{eta_rem_sec:02d}"
+            self._signal(
+                text=(
+                    f"{tr('starttrans')} {batch_no}/{total_batches} "
+                    f"lines={done_lines}/{total_lines} eta={eta_text}"
+                )
+            )
             result = self._get_cache(it)
             if not result:
                 result = tools.cleartext(self._item_task(it))
@@ -131,6 +148,20 @@ class BaseTrans(BaseCon):
                 print(f'行数不匹配，原始：{len(it)}, 结果：{len(sep_res)}\n{it=}\n{sep_res=}')
                 tmp = ["" for x in range(len(it) - len(sep_res))]
                 target_list += tmp
+
+            done_lines += len(it)
+            elapsed_done = max(time.time() - run_started_at, 0.001)
+            avg_line_sec = elapsed_done / max(done_lines, 1)
+            remaining_lines = max(total_lines - done_lines, 0)
+            eta_done_sec = max(int(math.ceil(avg_line_sec * remaining_lines)), 0)
+            eta_done_min, eta_done_rem_sec = divmod(eta_done_sec, 60)
+            self._signal(
+                text=(
+                    f"[translate-progress] {done_lines}/{total_lines} lines "
+                    f"({(done_lines / max(total_lines, 1)) * 100:.1f}%) "
+                    f"eta={eta_done_min:02d}:{eta_done_rem_sec:02d}"
+                )
+            )
 
             time.sleep(self.wait_sec)
 
