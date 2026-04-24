@@ -256,6 +256,61 @@ def test_qwen3tts_short_ref_always_clones(monkeypatch, tmp_path):
     assert out_file.exists()
 
 
+def test_qwen3tts_clone_batches_ignore_per_line_ref_text(monkeypatch, tmp_path):
+    mod = _load_tts_module(monkeypatch, fail_batch=False, free_gib=72)
+
+    ref_wav = tmp_path / "spk_ref.wav"
+    ref_wav.write_bytes(b"wav")
+
+    rows = []
+    for i in range(4):
+        base = tmp_path / f"line_clone_{i}"
+        rows.append(
+            {
+                "line": i + 1,
+                "text": f"texto clone {i}",
+                "role": "clone",
+                "filename": str(base),
+                "ref_wav": str(ref_wav),
+                "ref_text": f"source ref {i}",
+                "with_emotion": False,
+            }
+        )
+
+    queue_file = tmp_path / "queue_clone_reftext.json"
+    queue_file.write_text(json.dumps(rows), encoding="utf-8")
+
+    logs = []
+
+    def _capture(_file, msg):
+        payload = json.loads(msg)
+        logs.append(payload.get("text", ""))
+
+    monkeypatch.setattr(mod, "_write_log", _capture)
+    monkeypatch.setenv("PYVIDEOTRANS_QWEN_TTS_BATCH_LINES", "4")
+
+    import videotrans.util.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "get_audio_time", lambda _p: 15000)
+
+    ok, err = mod.qwen3tts_fun(
+        queue_tts_file=str(queue_file),
+        language="Spanish",
+        logs_file=str(tmp_path / "tts.log"),
+        defaulelang="en",
+        is_cuda=True,
+        prompt="",
+        model_name="1.7B",
+        roledict={},
+        device_index=0,
+    )
+
+    assert ok is True
+    assert err is None
+    assert any("clone_group_by_ref_text=False" in s for s in logs)
+    assert any("batch_start" in s and "size=4" in s and "mode=clone" in s for s in logs)
+
+
 def test_qwen3tts_aborts_when_majority_lines_fail(monkeypatch, tmp_path):
     mod = _load_tts_module(monkeypatch, fail_batch=False, free_gib=72)
 

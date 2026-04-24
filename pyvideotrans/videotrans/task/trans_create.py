@@ -1061,35 +1061,17 @@ class TransCreate(BaseTask):
         if len([it.get("ref_wav") for it in self.queue_tts if it.get("ref_wav")]) > 0:
             self._create_ref_from_vocal()
 
-            # If some clone references are missing, fallback gracefully:
-            # 1) reuse any existing speaker reference when available;
-            # 2) if none exists, switch those lines to a built-in custom voice.
-            existing_ref_wavs = [
-                it.get('ref_wav') for it in self.queue_tts
-                if it.get('ref_wav') and Path(it.get('ref_wav')).is_file()
-            ]
-            fallback_ref_wav = existing_ref_wavs[0] if existing_ref_wavs else None
-            fallback_role = str(settings.get('qwenttslocal_fallback_role', 'Serena')).strip() or 'Serena'
-            missing_ref_count = 0
+            missing_ref_lines = []
             for it in self.queue_tts:
                 if str(it.get('role', '')).strip().lower() != 'clone' or not it.get('ref_wav'):
                     continue
-                if Path(it.get('ref_wav')).is_file():
-                    continue
-                missing_ref_count += 1
-                if fallback_ref_wav:
-                    it['ref_wav'] = fallback_ref_wav
-                    it['ref_text'] = ''
-                else:
-                    # No clone references could be built at all; degrade to built-in voice.
-                    it['role'] = fallback_role
-                    it['ref_wav'] = ''
-                    it['ref_text'] = ''
+                if not Path(it.get('ref_wav')).is_file():
+                    missing_ref_lines.append(it.get('line'))
 
-            if missing_ref_count > 0:
-                logger.warning(
-                    f"Clone reference fallback applied for {missing_ref_count} line(s). "
-                    f"fallback_ref={'yes' if fallback_ref_wav else 'no'}, fallback_role={fallback_role}"
+            if missing_ref_lines:
+                raise RuntimeError(
+                    "Missing clone reference audio for line(s): "
+                    f"{', '.join(str(x) for x in missing_ref_lines)}"
                 )
 
             # Add emotion flag to each item based on total speaker duration.

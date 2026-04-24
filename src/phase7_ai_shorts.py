@@ -24,40 +24,6 @@ def _timeline_duration(segments: list[dict[str, Any]]) -> float:
     return float(max((seg.get("end", 0.0) for seg in segments), default=0.0))
 
 
-def _heuristic_proposals(
-    timeline: list[dict[str, Any]],
-    min_duration_s: float,
-    max_duration_s: float,
-) -> list[dict[str, Any]]:
-    total = _timeline_duration(timeline)
-    if total <= 0:
-        return []
-
-    target = max(min_duration_s, min(max_duration_s, max(total / 3.0, min_duration_s)))
-    proposals = []
-    start = 0.0
-    idx = 1
-
-    while start < total and len(proposals) < 6:
-        end = min(total, start + target)
-        title = f"Clip {idx}"
-        hook = "Momento clave del video"
-        description = "Recorte sugerido por análisis local (fallback)."
-        proposals.append(
-            {
-                "title": title,
-                "hook": hook,
-                "start": round(start, 2),
-                "end": round(end, 2),
-                "description": description,
-            }
-        )
-        idx += 1
-        start = end
-
-    return proposals
-
-
 def analyze_timeline_for_shorts(
     json_path: str,
     min_duration_s: float = 45.0,
@@ -65,19 +31,17 @@ def analyze_timeline_for_shorts(
     model_name: str | None = None,
 ) -> list[dict[str, Any]]:
     """Analyze timeline and return short clip proposals.
-
-    Uses Gemini if API key exists; otherwise falls back to deterministic local heuristic.
     """
     timeline = _load_timeline(json_path)
 
     api_key = os.environ.get("API_GOOGLE_STUDIO")
     if not api_key:
-        return _heuristic_proposals(timeline, min_duration_s, max_duration_s)
+        raise RuntimeError("API_GOOGLE_STUDIO is required for high-quality reel analysis.")
 
     try:
         import google.generativeai as genai
-    except Exception:
-        return _heuristic_proposals(timeline, min_duration_s, max_duration_s)
+    except Exception as exc:
+        raise RuntimeError("google-generativeai is required for reel analysis.") from exc
 
     lines = []
     for seg in timeline:
@@ -89,7 +53,7 @@ def analyze_timeline_for_shorts(
 
     transcript = "\n".join(lines)
     if not transcript:
-        return _heuristic_proposals(timeline, min_duration_s, max_duration_s)
+        raise RuntimeError("No transcript content available for reel analysis.")
 
     genai.configure(api_key=api_key)
     effective_model = model_name or os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
@@ -104,42 +68,39 @@ TRANSCRIPCION:
 {transcript}
 """
 
-    try:
-        response = model.generate_content(prompt)
-        raw = (response.text or "").strip()
-        raw = re.sub(r"^```(?:json)?\\s*", "", raw)
-        raw = re.sub(r"\\s*```$", "", raw)
-        parsed = json.loads(raw)
-        if not isinstance(parsed, list):
-            return _heuristic_proposals(timeline, min_duration_s, max_duration_s)
+    response = model.generate_content(prompt)
+    raw = (response.text or "").strip()
+    raw = re.sub(r"^```(?:json)?\\s*", "", raw)
+    raw = re.sub(r"\\s*```$", "", raw)
+    parsed = json.loads(raw)
+    if not isinstance(parsed, list):
+        raise RuntimeError("Gemini response must be a JSON array of reel proposals.")
 
-        cleaned = []
-        for item in parsed:
-            try:
-                s = float(item["start"])
-                e = float(item["end"])
-                if e <= s:
-                    continue
-                dur = e - s
-                if dur < min_duration_s or dur > max_duration_s:
-                    continue
-                cleaned.append(
-                    {
-                        "title": str(item.get("title", "Clip"))[:120],
-                        "hook": str(item.get("hook", ""))[:240],
-                        "start": round(s, 2),
-                        "end": round(e, 2),
-                        "description": str(item.get("description", ""))[:240],
-                    }
-                )
-            except Exception:
-                continue
-        if cleaned:
-            return cleaned
-    except Exception:
-        pass
+    cleaned = []
+    for item in parsed:
+        s = float(item["start"])
+        e = float(item["end"])
+        if e <= s:
+            raise RuntimeError(f"Invalid reel timing from Gemini: start={s}, end={e}")
+        dur = e - s
+        if dur < min_duration_s or dur > max_duration_s:
+            raise RuntimeError(
+                f"Gemini proposed out-of-range duration ({dur:.2f}s). "
+                f"Allowed range: {min_duration_s:.2f}s-{max_duration_s:.2f}s"
+            )
+        cleaned.append(
+            {
+                "title": str(item.get("title", "Clip"))[:120],
+                "hook": str(item.get("hook", ""))[:240],
+                "start": round(s, 2),
+                "end": round(e, 2),
+                "description": str(item.get("description", ""))[:240],
+            }
+        )
 
-    return _heuristic_proposals(timeline, min_duration_s, max_duration_s)
+    if not cleaned:
+        raise RuntimeError("Gemini returned no valid reel proposals.")
+    return cleaned
 
 
 def render_short(

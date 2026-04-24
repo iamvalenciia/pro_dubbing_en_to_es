@@ -52,7 +52,7 @@ def _resolve_a100_stt_model(*, requested_model: str, is_cuda: bool, recogn_type:
     if total_gb < threshold_40:
         return requested_model
 
-    selected = prefer_40 if free_gb >= threshold_40 else (prefer_16 if free_gb >= threshold_16 else "small")
+    selected = prefer_40
     logger.info(f"[a100_stt_mode] auto model selected: requested={requested_model} selected={selected} free_gb={free_gb:.1f} total_gb={total_gb:.1f}")
     return selected
 
@@ -94,14 +94,9 @@ class FasterAll(BaseRecogn):
             try:
                 tools.check_and_down_hf(self.model_name,repo_id,self.local_dir,callback=self._process_callback)
             except Exception as e:
-                fallback_model = os.environ.get("PYVIDEOTRANS_A100_STT_FALLBACK", "tiny").strip() or "tiny"
-                if fallback_model not in FASTER_MODELS_DICT:
-                    fallback_model = "tiny"
-                logger.warning(f"[a100_stt_mode] primary model download failed ({self.model_name}), fallback to {fallback_model}: {e}")
-                self.model_name = fallback_model
-                fallback_repo = FASTER_MODELS_DICT[fallback_model]
-                self.local_dir = f'{ROOT_DIR}/models/models--' + fallback_repo.replace('/', '--')
-                tools.check_and_down_hf(self.model_name, fallback_repo, self.local_dir, callback=self._process_callback)
+                raise RuntimeError(
+                    f"[a100_stt_mode] model download failed for {self.model_name}: {e}"
+                ) from e
         # 批量时预先vad切分
         # 否则后断句处理
         if settings.get('whisper_prepare'):

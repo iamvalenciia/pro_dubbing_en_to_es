@@ -158,6 +158,11 @@ def qwen3tts_fun(
     
     CUSTOM_VOICE= {"Vivian", "Serena", "Uncle_fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_anna", "Sohee"}
 
+    # By default, clone jobs are grouped by shared reference audio to maximize GPU batching.
+    # Set PYVIDEOTRANS_QWEN_CLONE_GROUP_BY_REF_TEXT=1 to preserve strict ref_text isolation.
+    clone_group_by_ref_text = str(
+        os.environ.get("PYVIDEOTRANS_QWEN_CLONE_GROUP_BY_REF_TEXT", "0")
+    ).strip().lower() in ("1", "true", "yes", "on")
     
     queue_tts=json.loads(Path(queue_tts_file).read_text(encoding='utf-8'))
     # Clone policy: always clone using whatever reference is available.
@@ -249,8 +254,7 @@ def qwen3tts_fun(
         requested_count = sum(1 for it in queue_tts if it.get('text'))
         generated_count = 0
         missing_ref_count = 0
-        min_success_ratio = float(os.environ.get("PYVIDEOTRANS_QWEN_MIN_SUCCESS_RATIO", "0.51") or "0.51")
-        min_success_ratio = max(0.0, min(1.0, min_success_ratio))
+        min_success_ratio = 1.0
         # Build valid job list first so we can run batched generation safely.
         valid_jobs = []
         for i, it in enumerate(queue_tts):
@@ -271,7 +275,7 @@ def qwen3tts_fun(
                 continue
 
             if not BASE_OBJ:
-                continue
+                raise RuntimeError("Qwen3-TTS clone engine is not initialized.")
             if role == 'clone':
                 wavfile = it.get('ref_wav', '')
                 ref_text = it.get('ref_text', '')
@@ -281,11 +285,9 @@ def qwen3tts_fun(
 
             if not wavfile or not Path(wavfile).is_file():
                 missing_ref_count += 1
-                _write_log(logs_file, json.dumps({
-                    "type": "logs",
-                    "text": f"[qwen3tts] ref_wav missing, skipping line {i+1}: role={role} wav={wavfile}"
-                }))
-                continue
+                raise RuntimeError(
+                    f"[qwen3tts] ref_wav missing for line {i+1}: role={role} wav={wavfile}"
+                )
 
             if role == 'clone':
                 # Cap reference to MAX_REF_MS; use all available audio otherwise.
@@ -337,10 +339,14 @@ def qwen3tts_fun(
             if job["kind"] == "custom":
                 group_key = ("custom", job["role"])
             else:
+                # For clone voice, avoid splitting batches by per-line subtitle ref_text.
+                group_ref_text = (
+                    job.get("ref_text") or ""
+                ) if (clone_group_by_ref_text or job.get("role") != "clone") else ""
                 group_key = (
                     "clone",
                     job["wavfile"],
-                    job.get("ref_text") or "",
+                    group_ref_text,
                     bool(job["with_emotion"]),
                 )
             grouped.setdefault(group_key, []).append(job)
@@ -352,8 +358,68 @@ def qwen3tts_fun(
 
         _write_log(logs_file, json.dumps({
             "type": "logs",
-            "text": f"[qwen3tts] generation_start jobs={total_jobs} groups={len(grouped)} chunks={total_chunks}"
+            "text": (
+                f"[qwen3tts] generation_start jobs={total_jobs} groups={len(grouped)} "
+                f"chunks={total_chunks} clone_group_by_ref_text={clone_group_by_ref_text}"
+            )
         }))
+
+        # ---- GPU PREFETCH: pre-build all clone prompts in parallel threads ----
+        # create_voice_clone_prompt() is CPU-bound (wav feature extraction).
+        # Computing all prompts upfront in a thread pool means the generation loop
+        # never stalls on CPU work at the start of a new group — GPU stays fed.
+        from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+        if BASE_OBJ:
+            def _build_clone_prompt_pre(group_key, jobs):
+                if group_key[0] != "clone":
+                    return None, None
+                j0 = jobs[0]
+                wavfile_pre = j0["wavfile"]
+                ref_text_pre = j0.get("ref_text") if (clone_group_by_ref_text or j0.get("role") != "clone") else ""
+                pk = (wavfile_pre, ref_text_pre or "", bool(j0["with_emotion"]))
+                if pk in clone_prompt_cache:
+                    return pk, None  # already cached
+                try:
+                    vcp = BASE_OBJ.create_voice_clone_prompt(
+                        ref_audio=wavfile_pre,
+                        ref_text=ref_text_pre or None,
+                        x_vector_only_mode=not bool(ref_text_pre)
+                    )
+                    return pk, vcp
+                except Exception as _pre_exc:
+                    _write_log(logs_file, json.dumps({
+                        "type": "logs",
+                        "text": f"[qwen3tts] prefetch_prompt failed (will retry inline): {_pre_exc}"
+                    }))
+                    return None, None
+
+            _clone_groups_pre = [(gk, jlist) for gk, jlist in grouped.items() if gk[0] != "custom"]
+            if _clone_groups_pre:
+                _write_log(logs_file, json.dumps({
+                    "type": "logs",
+                    "text": f"[qwen3tts] prefetch_clone_prompts start groups={len(_clone_groups_pre)}"
+                }))
+                with _TPE(max_workers=min(4, len(_clone_groups_pre)), thread_name_prefix="qwen_prompt_pre") as _pre_exec:
+                    _pre_futures = {
+                        _pre_exec.submit(_build_clone_prompt_pre, gk, jlist): gk
+                        for gk, jlist in _clone_groups_pre
+                    }
+                    for _pfut in _as_completed(_pre_futures):
+                        try:
+                            _pk, _vcp = _pfut.result()
+                            if _pk is not None and _vcp is not None:
+                                clone_prompt_cache[_pk] = _vcp
+                        except Exception:
+                            pass
+                _write_log(logs_file, json.dumps({
+                    "type": "logs",
+                    "text": f"[qwen3tts] prefetch_clone_prompts done cache_size={len(clone_prompt_cache)}"
+                }))
+        # ---- end prefetch ----
+
+        # Background ThreadPoolExecutor for sf.write — disk I/O runs while GPU generates next batch.
+        _sfwrite_exec = _TPE(max_workers=4, thread_name_prefix="sfwrite")
+        _sfwrite_futures = []
 
         chunk_idx = 0
         gen_started_at = time.time()
@@ -387,7 +453,10 @@ def qwen3tts_fun(
                     else:
                         texts = [j["text"] for j in chunk]
                         langs = [language] * len(texts)
-                        ref_text = chunk[0].get("ref_text")
+                        if clone_group_by_ref_text or chunk[0].get("role") != "clone":
+                            ref_text = chunk[0].get("ref_text")
+                        else:
+                            ref_text = ""
                         wavfile = chunk[0]["wavfile"]
                         prompt_key = (wavfile, ref_text or "", bool(chunk[0]["with_emotion"]))
                         voice_clone_prompt = clone_prompt_cache.get(prompt_key)
@@ -408,7 +477,9 @@ def qwen3tts_fun(
                         )
 
                     for j, wav in zip(chunk, wavs):
-                        sf.write(j["filename"], wav, sr)
+                        # Copy array so GPU buffer can be freed before the write completes.
+                        _wav_copy = wav.copy() if hasattr(wav, 'copy') else wav
+                        _sfwrite_futures.append(_sfwrite_exec.submit(sf.write, j["filename"], _wav_copy, sr))
                         generated_count += 1
 
                     elapsed_done = max(time.time() - gen_started_at, 0.001)
@@ -429,42 +500,20 @@ def qwen3tts_fun(
                     }))
 
                 except Exception as batch_exc:
-                    _write_log(logs_file, json.dumps({
-                        "type": "logs",
-                        "text": f"[qwen3tts] batch fallback to single: {batch_exc}"
-                    }))
+                    raise RuntimeError(
+                        f"[qwen3tts] batch generation failed at chunk {chunk_idx}/{total_chunks}: {batch_exc}"
+                    ) from batch_exc
 
-                    # Safety fallback: if a batch fails, process each line independently.
-                    for j in chunk:
-                        try:
-                            if j["kind"] == "custom":
-                                wavs, sr = CUSTOM_OBJ.generate_custom_voice(
-                                    text=j["text"],
-                                    language=language,
-                                    speaker=j["role"],
-                                    instruct=prompt
-                                )
-                            else:
-                                kw = {
-                                    "text": j["text"],
-                                    "language": language,
-                                    "ref_audio": j["wavfile"],
-                                    "temperature": j["temperature"],
-                                    "top_p": j["top_p"],
-                                }
-                                if j.get("ref_text"):
-                                    kw["ref_text"] = j["ref_text"]
-                                else:
-                                    kw["x_vector_only_mode"] = True
-                                wavs, sr = BASE_OBJ.generate_voice_clone(**kw)
-
-                            sf.write(j["filename"], wavs[0], sr)
-                            generated_count += 1
-                        except Exception as single_exc:
-                            _write_log(logs_file, json.dumps({
-                                "type": "logs",
-                                "text": f"[qwen3tts] single line skipped: role={j.get('role')} err={single_exc}"
-                            }))
+        # Drain background write futures; must complete before success-ratio check.
+        for _wfut in _sfwrite_futures:
+            try:
+                _wfut.result()
+            except Exception as _wfut_exc:
+                _write_log(logs_file, json.dumps({
+                    "type": "logs",
+                    "text": f"[qwen3tts] background sf.write error: {_wfut_exc}"
+                }))
+        _sfwrite_exec.shutdown(wait=False)
 
         failed_count = max(0, requested_count - generated_count)
         success_ratio = (generated_count / requested_count) if requested_count > 0 else 0.0
@@ -477,10 +526,10 @@ def qwen3tts_fun(
             )
         }))
 
-        # Root guardrail: do not treat run as success when failed lines are majority.
+        # Strict guardrail: all requested lines must be generated.
         if requested_count > 0 and success_ratio < min_success_ratio:
             return False, (
-                "Qwen3-TTS aborted: success ratio below threshold "
+                "Qwen3-TTS aborted: success ratio below strict threshold "
                 f"(generated={generated_count}, failed={failed_count}, "
                 f"ratio={success_ratio:.3f}, min={min_success_ratio:.3f})."
             )

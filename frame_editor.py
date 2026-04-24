@@ -3,7 +3,6 @@ import subprocess
 from pathlib import Path
 from typing import Tuple
 
-from PIL import Image, ImageEnhance
 
 
 def build_video_filter(brightness: float, contrast: float, saturation: float, sharpness: float) -> str:
@@ -84,16 +83,7 @@ def apply_frame_adjustments(
         output_path,
     ]
 
-    try:
-        subprocess.run(cmd, check=True)
-    except Exception:
-        # Fallback path in case image filtering via ffmpeg is unavailable.
-        with Image.open(frame_path).convert("RGB") as img:
-            img = ImageEnhance.Brightness(img).enhance(float(brightness))
-            img = ImageEnhance.Contrast(img).enhance(float(contrast))
-            img = ImageEnhance.Color(img).enhance(float(color))
-            img = ImageEnhance.Sharpness(img).enhance(float(sharpness))
-            img.save(output_path, format="JPEG", quality=95)
+    subprocess.run(cmd, check=True)
 
     return output_path
 

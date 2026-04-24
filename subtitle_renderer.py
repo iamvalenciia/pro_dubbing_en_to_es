@@ -161,14 +161,13 @@ def add_subtitles_to_video_ffmpeg(
     ]
     
     try:
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10, check=True)
         dims = result.stdout.strip().split(',')
         video_width = int(dims[0])
         video_height = int(dims[1])
         print(f"[Subtitle] Video: {video_width}x{video_height}")
     except Exception as e:
-        print(f"[Subtitle] Warning: Could not determine video dimensions ({e}), using defaults")
-        video_width, video_height = 1920, 1080
+        raise RuntimeError(f"Could not determine video dimensions for subtitle rendering: {e}") from e
     
     # Generate drawtext filter
     print(f"[Subtitle] Generating subtitle filter ({len(segments)} segments)...")
@@ -195,15 +194,8 @@ def add_subtitles_to_video_ffmpeg(
         output_path
     ]
     
-    # Fallback to libx264 if GPU encoding fails
     try:
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=3600)
-        if result.returncode != 0 and 'h264_nvenc' in result.stderr:
-            print(f"[Subtitle] GPU encoding not available, falling back to CPU...")
-            ffmpeg_cmd[9] = 'libx264'
-            ffmpeg_cmd[10] = '-preset'
-            ffmpeg_cmd.insert(11, 'slow')  # Better quality, slower encoding
-            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=3600)
+        subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=3600, check=True)
     except subprocess.TimeoutExpired:
         raise RuntimeError("FFmpeg encoding timed out")
     except Exception as e:

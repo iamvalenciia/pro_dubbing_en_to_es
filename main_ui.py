@@ -14,6 +14,7 @@ from pathlib import Path
 import ffmpeg
 import gradio as gr
 from dotenv import load_dotenv
+from frame_editor import extract_frame, apply_frame_adjustments, build_video_filter
 
 from src.logger import clear_log, get_logger, read_log_tail, setup_pipeline_logger
 from src.paths import (
@@ -46,14 +47,6 @@ except ImportError:
     print("Warning: reel_ui_wrapper not available")
     ui_analyze_reels = None
     ui_render_reel = None
-
-try:
-    from frame_editor import extract_frame, apply_frame_adjustments, build_video_filter
-except ImportError:
-    print("Warning: frame_editor not available")
-    extract_frame = None
-    apply_frame_adjustments = None
-    build_video_filter = None
 
 load_dotenv()  # Carga GEMINI_MODEL, HF_TOKEN, API_GOOGLE_STUDIO desde tu .env local
 
@@ -799,25 +792,12 @@ def _pick_best_output_mp4(vt_output_dir: str, ui_log) -> str:
     ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
     best = ranked[0][2]
     if ranked[0][0] == 0:
-        ui_log.warning("Ningún MP4 de salida tiene pista de audio; se usará el más reciente.")
+        raise RuntimeError("Ningún MP4 de salida tiene pista de audio; se aborta para evitar publicar una salida degradada.")
     return best
 
 
 def _build_video_filter(brightness: float, contrast: float, saturation: float, sharpness: float) -> str:
-    if build_video_filter is not None:
-        return build_video_filter(brightness, contrast, saturation, sharpness)
-
-    # Fallback local implementation if frame_editor is unavailable.
-    eq_brightness = max(-0.35, min(0.35, (float(brightness) - 1.0) * 0.25))
-    eq_contrast = max(0.5, min(2.0, float(contrast)))
-    eq_saturation = max(0.5, min(2.0, float(saturation)))
-    filters = [
-        f"eq=brightness={eq_brightness:.4f}:contrast={eq_contrast:.4f}:saturation={eq_saturation:.4f}"
-    ]
-    sharp_amount = max(0.0, (float(sharpness) - 1.0) * 1.5)
-    if sharp_amount > 0.01:
-        filters.append(f"unsharp=5:5:{sharp_amount:.4f}:5:5:0.0")
-    return ",".join(filters)
+    return build_video_filter(brightness, contrast, saturation, sharpness)
 
 
 def _apply_video_enhancements(
@@ -830,7 +810,7 @@ def _apply_video_enhancements(
 ):
     video_filter = _build_video_filter(brightness, contrast, saturation, sharpness)
 
-    # Try GPU encode first, fallback to CPU to maximize compatibility.
+    # High-quality path only: hardware encode, fail fast on errors.
     gpu_cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", input_video,
@@ -839,19 +819,7 @@ def _apply_video_enhancements(
         "-c:a", "copy",
         output_video,
     ]
-    cpu_cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", input_video,
-        "-vf", video_filter,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-c:a", "copy",
-        output_video,
-    ]
-
-    try:
-        subprocess.run(gpu_cmd, check=True)
-    except Exception:
-        subprocess.run(cpu_cmd, check=True)
+    subprocess.run(gpu_cmd, check=True)
 
 def run_pyvideotrans_pipeline(
     video_file,
@@ -1070,20 +1038,15 @@ def run_pyvideotrans_pipeline(
                     f"brightness={brightness}, contrast={contrast}, color={color}, sharpness={sharpness}"
                 )
                 enhanced_tmp = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed_enhanced_tmp.mp4")
-                try:
-                    _apply_video_enhancements(
-                        input_video=final_mp4,
-                        output_video=enhanced_tmp,
-                        brightness=brightness,
-                        contrast=contrast,
-                        saturation=color,
-                        sharpness=sharpness,
-                    )
-                    os.replace(enhanced_tmp, final_mp4)
-                except Exception as e:
-                    ui_log.warning(f"No se pudieron aplicar ajustes visuales al video final: {e}")
-                    if os.path.exists(enhanced_tmp):
-                        os.remove(enhanced_tmp)
+                _apply_video_enhancements(
+                    input_video=final_mp4,
+                    output_video=enhanced_tmp,
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=color,
+                    sharpness=sharpness,
+                )
+                os.replace(enhanced_tmp, final_mp4)
 
             result["video"] = final_mp4
             
@@ -1656,16 +1619,6 @@ with gr.Blocks(
         for c in candidates:
             if os.path.exists(c):
                 return c
-
-        # Fallback: most recent SRT in output folder.
-        srt_files = [
-            os.path.join(NETWORK_OUTPUT, f)
-            for f in os.listdir(NETWORK_OUTPUT)
-            if f.lower().endswith('.srt')
-        ]
-        if srt_files:
-            srt_files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return srt_files[0]
         return None
 
     def _build_reel_labels(reels):
