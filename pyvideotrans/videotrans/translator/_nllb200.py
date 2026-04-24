@@ -219,12 +219,12 @@ class NLLB200Trans(BaseTrans):
                 dev = torch.cuda.current_device()
                 allocated = torch.cuda.memory_allocated(dev) / (1024 ** 3)
                 reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
-                logger.debug(
+                logger.info(
                     f"[nllb200] device=cuda:{dev} batch_lines={batch_lines} seq_len={seq_len} "
                     f"trans_thread={self.trans_thread} alloc_gb={allocated:.2f} reserved_gb={reserved:.2f}"
                 )
             else:
-                logger.debug(
+                logger.info(
                     f"[nllb200] device={self.device} batch_lines={batch_lines} seq_len={seq_len} "
                     f"trans_thread={self.trans_thread}"
                 )
