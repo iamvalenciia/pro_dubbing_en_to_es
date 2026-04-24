@@ -1060,6 +1060,38 @@ class TransCreate(BaseTask):
         # 如果存在有 ref_wav 即需要clone，存在参考音频的
         if len([it.get("ref_wav") for it in self.queue_tts if it.get("ref_wav")]) > 0:
             self._create_ref_from_vocal()
+
+            # If some clone references are missing, fallback gracefully:
+            # 1) reuse any existing speaker reference when available;
+            # 2) if none exists, switch those lines to a built-in custom voice.
+            existing_ref_wavs = [
+                it.get('ref_wav') for it in self.queue_tts
+                if it.get('ref_wav') and Path(it.get('ref_wav')).is_file()
+            ]
+            fallback_ref_wav = existing_ref_wavs[0] if existing_ref_wavs else None
+            fallback_role = str(settings.get('qwenttslocal_fallback_role', 'Serena')).strip() or 'Serena'
+            missing_ref_count = 0
+            for it in self.queue_tts:
+                if str(it.get('role', '')).strip().lower() != 'clone' or not it.get('ref_wav'):
+                    continue
+                if Path(it.get('ref_wav')).is_file():
+                    continue
+                missing_ref_count += 1
+                if fallback_ref_wav:
+                    it['ref_wav'] = fallback_ref_wav
+                    it['ref_text'] = ''
+                else:
+                    # No clone references could be built at all; degrade to built-in voice.
+                    it['role'] = fallback_role
+                    it['ref_wav'] = ''
+                    it['ref_text'] = ''
+
+            if missing_ref_count > 0:
+                logger.warning(
+                    f"Clone reference fallback applied for {missing_ref_count} line(s). "
+                    f"fallback_ref={'yes' if fallback_ref_wav else 'no'}, fallback_role={fallback_role}"
+                )
+
             # Add emotion flag to each item based on total speaker duration.
             # If speaker duration >= 60s, use with_emotion=True (higher temperature)
             # If speaker duration < 60s, use with_emotion=False (lower temperature, clearer voice)
@@ -1114,6 +1146,30 @@ class TransCreate(BaseTask):
         self.ref_wav_durations = {}  # ref_wav -> total_duration_ms
 
         # 裁切对应片段为参考音频，多段则拼接
+        def _srt_time_to_seconds(val) -> float:
+            """Convert SRT timestamp string or numeric ms/seconds to float seconds."""
+            if val is None:
+                return 0.0
+            if isinstance(val, (int, float)):
+                # Internal subtitles keep millisecond integers; normalize to seconds.
+                num = float(val)
+                return num / 1000.0 if num > 1000 else max(0.0, num)
+            s = str(val).strip()
+            # SRT format: HH:MM:SS,mmm or HH:MM:SS.mmm
+            if ':' in s:
+                s = s.replace(',', '.')
+                parts = s.split(':')
+                try:
+                    h, m, sec = int(parts[0]), int(parts[1]), float(parts[2])
+                    return float(h * 3600 + m * 60 + sec)
+                except Exception:
+                    return 0.0
+            try:
+                num = float(s)
+                return num / 1000.0 if num > 1000 else max(0.0, num)
+            except Exception:
+                return 0.0
+
         def _build_ref_for_speaker(ref_wav, seg_list):
             try:
                 tmp_clips = []
@@ -1122,8 +1178,8 @@ class TransCreate(BaseTask):
                     if total_ms >= MAX_REF_MS:
                         break
 
-                    start_raw = int(it.get('startraw', it.get('start_time', 0)) or 0)
-                    end_raw = int(it.get('endraw', it.get('end_time', 0)) or 0)
+                    start_raw = _srt_time_to_seconds(it.get('startraw', it.get('start_time', 0)) or 0)
+                    end_raw = _srt_time_to_seconds(it.get('endraw', it.get('end_time', 0)) or 0)
                     if end_raw <= start_raw:
                         logger.debug(
                             f"Skip invalid ref segment for {ref_wav}: start={start_raw}, end={end_raw}"
@@ -1138,7 +1194,7 @@ class TransCreate(BaseTask):
                         out_file=clip_path
                     )
                     tmp_clips.append(clip_path)
-                    total_ms += max(0, end_raw - start_raw)
+                    total_ms += int(max(0.0, end_raw - start_raw) * 1000)
 
                 if not tmp_clips:
                     return

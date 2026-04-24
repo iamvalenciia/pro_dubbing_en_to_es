@@ -2,11 +2,12 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Union
+from packaging.version import Version
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from videotrans.configure.config import ROOT_DIR
+from videotrans.configure.config import ROOT_DIR, logger
 from videotrans.translator._base import BaseTrans
 
 
@@ -62,6 +63,45 @@ class NLLB200Trans(BaseTrans):
             self.from_lang = _LANGUAGE_CODE_MAP.get(src_code[:2], "eng_Latn")
 
         self.to_lang = _LANGUAGE_CODE_MAP.get(tgt_code[:2], "spa_Latn")
+        self.trans_thread = self._resolve_trans_thread()
+
+    def _resolve_trans_thread(self) -> int:
+        # Allow explicit override from env to simplify production tuning.
+        forced = os.environ.get("PYVIDEOTRANS_NLLB_BATCH_LINES", "").strip()
+        if forced:
+            try:
+                return max(1, min(int(forced), 512))
+            except Exception:
+                pass
+
+        try:
+            current = max(int(getattr(self, "trans_thread", 10)), 1)
+        except Exception:
+            current = 10
+
+        if not torch.cuda.is_available():
+            return current
+
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024 ** 3)
+        except Exception:
+            return max(current, 32)
+
+        if free_gb >= 70:
+            target = 256
+        elif free_gb >= 40:
+            target = 160
+        elif free_gb >= 24:
+            target = 96
+        elif free_gb >= 16:
+            target = 64
+        elif free_gb >= 10:
+            target = 48
+        else:
+            target = 32
+
+        return max(current, target)
 
     def _download(self):
         model_cache_dir = self._resolve_cache_dir()
@@ -73,13 +113,70 @@ class NLLB200Trans(BaseTrans):
             cache_dir=model_cache_dir,
             src_lang=self.from_lang,
         )
-        dtype = torch.float16 if self.device == "cuda" else torch.float32
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(
-            self.model_name,
-            cache_dir=model_cache_dir,
-            torch_dtype=dtype,
-        )
+        target_dtype = torch.float16 if self.device == "cuda" else torch.float32
+
+        # Transformers en versiones recientes exige torch>=2.6 cuando internamente usa torch.load.
+        # Forzamos safetensors para evitar la ruta vulnerable y mantener compatibilidad.
+        if Version(torch.__version__.split("+")[0]) < Version("2.6.0"):
+            raise RuntimeError(
+                f"Torch {torch.__version__} es incompatible para cargar NLLB-200 de forma segura. "
+                "Actualiza a torch>=2.6 o reconstruye la imagen con las versiones recomendadas."
+            )
+
+        def _has_meta_params(model) -> bool:
+            try:
+                return any(getattr(p, "is_meta", False) for p in model.parameters())
+            except Exception:
+                return False
+
+        def _load_model(*, use_safetensors: bool, low_cpu_mem_usage: bool):
+            model_kwargs = {
+                "cache_dir": model_cache_dir,
+                "use_safetensors": use_safetensors,
+                "low_cpu_mem_usage": low_cpu_mem_usage,
+            }
+
+            return AutoModelForSeq2SeqLM.from_pretrained(
+                self.model_name,
+                **model_kwargs,
+            )
+
+        # Estrategia robusta: probar rutas de carga sin forzar dtype durante from_pretrained.
+        # Forzar dtype durante load puede activar rutas internas con tensores meta.
+        last_err = None
+        load_attempts = [
+            # Prioridad: safetensors (ruta segura y recomendada)
+            (True, False),
+            (True, True),
+            # Fallback de formato de checkpoint, solo permitido con torch>=2.6 (guard arriba)
+            (False, False),
+            (False, True),
+        ]
+        self.model = None
+        for use_safetensors, low_cpu_mem_usage in load_attempts:
+            try:
+                model = _load_model(use_safetensors=use_safetensors, low_cpu_mem_usage=low_cpu_mem_usage)
+                if _has_meta_params(model):
+                    raise RuntimeError(
+                        f"NLLB loaded with meta tensors (use_safetensors={use_safetensors}, "
+                        f"low_cpu_mem_usage={low_cpu_mem_usage})"
+                    )
+                self.model = model
+                break
+            except Exception as e:
+                last_err = e
+                try:
+                    del model
+                except Exception:
+                    pass
+
+        if self.model is None:
+            raise RuntimeError(f"NLLB model load failed after all strategies: {last_err}")
+
+        # Mover al dispositivo final y ajustar precision despues de que el modelo existe en memoria real.
         self.model.to(self.device)
+        if self.device == "cuda":
+            self.model.to(dtype=target_dtype)
         self.model.eval()
         return True
 
@@ -115,6 +212,24 @@ class NLLB200Trans(BaseTrans):
             truncation=True,
             max_length=512,
         )
+        try:
+            seq_len = int(inputs["input_ids"].shape[-1])
+            batch_lines = len(queries)
+            if self.device == "cuda" and torch.cuda.is_available():
+                dev = torch.cuda.current_device()
+                allocated = torch.cuda.memory_allocated(dev) / (1024 ** 3)
+                reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
+                logger.debug(
+                    f"[nllb200] device=cuda:{dev} batch_lines={batch_lines} seq_len={seq_len} "
+                    f"trans_thread={self.trans_thread} alloc_gb={allocated:.2f} reserved_gb={reserved:.2f}"
+                )
+            else:
+                logger.debug(
+                    f"[nllb200] device={self.device} batch_lines={batch_lines} seq_len={seq_len} "
+                    f"trans_thread={self.trans_thread}"
+                )
+        except Exception:
+            pass
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         generated = self.model.generate(

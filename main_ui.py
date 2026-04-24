@@ -1,4 +1,5 @@
 import json
+import importlib
 import os
 import re
 import shutil
@@ -29,6 +30,9 @@ PYVIDEOTRANS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "py
 PYVIDEOTRANS_CLI = os.path.join(PYVIDEOTRANS_ROOT, "cli.py")
 PYVIDEOTRANS_PYTHON = os.environ.get("PYVIDEOTRANS_PYTHON", sys.executable)
 
+if PYVIDEOTRANS_ROOT not in sys.path:
+    sys.path.insert(0, PYVIDEOTRANS_ROOT)
+
 try:
     from subtitle_ui_wrapper import ui_generate_subtitles, ui_render_subtitles
 except ImportError:
@@ -44,11 +48,12 @@ except ImportError:
     ui_render_reel = None
 
 try:
-    from frame_editor import extract_frame, apply_frame_adjustments
+    from frame_editor import extract_frame, apply_frame_adjustments, build_video_filter
 except ImportError:
     print("Warning: frame_editor not available")
     extract_frame = None
     apply_frame_adjustments = None
+    build_video_filter = None
 
 load_dotenv()  # Carga GEMINI_MODEL, HF_TOKEN, API_GOOGLE_STUDIO desde tu .env local
 
@@ -545,7 +550,15 @@ def _warmup_nllb200():
 
     try:
         ui_log.info("Iniciando warm-up de NLLB-200(Local)...")
-        from pyvideotrans.videotrans.translator._nllb200 import NLLB200Trans
+        NLLB200Trans = None
+        for mod_name in ("videotrans.translator._nllb200", "pyvideotrans.videotrans.translator._nllb200"):
+            try:
+                NLLB200Trans = importlib.import_module(mod_name).NLLB200Trans
+                break
+            except Exception:
+                continue
+        if NLLB200Trans is None:
+            raise RuntimeError("No se pudo importar NLLB200Trans desde videotrans")
 
         warmup = NLLB200Trans(
             translate_type=2,
@@ -683,6 +696,8 @@ ASR_TYPE_MAP = {
 }
 
 TRANSLATE_TYPE_MAP = {
+    "nllb_local": 2,
+    "m2m100_local": 2,
     "google": 0,
     "chatgpt": 3,
     "deepseek": 4,
@@ -740,20 +755,68 @@ def _find_pyvideotrans_output_dir(candidate_names: list[str], min_mtime: float |
     return folders[0]
 
 
-def _build_video_filter(brightness: float, contrast: float, saturation: float, sharpness: float) -> str:
-    # eq brightness in ffmpeg is usually in range [-1, 1].
-    eq_brightness = max(-1.0, min(1.0, (float(brightness) - 1.0) * 0.35))
-    eq_contrast = max(0.1, min(3.0, float(contrast)))
-    eq_saturation = max(0.0, min(3.0, float(saturation)))
+def _probe_media(path: str) -> dict | None:
+    try:
+        return ffmpeg.probe(path)
+    except Exception:
+        return None
 
+
+def _media_duration_seconds(path: str) -> float:
+    info = _probe_media(path)
+    if not info:
+        return 0.0
+    try:
+        return float((info.get("format") or {}).get("duration") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _mp4_has_audio_stream(path: str) -> bool:
+    info = _probe_media(path)
+    if not info:
+        return False
+    streams = info.get("streams") or []
+    return any((s.get("codec_type") or "").lower() == "audio" for s in streams)
+
+
+def _pick_best_output_mp4(vt_output_dir: str, ui_log) -> str:
+    mp4_files = [f for f in os.listdir(vt_output_dir) if f.lower().endswith('.mp4')]
+    if not mp4_files:
+        raise RuntimeError("PyVideoTrans no generó el video final.")
+
+    ranked = []
+    for name in mp4_files:
+        abs_path = os.path.join(vt_output_dir, name)
+        try:
+            mtime = os.path.getmtime(abs_path)
+        except OSError:
+            mtime = 0.0
+        has_audio = _mp4_has_audio_stream(abs_path)
+        ranked.append((1 if has_audio else 0, mtime, abs_path))
+
+    # Prefer files that actually contain an audio stream, then newest mtime.
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    best = ranked[0][2]
+    if ranked[0][0] == 0:
+        ui_log.warning("Ningún MP4 de salida tiene pista de audio; se usará el más reciente.")
+    return best
+
+
+def _build_video_filter(brightness: float, contrast: float, saturation: float, sharpness: float) -> str:
+    if build_video_filter is not None:
+        return build_video_filter(brightness, contrast, saturation, sharpness)
+
+    # Fallback local implementation if frame_editor is unavailable.
+    eq_brightness = max(-0.35, min(0.35, (float(brightness) - 1.0) * 0.25))
+    eq_contrast = max(0.5, min(2.0, float(contrast)))
+    eq_saturation = max(0.5, min(2.0, float(saturation)))
     filters = [
         f"eq=brightness={eq_brightness:.4f}:contrast={eq_contrast:.4f}:saturation={eq_saturation:.4f}"
     ]
-
     sharp_amount = max(0.0, (float(sharpness) - 1.0) * 1.5)
     if sharp_amount > 0.01:
         filters.append(f"unsharp=5:5:{sharp_amount:.4f}:5:5:0.0")
-
     return ",".join(filters)
 
 
@@ -815,7 +878,7 @@ def run_pyvideotrans_pipeline(
     # Defaults fijos para simplificar UX (sin 4 selectores técnicos en UI).
     asr_model = "faster"
     target_lang = "es"
-    llm_model = "google"
+    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
     tts_model = "edge"
 
     effective_tts_model = tts_model
@@ -880,6 +943,7 @@ def run_pyvideotrans_pipeline(
                 "--recogn_type", str(asr_type),
                 "--translate_type", str(translate_type),
                 "--tts_type", str(tts_type),
+                "--cuda",
                 "--subtitle_type", "0",  # Sin subs quemados (como requiere el SPEC)
                 "--video_autorate"       # Delega la isocronía a pyvideotrans
             ]
@@ -887,7 +951,6 @@ def run_pyvideotrans_pipeline(
             if speaker_clone_mode and effective_tts_model == "qwen_local_clone":
                 # Flujo speaker-aware: diarizar -> detectar speakers -> clone por speaker.
                 cmd.extend([
-                    "--cuda",
                     "--voice_role", "clone",
                     "--enable_diariz",
                     "--nums_diariz", "0",
@@ -897,7 +960,7 @@ def run_pyvideotrans_pipeline(
                 cmd.extend(["--voice_role", voice_role])
             elif effective_tts_model == "qwen_local_clone":
                 # Sin diarización explícita, Qwen local puede clonar por línea.
-                cmd.extend(["--cuda", "--voice_role", "clone"])
+                cmd.extend(["--voice_role", "clone"])
             
             result["phase"] = "Fase Activa: Procesando pipeline pesado de pyvideotrans..."
             ui_log.info(f"Ejecutando subproceso: {' '.join(cmd)}")
@@ -934,15 +997,48 @@ def run_pyvideotrans_pipeline(
                 cwd=PYVIDEOTRANS_ROOT,
                 env=child_env,
             )
+            vt_recent_lines = []
             
             for line in iter(process.stdout.readline, ''):
                 if line:
-                    ui_log.info(f"[VT-CORE] {line.strip()}")
+                    line_clean = line.strip()
+                    ui_log.info(f"[VT-CORE] {line_clean}")
+                    vt_recent_lines.append(line_clean)
+                    if len(vt_recent_lines) > 120:
+                        vt_recent_lines.pop(0)
                     
             process.wait()
             
             if process.returncode != 0:
+                hint = None
+                joined = "\n".join(vt_recent_lines)
+                if "Kernel size can't be greater than actual input size" in joined:
+                    hint = (
+                        "Qwen clone failed: reference audio is too short for voice prompt encoding. "
+                        "Use longer clone refs (>=1.2s), or disable speaker clone for this run."
+                    )
+                elif "Torch 2.5.1+cu121 es incompatible" in joined:
+                    hint = "NLLB warm-up failed due Torch version mismatch (requires torch>=2.6)."
+
+                if hint:
+                    raise RuntimeError(
+                        f"PyVideoTrans falló con código de salida {process.returncode}. {hint}"
+                    )
                 raise RuntimeError(f"PyVideoTrans falló con código de salida {process.returncode}")
+
+            joined = "\n".join(vt_recent_lines)
+            # If TTS generated mostly failed lines, stop here to avoid publishing a mostly silent "success" video.
+            m = re.search(r"Success:\s*(\d+)\s*,\s*Failed:\s*(\d+)", joined)
+            if m:
+                ok_n = int(m.group(1))
+                fail_n = int(m.group(2))
+                if fail_n > 0 and ok_n <= fail_n:
+                    raise RuntimeError(
+                        "TTS generó demasiados fallos "
+                        f"(Success={ok_n}, Failed={fail_n}). "
+                        "No se publica video para evitar salida sin audio útil. "
+                        "Prueba con referencia de voz más limpia/larga o reduce diarización."
+                    )
             
             # === RECOLECTAR Y ADAPTAR OUTPUTS ===
             result["phase"] = "Adaptando datos e incrustando en el ecosistema QDP..."
@@ -963,14 +1059,7 @@ def run_pyvideotrans_pipeline(
             safe_name = original_safe
             
             # 1. Encontrar y mover Video Doblado Final
-            mp4_files = [f for f in os.listdir(vt_output_dir) if f.lower().endswith('.mp4')]
-            if not mp4_files:
-                raise RuntimeError("PyVideoTrans no generó el video final.")
-            mp4_files.sort(
-                key=lambda f: os.path.getmtime(os.path.join(vt_output_dir, f)),
-                reverse=True,
-            )
-            vt_mp4 = os.path.join(vt_output_dir, mp4_files[0])
+            vt_mp4 = _pick_best_output_mp4(vt_output_dir, ui_log)
             final_mp4 = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed.mp4")
             shutil.copy2(vt_mp4, final_mp4)
 
@@ -1006,6 +1095,17 @@ def run_pyvideotrans_pipeline(
                 .overwrite_output()
                 .run(quiet=True)
             )
+
+            # Guardrail: reject outputs where dubbed audio is unrealistically short.
+            video_sec = _media_duration_seconds(final_mp4)
+            audio_sec = _media_duration_seconds(final_wav)
+            min_ratio = float(os.environ.get("QDP_MIN_DUB_AUDIO_RATIO", "0.20") or "0.20")
+            if video_sec > 0 and audio_sec > 0 and (audio_sec / video_sec) < min_ratio:
+                raise RuntimeError(
+                    "El audio doblado quedó demasiado corto para el video "
+                    f"(audio={audio_sec:.2f}s, video={video_sec:.2f}s, ratio={audio_sec/video_sec:.2f} < {min_ratio:.2f}). "
+                    "Esto suele indicar fallos masivos en TTS/diarización o referencias inválidas."
+                )
             result["audio"] = final_wav
             result["download_audio"] = final_wav  # Para descarga
             

@@ -346,7 +346,8 @@ class AppSettings:
             "countdown_sec": 30,
             "backaudio_volume": 0.8,
             "loop_backaudio": 1,
-            "cuda_com_type": "default",
+            "cuda_com_type": "float16",
+            "stt_batch_size": 0,
             "initial_prompt_zh-cn": "",  # 注意：在对象中会映射为 _zh_cn
             "initial_prompt_zh-tw": "",
             "initial_prompt_en": "",
@@ -400,8 +401,8 @@ class AppSettings:
             "gemini_recogn_chunk": 50,
             "zh_hant_s": True,
             "process_max": 1,
-            "process_max_gpu": 1,
-            "multi_gpus": False,
+            "process_max_gpu": 0,
+            "multi_gpus": True,
             "azure_lines": 1,
             "chattts_voice": ChatTTS_VOICE,
             "proxy": ""

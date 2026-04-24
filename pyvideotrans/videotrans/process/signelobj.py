@@ -45,10 +45,21 @@ class GlobalProcessManager:
     @classmethod
     def get_gpu_process_nums(cls):
         cpu_count=int(os.cpu_count())
+        auto_gpu_pool = str(os.environ.get('PYVIDEOTRANS_AUTO_PROCESS_MAX_GPU', '1')).lower() in ('1', 'true', 'yes', 'on')
         try:
             process_max_gpu=int(float(settings.get('process_max_gpu',0)))
         except:
             process_max_gpu=0
+        if auto_gpu_pool and process_max_gpu <= 0:
+            try:
+                from videotrans.util.gpus import getset_gpu
+                getset_gpu()
+            except Exception:
+                pass
+            gpu_nums = max(int(getattr(app_cfg, 'NVIDIA_GPU_NUMS', 0)), 0)
+            if gpu_nums < 1:
+                return 1
+            return int(min(gpu_nums, 8, cpu_count))
         # 手动设置了gpu进程数量，则优先级最高,例如虽然只有一卡，但显存特别大，可手动设置多个gpu进程
         if process_max_gpu>0:
             return int(min(process_max_gpu,8,cpu_count))

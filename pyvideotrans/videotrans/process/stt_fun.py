@@ -8,6 +8,52 @@ from videotrans.util import gpus
 from videotrans.configure.config import logger, ROOT_DIR, defaulelang
 
 
+def _resolve_stt_batch_size(*, batch_size=0, is_cuda=False, device_index=0):
+    import os
+    env_val = os.environ.get("PYVIDEOTRANS_STT_BATCH_SIZE")
+    if env_val:
+        try:
+            env_n = int(env_val)
+            if env_n > 0:
+                return max(1, min(env_n, 128))
+        except Exception:
+            pass
+
+    try:
+        requested = int(batch_size)
+    except Exception:
+        requested = 0
+
+    if requested > 0:
+        return max(1, min(requested, 64))
+
+    if not is_cuda:
+        return 4
+
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return 4
+        free_bytes, _ = torch.cuda.mem_get_info(device_index)
+        free_gb = free_bytes / (1024 ** 3)
+    except Exception:
+        return 8
+
+    if free_gb >= 70:
+        return 48
+    if free_gb >= 40:
+        return 32
+    if free_gb >= 24:
+        return 24
+    if free_gb >= 16:
+        return 16
+    if free_gb >= 10:
+        return 12
+    if free_gb >= 6:
+        return 8
+    return 2
+
+
 def openai_whisper(
         *,
         prompt=None,
@@ -317,7 +363,8 @@ def faster_whisper(
         repetition_penalty=1.0,
         compression_ratio_threshold=2.2,
         device_index=0,  # gpu索引
-        max_speech_ms=6000
+        max_speech_ms=6000,
+        batch_size=0
 ):
     import re, os, traceback, json, time
     import shutil
@@ -343,8 +390,31 @@ def faster_whisper(
         # 50x系列显卡会报错，回退使用 float16
         if compute_type in ['auto','default']:
             logger.debug(f'[faster_whisper][{is_cuda=}]原始auto|default默认精度:{compute_type}')
-            compute_type= 'int8_float16' if is_cuda else 'int8'
+            compute_type= 'float16' if is_cuda else 'int8'
         logger.debug(f'[faster_whisper][{is_cuda=}]实际使用计算精度:{compute_type}')
+        resolved_batch_size = _resolve_stt_batch_size(batch_size=batch_size, is_cuda=is_cuda, device_index=device_index)
+        logger.debug(f'[faster_whisper][{is_cuda=}]批量大小:{resolved_batch_size}')
+        if is_cuda and torch.cuda.is_available():
+            try:
+                alloc_gb = torch.cuda.memory_allocated(device_index) / float(1024 ** 3)
+                reserved_gb = torch.cuda.memory_reserved(device_index) / float(1024 ** 3)
+            except Exception:
+                alloc_gb = reserved_gb = 0.0
+            _write_log(
+                logs_file,
+                json.dumps({
+                    "type": "logs",
+                    "text": f"[faster_whisper] device=cuda:{device_index} compute_type={compute_type} batch_size={resolved_batch_size} alloc_gb={alloc_gb:.2f} reserved_gb={reserved_gb:.2f}"
+                })
+            )
+        else:
+            _write_log(
+                logs_file,
+                json.dumps({
+                    "type": "logs",
+                    "text": f"[faster_whisper] device=cpu compute_type={compute_type} batch_size={resolved_batch_size}"
+                })
+            )
         try:
             # 1. 加载基础模型
             _write_log(logs_file, json.dumps({"type": "logs", "text": 'loading model'}))
@@ -397,6 +467,27 @@ def faster_whisper(
         else:
             temperature = float(temperature)
 
+        warmup_enabled = str(os.environ.get("PYVIDEOTRANS_STT_WARMUP", "1")).lower() in ("1", "true", "yes", "on")
+        if warmup_enabled and is_cuda:
+            try:
+                _write_log(logs_file, json.dumps({"type": "logs", "text": "[faster_whisper] cuda warmup..."}))
+                _warmup_segments, _warmup_info = model.transcribe(
+                    audio_file,
+                    beam_size=1,
+                    best_of=1,
+                    vad_filter=False,
+                    clip_timestamps=[0, 1.5],
+                    word_timestamps=False,
+                    without_timestamps=True,
+                    language=detect_language.split('-')[0] if detect_language and detect_language != 'auto' else None,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                )
+                for _ in _warmup_segments:
+                    break
+            except Exception as warmup_exc:
+                _write_log(logs_file, json.dumps({"type": "logs", "text": f"[faster_whisper] warmup skipped: {warmup_exc}"}))
+
         if speech_timestamps:
             _write_log(logs_file, json.dumps({"type": "logs", "text": 'Transcribe batch...'}))
             # 4. 执行批量推理
@@ -411,7 +502,7 @@ def faster_whisper(
             ]
             segments, info = batched_model.transcribe(
                 audio_file,
-                batch_size=4,  #
+                batch_size=resolved_batch_size,
                 beam_size=beam_size,
                 best_of=best_of,
                 no_speech_threshold=no_speech_threshold,
@@ -452,8 +543,10 @@ def faster_whisper(
                 _write_log(logs_file, json.dumps({"type": "subtitle", "text": f'[{i}] {text}\n'}))
         else:
             _write_log(logs_file, json.dumps({"type": "logs", "text": 'Transcribe word_timestamps'}))
-            segments, info = model.transcribe(
+            batched_model = BatchedInferencePipeline(model=model)
+            segments, info = batched_model.transcribe(
                 audio_file,
+                batch_size=resolved_batch_size,
                 beam_size=beam_size,
                 best_of=best_of,
                 condition_on_previous_text=condition_on_previous_text,
@@ -506,7 +599,8 @@ def pipe_asr(
         audio_file=None,
         local_dir=None,
         jianfan=False,
-        device_index=0  # gpu索引
+        device_index=0,  # gpu索引
+        batch_size=0
 ):
     import re, os, traceback, json, time
     import shutil
@@ -537,10 +631,12 @@ def pipe_asr(
 
         raws = cut_audio_list
 
+        resolved_batch_size = _resolve_stt_batch_size(batch_size=batch_size, is_cuda=is_cuda, device_index=device_index)
+
         p = pipeline(
             task="automatic-speech-recognition",
             model=local_dir,
-            batch_size=4,
+            batch_size=resolved_batch_size,
             device=device_arg,
             dtype=torch.float16 if is_cuda else torch.float32,
         )

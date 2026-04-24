@@ -25,12 +25,29 @@ class QwenttsLocal(BaseTTS):
 
     
     def _download(self):
+        def _model_ready(local_dir: str) -> bool:
+            p = Path(local_dir)
+            if not p.exists():
+                return False
+            has_cfg = (p / "config.json").exists() and (p / "tokenizer.json").exists()
+            has_weights = any(p.glob("*.safetensors")) or (p / "model.bin").exists() or (p / "pytorch_model.bin").exists()
+            return has_cfg and has_weights
+
+        base_dir = f'{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{self.model_name}-Base'
+        custom_dir = f'{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{self.model_name}-CustomVoice'
+
+        self._signal(text=f"[qwen3tts-patch] download_check model={self.model_name}")
+
+        if _model_ready(base_dir) and _model_ready(custom_dir):
+            self._signal(text="[qwen3tts-patch] cache_hit Base+CustomVoice, skip download")
+            return
+
         if defaulelang == 'zh':
-            tools.check_and_down_ms(f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-Base',callback=self._process_callback,local_dir=f'{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{self.model_name}-Base')
-            tools.check_and_down_ms(f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',callback=self._process_callback,local_dir=f'{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{self.model_name}-CustomVoice')
+            tools.check_and_down_ms(f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-Base',callback=self._process_callback,local_dir=base_dir)
+            tools.check_and_down_ms(f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',callback=self._process_callback,local_dir=custom_dir)
         else:
-            tools.check_and_down_hf(model_id=f'Qwen3-TTS-12Hz-{self.model_name}-Base',repo_id=f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-Base',local_dir=f'{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{self.model_name}-Base',callback=self._process_callback)
-            tools.check_and_down_hf(model_id=f'Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',repo_id=f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',local_dir=f'{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',callback=self._process_callback)
+            tools.check_and_down_hf(model_id=f'Qwen3-TTS-12Hz-{self.model_name}-Base',repo_id=f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-Base',local_dir=base_dir,callback=self._process_callback)
+            tools.check_and_down_hf(model_id=f'Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',repo_id=f'Qwen/Qwen3-TTS-12Hz-{self.model_name}-CustomVoice',local_dir=custom_dir,callback=self._process_callback)
 
 
     def _exec(self):

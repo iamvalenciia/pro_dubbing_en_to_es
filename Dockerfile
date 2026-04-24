@@ -1,8 +1,8 @@
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
-ENV TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0a"
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0a;10.0;12.0"
 
 # RunPod path defaults: network volume (persistent) + local NVMe (fast 50GB).
 ENV QDP_NETWORK_DIR=/runpod-volume
@@ -29,8 +29,9 @@ RUN pip install --no-cache-dir --upgrade pip wheel setuptools packaging
 
 COPY requirements.txt /app/requirements.txt
 
-# Pin torch stack to CUDA 12.4 for RTX/A100 compatibility.
-RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+# Pin torch stack to >=2.6 to satisfy transformers safe-loading requirement.
+# Use CUDA 12.8 wheels to support Blackwell GPUs (sm_120).
+RUN pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 
 # Core runtime deps.
 RUN pip install --no-cache-dir -r /app/requirements.txt
@@ -44,16 +45,26 @@ RUN pip install --no-cache-dir transformers==4.57.6 accelerate==1.12.0 einops so
   && pip install --no-cache-dir --no-deps qwen-tts==0.1.1
 
 # Optional speedups (do not fail image build if unavailable).
-ARG INSTALL_XFORMERS=1
+ARG INSTALL_XFORMERS=0
 ARG INSTALL_FLASH_ATTN=0
 RUN if [ "$INSTALL_XFORMERS" = "1" ]; then \
-      pip install --no-cache-dir xformers==0.0.28.post3 || echo "WARN: xformers install skipped"; \
+      pip install --no-cache-dir --no-deps xformers==0.0.28.post3 || echo "WARN: xformers install skipped"; \
     fi
 RUN if [ "$INSTALL_FLASH_ATTN" = "1" ]; then \
       pip install --no-cache-dir flash-attn==2.7.0.post2 --no-build-isolation || echo "WARN: flash-attn install skipped"; \
     else \
       echo "INFO: flash-attn disabled at build time"; \
     fi
+
+# Hard-fail image build if torch gets downgraded by transitive deps.
+RUN python - <<'PY'
+import torch
+from packaging.version import Version
+v = torch.__version__.split('+')[0]
+print(f"Torch resolved in image: {torch.__version__}")
+if Version(v) < Version("2.6.0"):
+    raise SystemExit(f"ERROR: torch>=2.6.0 required, got {torch.__version__}")
+PY
 
 COPY . /app
 

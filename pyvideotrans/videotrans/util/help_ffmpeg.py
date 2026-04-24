@@ -414,7 +414,8 @@ def _get_ms_from_media(file):
         # mkv 等其他格式可能无法从流中读取 duration
         pass
     if ms==0:
-        ms=int(float(runffprobe(['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',file])))
+        # NOTE: multiply by 1000 to stay in milliseconds, same as the stream paths above.
+        ms=int(float(runffprobe(['-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',file]))*1000)
     return ms
 
 

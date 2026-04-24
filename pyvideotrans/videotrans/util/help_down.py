@@ -82,7 +82,6 @@ def check_and_down_hf(model_id, repo_id, local_dir, callback=None) -> bool:
             huggingface_hub.snapshot_download(
                 repo_id=repo_id,
                 local_dir=local_dir,
-                local_dir_use_symlinks=False,
                 endpoint=endpoint,
                 etag_timeout=5,
                 tqdm_class=MyTqdmClass,
@@ -96,25 +95,33 @@ def check_and_down_hf(model_id, repo_id, local_dir, callback=None) -> bool:
         msg = f'下载模型失败，你可以打开以下网址，将所有文件下载到\n {local_dir} 文件夹内\n' if defaulelang == 'zh' else f'The model download failed. You can try opening the following URL and downloading all files to the {local_dir} folder.'
         raise RuntimeError(f'{msg}\n[https://huggingface.co/{repo_id}/tree/main]\n{e}')
     else:
-        junk_paths = [
-            ".cache",
-            "blobs",
-            "refs",
-            "snapshots",
-            ".no_exist"
-        ]
+        # Keep HF metadata by default so next run can reuse local snapshots.
+        # If these folders are always removed, every run may re-fetch files.
+        clear_cache = str(os.environ.get("PYVIDEOTRANS_HF_CLEAR_CACHE", "0")).strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        if clear_cache:
+            junk_paths = [
+                ".cache",
+                "blobs",
+                "refs",
+                "snapshots",
+                ".no_exist"
+            ]
 
-        for junk in junk_paths:
-            full_path = Path(local_dir) / junk
-            if full_path.exists():
-                try:
-                    if full_path.is_dir():
-                        shutil.rmtree(full_path)
-                    else:
-                        os.remove(full_path)
-                    print(f"clear cache: {junk}")
-                except Exception as e:
-                    print(f"{junk} {e}")
+            for junk in junk_paths:
+                full_path = Path(local_dir) / junk
+                if full_path.exists():
+                    try:
+                        if full_path.is_dir():
+                            shutil.rmtree(full_path)
+                        else:
+                            os.remove(full_path)
+                        print(f"clear cache: {junk}")
+                    except Exception as e:
+                        print(f"{junk} {e}")
+        else:
+            print("keep cache metadata: refs/snapshots/blobs")
     return True
 
 

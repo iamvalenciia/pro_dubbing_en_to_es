@@ -21,7 +21,6 @@ for repo_id, folder_name in REPOS:
     path = snapshot_download(
         repo_id=repo_id,
         local_dir=str(local_dir),
-        local_dir_use_symlinks=False,
         resume_download=True,
     )
     print(f"Downloaded to: {path}")

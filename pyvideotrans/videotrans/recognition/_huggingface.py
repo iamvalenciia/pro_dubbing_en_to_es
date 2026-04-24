@@ -58,6 +58,7 @@ class HuggingfaceRecogn(BaseRecogn):
             "is_cuda": self.is_cuda,
             "audio_file": None,
             "local_dir": self.local_dir,
+            "batch_size": int(settings.get('stt_batch_size', 0)),
             "jianfan": self.jianfan
         }
         raws=self._new_process(callback=pipe_asr,title=title,is_cuda=self.is_cuda,kwargs=kwargs)
@@ -85,6 +86,7 @@ class HuggingfaceRecogn(BaseRecogn):
             "audio_file": self.audio_file,
             "local_dir": self.local_dir,
             "compute_type": settings.get('cuda_com_type', 'default'),
+            "batch_size": int(settings.get('stt_batch_size', 0)),
             "beam_size": int(settings.get('beam_size', 5)),
             "best_of": int(settings.get('best_of', 5)),
             "jianfan": self.jianfan,

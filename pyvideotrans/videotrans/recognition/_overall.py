@@ -1,7 +1,7 @@
-import time, json, shutil
+import time, json, shutil, os
 from pathlib import Path
 from dataclasses import dataclass
-from videotrans.configure.config import  settings, ROOT_DIR, TEMP_DIR
+from videotrans.configure.config import settings, ROOT_DIR, TEMP_DIR, logger
 from videotrans.recognition._base import BaseRecogn
 
 from videotrans.util import tools
@@ -9,10 +9,62 @@ from pydub import AudioSegment
 from videotrans.process import openai_whisper, faster_whisper
 from videotrans.util.contants import FASTER_MODELS_DICT
 
+
+def _safe_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _resolve_a100_stt_model(*, requested_model: str, is_cuda: bool, recogn_type: int) -> str:
+    # Only affect Faster-Whisper local mode.
+    if recogn_type != 0:
+        return requested_model
+    if not is_cuda:
+        return requested_model
+
+    enabled = str(os.environ.get("PYVIDEOTRANS_A100_STT_MODE", "1")).lower() in ("1", "true", "yes", "on")
+    if not enabled:
+        return requested_model
+
+    prefer_40 = os.environ.get("PYVIDEOTRANS_A100_STT_MODEL_40GB", "large-v3-turbo").strip() or "large-v3-turbo"
+    prefer_16 = os.environ.get("PYVIDEOTRANS_A100_STT_MODEL_16GB", "medium").strip() or "medium"
+    if prefer_40 not in FASTER_MODELS_DICT:
+        prefer_40 = "large-v3-turbo"
+    if prefer_16 not in FASTER_MODELS_DICT:
+        prefer_16 = "medium"
+
+    threshold_40 = _safe_int_env("PYVIDEOTRANS_A100_STT_THRESHOLD_40GB", 40)
+    threshold_16 = _safe_int_env("PYVIDEOTRANS_A100_STT_THRESHOLD_16GB", 16)
+
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return requested_model
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        total_gb = total_bytes / float(1024 ** 3)
+        free_gb = free_bytes / float(1024 ** 3)
+    except Exception:
+        return requested_model
+
+    # Apply only on high-memory cards by default (A100 class and above).
+    if total_gb < threshold_40:
+        return requested_model
+
+    selected = prefer_40 if free_gb >= threshold_40 else (prefer_16 if free_gb >= threshold_16 else "small")
+    logger.info(f"[a100_stt_mode] auto model selected: requested={requested_model} selected={selected} free_gb={free_gb:.1f} total_gb={total_gb:.1f}")
+    return selected
+
 @dataclass
 class FasterAll(BaseRecogn):
     def __post_init__(self):
         super().__post_init__()
+        self.model_name = _resolve_a100_stt_model(
+            requested_model=self.model_name,
+            is_cuda=self.is_cuda,
+            recogn_type=self.recogn_type,
+        )
         local_dir = f'{ROOT_DIR}/models/models--'
         if self.model_name in FASTER_MODELS_DICT:
             local_dir += FASTER_MODELS_DICT[self.model_name].replace('/', '--')
@@ -39,7 +91,17 @@ class FasterAll(BaseRecogn):
                 repo_id = FASTER_MODELS_DICT[self.model_name]
             else:
                 repo_id = self.model_name
-            tools.check_and_down_hf(self.model_name,repo_id,self.local_dir,callback=self._process_callback)
+            try:
+                tools.check_and_down_hf(self.model_name,repo_id,self.local_dir,callback=self._process_callback)
+            except Exception as e:
+                fallback_model = os.environ.get("PYVIDEOTRANS_A100_STT_FALLBACK", "tiny").strip() or "tiny"
+                if fallback_model not in FASTER_MODELS_DICT:
+                    fallback_model = "tiny"
+                logger.warning(f"[a100_stt_mode] primary model download failed ({self.model_name}), fallback to {fallback_model}: {e}")
+                self.model_name = fallback_model
+                fallback_repo = FASTER_MODELS_DICT[fallback_model]
+                self.local_dir = f'{ROOT_DIR}/models/models--' + fallback_repo.replace('/', '--')
+                tools.check_and_down_hf(self.model_name, fallback_repo, self.local_dir, callback=self._process_callback)
         # 批量时预先vad切分
         # 否则后断句处理
         if settings.get('whisper_prepare'):
@@ -90,6 +152,7 @@ class FasterAll(BaseRecogn):
             "audio_file": self.audio_file,
             "local_dir": self.local_dir,
             "compute_type": settings.get('cuda_com_type', 'default'),
+            "batch_size": int(settings.get('stt_batch_size', 0)),
             "jianfan": self.jianfan,
             "audio_duration":self.audio_duration,
             "hotwords":settings.get('hotwords'),
