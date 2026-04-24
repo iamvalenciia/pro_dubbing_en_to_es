@@ -11,6 +11,22 @@ ENV HF_HOME=/workspace/qdp_data/torch_cache
 ENV HF_HUB_CACHE=/workspace/qdp_data/torch_cache/hub
 ENV TORCH_HOME=/workspace/qdp_data/torch_cache
 
+# ========== GPU TUNING ENVIRONMENT VARIABLES ==========
+# Enable aggressive batching and concurrency for faster dubbing on RunPod
+# NLLB-200: batch=256 lines per pass (handles ~5K tokens/batch typical)
+ENV PYVIDEOTRANS_NLLB_BATCH_LINES=256
+# Qwen3-TTS: batch=12 lines per pass (empirically safe for 1.7B model on 24GB+ VRAM)
+ENV PYVIDEOTRANS_QWEN_TTS_BATCH_LINES=12
+# Qwen3-TTS: PyTorch thread count for audio post-processing (CPU)
+ENV PYVIDEOTRANS_QWEN_TTS_TORCH_THREADS=12
+# Force CUDA for Qwen-TTS even if upstream detection fails
+ENV PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA=1
+# Enable auto-detection of GPU process pool size
+ENV PYVIDEOTRANS_AUTO_PROCESS_MAX_GPU=1
+# Override default process_max_gpu setting: allows 2 concurrent GPU tasks
+# (instead of default 1) for better throughput on high-VRAM GPU systems
+ENV PYVIDEOTRANS_PROCESS_MAX_GPU=2
+
 RUN for i in 1 2 3 4 5; do \
       apt-get clean && \
       apt-get update -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=0 --fix-missing && \
@@ -67,6 +83,26 @@ if Version(v) < Version("2.6.0"):
 PY
 
 COPY . /app
+
+# ========== OPTIMIZE cfg.json FOR GPU PERFORMANCE ==========
+# Ensure aggressive batching and concurrency settings are baked into the container
+RUN python3 - <<'PY'
+import json
+cfg_path = "/app/pyvideotrans/videotrans/cfg.json"
+with open(cfg_path, "r") as f:
+    cfg = json.load(f)
+# GPU tuning for aggressive performance
+cfg["trans_thread"] = 10          # translation threads (balanced with GPU memory)
+cfg["aitrans_thread"] = 50        # AI translation threads
+cfg["process_max_gpu"] = 2        # enable 2 concurrent GPU tasks
+cfg["multi_gpus"] = False         # use first GPU with high concurrency, not multi-GPU
+cfg["dubbing_thread"] = 1         # dubbing runs serialized but with batching
+cfg["crf"] = 23                   # video quality (default)
+cfg["backaudio_volume"] = 0.8     # background audio volume
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f)
+print(f"[DOCKERFILE] Updated {cfg_path} with GPU tuning: process_max_gpu=2, trans_thread=10, aitrans_thread=50")
+PY
 
 EXPOSE 7860
 CMD ["python", "/app/main_ui.py"]
