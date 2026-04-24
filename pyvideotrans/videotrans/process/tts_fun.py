@@ -34,49 +34,56 @@ def _get_or_load_qwen3_model(model_key: str, model_path: str, device_map: str, d
 def _resolve_qwen_tts_batch_lines(is_cuda: bool):
     import os
     import torch
+    details = "mode=cpu-default"
     env_val = os.environ.get("PYVIDEOTRANS_QWEN_TTS_BATCH_LINES")
     if env_val:
         try:
             n = int(env_val)
             if n > 0:
-                return n
+                return n, f"mode=env-fixed batch_lines={n}"
         except Exception:
             pass
 
     if not is_cuda or not torch.cuda.is_available():
-        return 2
+        return 2, details
 
     try:
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
         free_gib = free_bytes / float(1024 ** 3)
+        total_gib = total_bytes / float(1024 ** 3)
     except Exception:
         free_gib = 0.0
+        total_gib = 0.0
 
     target_vram_env = (
         os.environ.get("PYVIDEOTRANS_QWEN_TTS_TARGET_VRAM_GB", "").strip()
         or os.environ.get("PYVIDEOTRANS_GPU_TARGET_VRAM_GB", "").strip()
     )
+    target_vram_gb = 0.0
     if target_vram_env:
         try:
-            target_vram_gb = max(float(target_vram_env), 1.0)
-            target_from_vram = int(round((target_vram_gb / 24.0) * 12.0))
-            target_from_vram = max(2, min(target_from_vram, 64))
-            free_bound = max(2, min(int(round((free_gib / 24.0) * 16.0)), 64))
-            return max(2, min(target_from_vram, free_bound))
+            target_vram_gb = float(target_vram_env)
         except Exception:
-            pass
+            target_vram_gb = 0.0
 
-    if free_gib >= 60:
-        return 12
-    if free_gib >= 40:
-        return 10
-    if free_gib >= 24:
-        return 12
-    if free_gib >= 12:
-        return 8
-    if free_gib >= 6:
-        return 4
-    return 2
+    # Dynamic default: use ~92% of currently free VRAM for TTS work if target is unset/<=0.
+    # Mapping keeps historical calibration (24 GiB ~= 12 lines) but scales up for larger GPUs.
+    if target_vram_gb <= 0:
+        effective_target_gb = max(1.0, free_gib * 0.92)
+        target_mode = "auto"
+    else:
+        effective_target_gb = min(target_vram_gb, max(1.0, free_gib * 0.95))
+        target_mode = "env-target"
+
+    lines_per_gib = 12.0 / 24.0
+    batch_lines = int(round(effective_target_gb * lines_per_gib))
+    batch_lines = max(2, min(batch_lines, 128))
+
+    details = (
+        f"mode={target_mode} free_gb={free_gib:.2f} total_gb={total_gib:.2f} "
+        f"target_gb={effective_target_gb:.2f} lines_per_gib={lines_per_gib:.3f}"
+    )
+    return batch_lines, details
 
 
 def _batched(seq, size: int):
@@ -89,6 +96,16 @@ def _write_log(file, msg):
         Path(file).write_text(msg, encoding='utf-8')
     except Exception as e:
         logger.exception(f'写入新进程日志时出错', exc_info=True)
+
+
+def _emit_progress(logs_file, text: str):
+    """Emit progress both to inter-process log file and stdout for CLI/UI visibility."""
+    payload = json.dumps({"type": "progress", "text": text}, ensure_ascii=False)
+    _write_log(logs_file, payload)
+    try:
+        print(text, flush=True)
+    except Exception:
+        pass
 
 
 def _prepare_ref_wav(wavfile: str, max_ms: int = 60_000) -> str:
@@ -215,7 +232,7 @@ def qwen3tts_fun(
         )
 
     try:
-        batch_lines = _resolve_qwen_tts_batch_lines(is_cuda=is_cuda)
+        batch_lines, batch_policy = _resolve_qwen_tts_batch_lines(is_cuda=is_cuda)
         if is_cuda and torch.cuda.is_available():
             try:
                 alloc_gb = torch.cuda.memory_allocated(device_index) / float(1024 ** 3)
@@ -226,7 +243,11 @@ def qwen3tts_fun(
                 logs_file,
                 json.dumps({
                     "type": "logs",
-                    "text": f"[qwen3tts] device=cuda:{device_index} dtype={dtype} batch_lines={batch_lines} torch_threads={torch_threads} alloc_gb={alloc_gb:.2f} reserved_gb={reserved_gb:.2f}"
+                    "text": (
+                        f"[qwen3tts] device=cuda:{device_index} dtype={dtype} batch_lines={batch_lines} "
+                        f"torch_threads={torch_threads} alloc_gb={alloc_gb:.2f} reserved_gb={reserved_gb:.2f} "
+                        f"batch_policy=({batch_policy})"
+                    )
                 })
             )
         else:
@@ -234,7 +255,7 @@ def qwen3tts_fun(
                 logs_file,
                 json.dumps({
                     "type": "logs",
-                    "text": f"[qwen3tts] device=cpu dtype={dtype} batch_lines={batch_lines} torch_threads={torch_threads}"
+                    "text": f"[qwen3tts] device=cpu dtype={dtype} batch_lines={batch_lines} torch_threads={torch_threads} batch_policy=({batch_policy})"
                 })
             )
 
@@ -356,13 +377,13 @@ def qwen3tts_fun(
         for jobs in grouped.values():
             total_chunks += (len(jobs) + batch_lines - 1) // batch_lines
 
-        _write_log(logs_file, json.dumps({
-            "type": "logs",
-            "text": (
+        _emit_progress(
+            logs_file,
+            (
                 f"[qwen3tts] generation_start jobs={total_jobs} groups={len(grouped)} "
                 f"chunks={total_chunks} clone_group_by_ref_text={clone_group_by_ref_text}"
-            )
-        }))
+            ),
+        )
 
         # ---- GPU PREFETCH: pre-build all clone prompts in parallel threads ----
         # create_voice_clone_prompt() is CPU-bound (wav feature extraction).
@@ -432,14 +453,15 @@ def qwen3tts_fun(
                 remaining_chunks = max(total_chunks - chunk_idx, 0)
                 eta_sec = max(int(avg_chunk_sec * remaining_chunks), 0)
                 eta_min, eta_rem_sec = divmod(eta_sec, 60)
-                _write_log(logs_file, json.dumps({
-                    "type": "logs",
-                    "text": (
+                pct = (generated_count / max(total_jobs, 1)) * 100.0
+                _emit_progress(
+                    logs_file,
+                    (
                         f"[qwen3tts] batch_start {chunk_idx}/{total_chunks} size={len(chunk)} mode={group_key[0]} "
-                        f"remaining_chunks={remaining_chunks} eta={eta_min:02d}:{eta_rem_sec:02d} "
-                        f"generated={generated_count}/{total_jobs}"
-                    )
-                }))
+                        f"progress={pct:.1f}% generated={generated_count}/{total_jobs} "
+                        f"remaining_chunks={remaining_chunks} eta={eta_min:02d}:{eta_rem_sec:02d}"
+                    ),
+                )
                 try:
                     if group_key[0] == "custom":
                         texts = [j["text"] for j in chunk]
@@ -489,15 +511,16 @@ def qwen3tts_fun(
                     eta_done_min, eta_done_rem_sec = divmod(eta_done_sec, 60)
                     eta_finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_done_sec))
 
-                    _write_log(logs_file, json.dumps({
-                        "type": "logs",
-                        "text": (
+                    pct_done = (generated_count / max(total_jobs, 1)) * 100.0
+                    _emit_progress(
+                        logs_file,
+                        (
                             f"[qwen3tts] batch_done {chunk_idx}/{total_chunks} elapsed_s={time.time() - chunk_started_at:.1f} "
-                            f"generated={generated_count}/{total_jobs} remaining_segments={remaining_segments} "
-                            f"speed={seg_per_sec:.2f} seg/s eta={eta_done_min:02d}:{eta_done_rem_sec:02d} "
-                            f"eta_finish={eta_finish}"
-                        )
-                    }))
+                            f"progress={pct_done:.1f}% generated={generated_count}/{total_jobs} "
+                            f"remaining_segments={remaining_segments} speed={seg_per_sec:.2f} seg/s "
+                            f"eta={eta_done_min:02d}:{eta_done_rem_sec:02d} eta_finish={eta_finish}"
+                        ),
+                    )
 
                 except Exception as batch_exc:
                     raise RuntimeError(
@@ -517,14 +540,14 @@ def qwen3tts_fun(
 
         failed_count = max(0, requested_count - generated_count)
         success_ratio = (generated_count / requested_count) if requested_count > 0 else 0.0
-        _write_log(logs_file, json.dumps({
-            "type": "logs",
-            "text": (
+        _emit_progress(
+            logs_file,
+            (
                 f"[qwen3tts] generation_summary requested={requested_count} "
                 f"generated={generated_count} failed={failed_count} "
                 f"missing_ref={missing_ref_count} success_ratio={success_ratio:.3f}"
-            )
-        }))
+            ),
+        )
 
         # Strict guardrail: all requested lines must be generated.
         if requested_count > 0 and success_ratio < min_success_ratio:

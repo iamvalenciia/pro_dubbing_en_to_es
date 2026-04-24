@@ -940,6 +940,8 @@ def run_pyvideotrans_pipeline(
             child_env = os.environ.copy()
             child_env.setdefault("PYTHONUTF8", "1")
             child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            # Reduce noisy HF warnings like repeated pad_token_id messages.
+            child_env.setdefault("TRANSFORMERS_VERBOSITY", "error")
             # Ensure ctranslate2 finds models in standard HuggingFace cache
             child_env.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
             child_env.setdefault("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
@@ -966,11 +968,32 @@ def run_pyvideotrans_pipeline(
                 env=child_env,
             )
             vt_recent_lines = []
+            qwen_re = re.compile(
+                r"\[qwen3tts\]\s+(batch_start|batch_done)\s+([^\n]*)",
+                re.IGNORECASE,
+            )
+            qwen_generated_re = re.compile(r"generated=(\d+)/(\d+)", re.IGNORECASE)
+            qwen_eta_re = re.compile(r"eta=(\d{2}:\d{2})", re.IGNORECASE)
             
             for line in iter(process.stdout.readline, ''):
                 if line:
                     line_clean = line.strip()
                     ui_log.info(f"[VT-CORE] {line_clean}")
+                    qwen_match = qwen_re.search(line_clean)
+                    if qwen_match:
+                        generated = qwen_generated_re.search(line_clean)
+                        eta = qwen_eta_re.search(line_clean)
+                        if generated:
+                            done_n = int(generated.group(1))
+                            total_n = int(generated.group(2))
+                            pct = (done_n / max(total_n, 1)) * 100.0
+                            eta_txt = eta.group(1) if eta else "--:--"
+                            result["phase"] = (
+                                f"Qwen TTS en progreso: {done_n}/{total_n} "
+                                f"({pct:.1f}%) · ETA {eta_txt}"
+                            )
+                        else:
+                            result["phase"] = "Qwen TTS en progreso..."
                     vt_recent_lines.append(line_clean)
                     if len(vt_recent_lines) > 120:
                         vt_recent_lines.pop(0)
