@@ -15,8 +15,13 @@ ENV TORCH_HOME=/workspace/qdp_data/torch_cache
 # Enable aggressive batching and concurrency for faster dubbing on RunPod
 # NLLB-200 (A100-80GB profile): batch=512 lines per pass
 ENV PYVIDEOTRANS_NLLB_BATCH_LINES=512
+# Optional operator knob: desired VRAM budget for NLLB (GB).
+# Example override in RunPod: PYVIDEOTRANS_NLLB_TARGET_VRAM_GB=60
+ENV PYVIDEOTRANS_NLLB_TARGET_VRAM_GB=60
 # Qwen3-TTS: batch=12 lines per pass (empirically safe for 1.7B model on 24GB+ VRAM)
 ENV PYVIDEOTRANS_QWEN_TTS_BATCH_LINES=12
+# Optional operator knob: desired VRAM budget for Qwen TTS (GB).
+ENV PYVIDEOTRANS_QWEN_TTS_TARGET_VRAM_GB=24
 # Qwen3-TTS: PyTorch thread count for audio post-processing (CPU)
 ENV PYVIDEOTRANS_QWEN_TTS_TORCH_THREADS=12
 # Force CUDA for Qwen-TTS even if upstream detection fails

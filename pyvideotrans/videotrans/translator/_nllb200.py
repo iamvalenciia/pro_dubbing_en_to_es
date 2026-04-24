@@ -70,7 +70,7 @@ class NLLB200Trans(BaseTrans):
         forced = os.environ.get("PYVIDEOTRANS_NLLB_BATCH_LINES", "").strip()
         if forced:
             try:
-                return max(1, min(int(forced), 512))
+                return max(1, min(int(forced), 1024))
             except Exception:
                 pass
 
@@ -87,6 +87,25 @@ class NLLB200Trans(BaseTrans):
             free_gb = free_bytes / (1024 ** 3)
         except Exception:
             return max(current, 32)
+
+        # Optional target VRAM knob for operators.
+        # Example: PYVIDEOTRANS_NLLB_TARGET_VRAM_GB=60 on A100-80GB.
+        target_vram_env = (
+            os.environ.get("PYVIDEOTRANS_NLLB_TARGET_VRAM_GB", "").strip()
+            or os.environ.get("PYVIDEOTRANS_GPU_TARGET_VRAM_GB", "").strip()
+        )
+        if target_vram_env:
+            try:
+                target_vram_gb = max(float(target_vram_env), 1.0)
+                # Empirical mapping from current profile: ~512 lines around ~70 GB available.
+                target_from_vram = int(round((target_vram_gb / 70.0) * 512.0))
+                # Hard safety cap and floor.
+                target_from_vram = max(32, min(target_from_vram, 1024))
+                # Never choose a batch that is absurd relative to currently free VRAM.
+                free_bound = max(32, min(int(round((free_gb / 70.0) * 640.0)), 1024))
+                return max(current, min(target_from_vram, free_bound))
+            except Exception:
+                pass
 
         if free_gb >= 70:
             target = 512
@@ -219,9 +238,13 @@ class NLLB200Trans(BaseTrans):
                 dev = torch.cuda.current_device()
                 allocated = torch.cuda.memory_allocated(dev) / (1024 ** 3)
                 reserved = torch.cuda.memory_reserved(dev) / (1024 ** 3)
+                free_now, total_now = torch.cuda.mem_get_info(dev)
+                free_now_gb = free_now / (1024 ** 3)
+                total_now_gb = total_now / (1024 ** 3)
                 logger.info(
                     f"[nllb200] device=cuda:{dev} batch_lines={batch_lines} seq_len={seq_len} "
-                    f"trans_thread={self.trans_thread} alloc_gb={allocated:.2f} reserved_gb={reserved:.2f}"
+                    f"trans_thread={self.trans_thread} alloc_gb={allocated:.2f} reserved_gb={reserved:.2f} "
+                    f"free_gb={free_now_gb:.2f} total_gb={total_now_gb:.2f}"
                 )
             else:
                 logger.info(

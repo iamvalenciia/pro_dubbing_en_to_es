@@ -152,14 +152,19 @@ class BaseTrans(BaseCon):
             done_lines += len(it)
             elapsed_done = max(time.time() - run_started_at, 0.001)
             avg_line_sec = elapsed_done / max(done_lines, 1)
+            line_per_sec = done_lines / elapsed_done
             remaining_lines = max(total_lines - done_lines, 0)
+            remaining_batches_after = max(total_batches - batch_no, 0)
             eta_done_sec = max(int(math.ceil(avg_line_sec * remaining_lines)), 0)
             eta_done_min, eta_done_rem_sec = divmod(eta_done_sec, 60)
+            eta_finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_done_sec))
             self._signal(
                 text=(
                     f"[translate-progress] {done_lines}/{total_lines} lines "
                     f"({(done_lines / max(total_lines, 1)) * 100:.1f}%) "
-                    f"eta={eta_done_min:02d}:{eta_done_rem_sec:02d}"
+                    f"remaining_lines={remaining_lines} remaining_batches={remaining_batches_after} "
+                    f"speed={line_per_sec:.2f} lines/s eta={eta_done_min:02d}:{eta_done_rem_sec:02d} "
+                    f"eta_finish={eta_finish}"
                 )
             )
 
@@ -178,10 +183,25 @@ class BaseTrans(BaseCon):
     # 此时 _item_task 接收的是 srt格式的字符串
     def _run_srt(self,split_source_text):
         raws_list=[]
+        total_batches = len(split_source_text)
+        total_lines = len(self.text_list)
+        done_lines = 0
+        run_started_at = time.time()
         for i, it in enumerate(split_source_text):
             # 是字幕类表，此时 it=[{text,line,time}]
             if self._exit(): return
-            self._signal(text=tr('starttrans') + f' {i} ')
+            batch_no = i + 1
+            elapsed = max(time.time() - run_started_at, 0.001)
+            avg_batch_sec = elapsed / batch_no
+            remaining_batches = max(total_batches - batch_no, 0)
+            eta_sec = max(int(math.ceil(avg_batch_sec * remaining_batches)), 0)
+            eta_min, eta_rem_sec = divmod(eta_sec, 60)
+            self._signal(
+                text=(
+                    f"{tr('starttrans')} {batch_no}/{total_batches} "
+                    f"lines={done_lines}/{total_lines} eta={eta_min:02d}:{eta_rem_sec:02d}"
+                )
+            )
             for j, srt in enumerate(it):
                 it[j]['text'] = srt['text'].strip().replace("\n", " ")
             # 组成合法的srt格式字符串
@@ -199,6 +219,25 @@ class BaseTrans(BaseCon):
             tmp=tools.get_subtitle_from_srt(result, is_file=False)
             #logger.debug(f'\n原始待翻译文本:{srt_str=}\n翻译结果:{result=}\n整理后：{tmp=}')
             raws_list.extend(tmp)
+
+            done_lines += len(it)
+            elapsed_done = max(time.time() - run_started_at, 0.001)
+            avg_line_sec = elapsed_done / max(done_lines, 1)
+            line_per_sec = done_lines / elapsed_done
+            remaining_lines = max(total_lines - done_lines, 0)
+            remaining_batches_after = max(total_batches - batch_no, 0)
+            eta_done_sec = max(int(math.ceil(avg_line_sec * remaining_lines)), 0)
+            eta_done_min, eta_done_rem_sec = divmod(eta_done_sec, 60)
+            eta_finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_done_sec))
+            self._signal(
+                text=(
+                    f"[translate-progress] {done_lines}/{total_lines} lines "
+                    f"({(done_lines / max(total_lines, 1)) * 100:.1f}%) "
+                    f"remaining_lines={remaining_lines} remaining_batches={remaining_batches_after} "
+                    f"speed={line_per_sec:.2f} lines/s eta={eta_done_min:02d}:{eta_done_rem_sec:02d} "
+                    f"eta_finish={eta_finish}"
+                )
+            )
             time.sleep(self.wait_sec)
 
         logger.debug(f'按SRT格式翻译，原始字幕行数：{len(self.text_list)},整理为list[dict]后的行数:{len(raws_list)}')

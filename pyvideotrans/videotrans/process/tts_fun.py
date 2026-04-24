@@ -52,6 +52,20 @@ def _resolve_qwen_tts_batch_lines(is_cuda: bool):
     except Exception:
         free_gib = 0.0
 
+    target_vram_env = (
+        os.environ.get("PYVIDEOTRANS_QWEN_TTS_TARGET_VRAM_GB", "").strip()
+        or os.environ.get("PYVIDEOTRANS_GPU_TARGET_VRAM_GB", "").strip()
+    )
+    if target_vram_env:
+        try:
+            target_vram_gb = max(float(target_vram_env), 1.0)
+            target_from_vram = int(round((target_vram_gb / 24.0) * 12.0))
+            target_from_vram = max(2, min(target_from_vram, 64))
+            free_bound = max(2, min(int(round((free_gib / 24.0) * 16.0)), 64))
+            return max(2, min(target_from_vram, free_bound))
+        except Exception:
+            pass
+
     if free_gib >= 60:
         return 12
     if free_gib >= 40:
@@ -342,13 +356,23 @@ def qwen3tts_fun(
         }))
 
         chunk_idx = 0
+        gen_started_at = time.time()
         for group_key, jobs in grouped.items():
             for chunk in _batched(jobs, batch_lines):
                 chunk_idx += 1
                 chunk_started_at = time.time()
+                elapsed = max(time.time() - gen_started_at, 0.001)
+                avg_chunk_sec = elapsed / max(chunk_idx, 1)
+                remaining_chunks = max(total_chunks - chunk_idx, 0)
+                eta_sec = max(int(avg_chunk_sec * remaining_chunks), 0)
+                eta_min, eta_rem_sec = divmod(eta_sec, 60)
                 _write_log(logs_file, json.dumps({
                     "type": "logs",
-                    "text": f"[qwen3tts] batch_start {chunk_idx}/{total_chunks} size={len(chunk)} mode={group_key[0]}"
+                    "text": (
+                        f"[qwen3tts] batch_start {chunk_idx}/{total_chunks} size={len(chunk)} mode={group_key[0]} "
+                        f"remaining_chunks={remaining_chunks} eta={eta_min:02d}:{eta_rem_sec:02d} "
+                        f"generated={generated_count}/{total_jobs}"
+                    )
                 }))
                 try:
                     if group_key[0] == "custom":
@@ -387,9 +411,21 @@ def qwen3tts_fun(
                         sf.write(j["filename"], wav, sr)
                         generated_count += 1
 
+                    elapsed_done = max(time.time() - gen_started_at, 0.001)
+                    seg_per_sec = generated_count / elapsed_done
+                    remaining_segments = max(total_jobs - generated_count, 0)
+                    eta_done_sec = max(int(remaining_segments / max(seg_per_sec, 0.0001)), 0)
+                    eta_done_min, eta_done_rem_sec = divmod(eta_done_sec, 60)
+                    eta_finish = time.strftime("%H:%M:%S", time.localtime(time.time() + eta_done_sec))
+
                     _write_log(logs_file, json.dumps({
                         "type": "logs",
-                        "text": f"[qwen3tts] batch_done {chunk_idx}/{total_chunks} elapsed_s={time.time() - chunk_started_at:.1f} generated={generated_count}/{total_jobs}"
+                        "text": (
+                            f"[qwen3tts] batch_done {chunk_idx}/{total_chunks} elapsed_s={time.time() - chunk_started_at:.1f} "
+                            f"generated={generated_count}/{total_jobs} remaining_segments={remaining_segments} "
+                            f"speed={seg_per_sec:.2f} seg/s eta={eta_done_min:02d}:{eta_done_rem_sec:02d} "
+                            f"eta_finish={eta_finish}"
+                        )
                     }))
 
                 except Exception as batch_exc:
