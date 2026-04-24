@@ -47,7 +47,8 @@ class GlobalProcessManager:
         cpu_count=int(os.cpu_count())
         auto_gpu_pool = str(os.environ.get('PYVIDEOTRANS_AUTO_PROCESS_MAX_GPU', '1')).lower() in ('1', 'true', 'yes', 'on')
         try:
-            process_max_gpu=int(float(settings.get('process_max_gpu',0)))
+            env_process_max_gpu = os.environ.get('PYVIDEOTRANS_PROCESS_MAX_GPU', '').strip()
+            process_max_gpu = int(float(env_process_max_gpu)) if env_process_max_gpu else int(float(settings.get('process_max_gpu',0)))
         except:
             process_max_gpu=0
         if auto_gpu_pool and process_max_gpu <= 0:

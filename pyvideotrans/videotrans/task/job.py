@@ -367,12 +367,14 @@ class WorkerTaskDone(QThread):
                 tools.send_notification(f'Error:{e}', f'{trk.cfg.basename}')
                 
 def start_thread():
+    import os
     gpus.getset_gpu()
     task_nums=1
     # 存在可用显卡时，进一步判断应该启动几个相关线程
     if app_cfg.NVIDIA_GPU_NUMS>0:
         try:
-            process_max_gpu=int(float(settings.get('process_max_gpu',0)))
+            env_process_max_gpu = os.environ.get('PYVIDEOTRANS_PROCESS_MAX_GPU', '').strip()
+            process_max_gpu = int(float(env_process_max_gpu)) if env_process_max_gpu else int(float(settings.get('process_max_gpu',0)))
         except:
             process_max_gpu=1
         # 如果手动设置了gpu进程数量
