@@ -4,6 +4,32 @@
 # 成功，第一个值存在需要的返回值，不需要时返回True，第二个值为None
 from videotrans.configure.config import logger,ROOT_DIR
 
+# ========== SINGLETON CACHE FOR QWEN3-TTS MODELS ==========
+# Avoid re-downloading/re-loading models during duplicate initialization
+_QWEN3_MODEL_CACHE = {}
+
+def _get_or_load_qwen3_model(model_key: str, model_path: str, device_map: str, dtype, attn_implementation):
+    """
+    Retrieve model from cache or load it once.
+    model_key: 'base' or 'custom' (identifies which variant)
+    model_path: full path to model directory
+    Returns: Qwen3TTSModel instance
+    """
+    cache_key = (model_key, device_map, str(dtype))
+    if cache_key in _QWEN3_MODEL_CACHE:
+        return _QWEN3_MODEL_CACHE[cache_key]
+    
+    # Not in cache, load it
+    from qwen_tts import Qwen3TTSModel
+    model = Qwen3TTSModel.from_pretrained(
+        model_path,
+        device_map=device_map,
+        dtype=dtype,
+        attn_implementation=attn_implementation
+    )
+    _QWEN3_MODEL_CACHE[cache_key] = model
+    return model
+
 
 def _resolve_qwen_tts_batch_lines(is_cuda: bool):
     import os
@@ -114,7 +140,6 @@ def qwen3tts_fun(
         except Exception:
             pass
     import soundfile as sf
-    from qwen_tts import Qwen3TTSModel
 
     
     CUSTOM_VOICE= {"Vivian", "Serena", "Uncle_fu", "Dylan", "Eric", "Ryan", "Aiden", "Ono_anna", "Sohee"}
@@ -151,16 +176,20 @@ def qwen3tts_fun(
     all_roles={ r.get('role') for r in queue_tts}
     if all_roles & CUSTOM_VOICE:
         # 存在自定义音色
-        CUSTOM_OBJ=Qwen3TTSModel.from_pretrained(
-            f"{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{model_name}-CustomVoice",
+        # Use cached model if available to avoid re-downloading on duplicate initialization
+        CUSTOM_OBJ=_get_or_load_qwen3_model(
+            model_key="custom",
+            model_path=f"{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{model_name}-CustomVoice",
             device_map=device_map,
             dtype=dtype,
             attn_implementation=atten
         )
     if "clone" in all_roles or all_roles-CUSTOM_VOICE:
         # 存在克隆音色
-        BASE_OBJ=Qwen3TTSModel.from_pretrained(
-            f"{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{model_name}-Base",
+        # Use cached model if available to avoid re-downloading on duplicate initialization
+        BASE_OBJ=_get_or_load_qwen3_model(
+            model_key="base",
+            model_path=f"{ROOT_DIR}/models/models--Qwen--Qwen3-TTS-12Hz-{model_name}-Base",
             device_map=device_map,
             dtype=dtype,
             attn_implementation=atten
