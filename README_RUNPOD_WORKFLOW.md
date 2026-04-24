@@ -147,3 +147,149 @@ aws s3 cp "C:\ruta\local\full_video_en.mp4" "s3://l9dt5rqorw/user_input/full_vid
 Descargar todos los resultados:
 
 aws s3 sync "s3://l9dt5rqorw/output_final/" "C:\ruta\local\output_final" --region us-ks-2 --endpoint-url https://s3api-us-ks-2.runpod.io
+
+---
+
+## 11) PERFORMANCE & GPU TUNING EN RUNPOD (Optimizado Abril 2026)
+
+### 11.1 Por qué puede estar lento en RunPod
+
+Si sientes que todo va lento **al iniciar a doblar audio**, las causas más comunes son:
+
+1. **Doble descarga de modelos Qwen3-TTS** (~30 segundos)
+   - Ya fue corregida en commit 51b7549 (modelo cache singleton)
+
+2. **Configuración conservadora de GPU** (heredada de cfg.json defaults)
+   - process_max_gpu=1 (solo 1 tarea de GPU concurrente)
+   - trans_thread=10 (traducción sin batching agresivo)
+   - aitrans_thread=50 (threads para traducción IA)
+
+3. **Sin aceleración de batching**
+   - NLLB-200: default batch=10, debería ser 256
+   - Qwen3-TTS: default batch=2, debería ser 12
+
+### 11.2 Nueva imagen Docker (v25+) con GPU tuning baked-in
+
+**A partir del commit ee72e0f, la imagen Docker incluye:**
+
+```dockerfile
+# ENV variables para batching agresivo
+ENV PYVIDEOTRANS_NLLB_BATCH_LINES=256
+ENV PYVIDEOTRANS_QWEN_TTS_BATCH_LINES=12
+ENV PYVIDEOTRANS_PROCESS_MAX_GPU=2
+
+# cfg.json actualizado automáticamente en build:
+# process_max_gpu=2    (2 tareas de GPU concurrentes)
+# trans_thread=10      (traducción con threading)
+# aitrans_thread=50    (hilos para traducción IA)
+```
+
+**Impacto esperado:**
+- Primera ejecución: ~30s más rápido (no double-download)
+- Cada batch de traducción: 2-3x más rápido
+- Audio dubbing: 1.5-2x más rápido en GPUs con 24GB+ VRAM
+
+### 11.3 Cómo usar la imagen optimizada en RunPod
+
+**Opción A: Usar imagen más reciente (recomendada)**
+
+1. Construir localmente:
+```bash
+docker build -t iamvalenciia/dubbing-app:v25 .
+docker push iamvalenciia/dubbing-app:v25
+```
+
+2. En RunPod, crear Pod con:
+```bash
+runpodctl pod create \
+  --name "qdp-dubbing" \
+  --image "iamvalenciia/dubbing-app:v25" \
+  --gpu-id "NVIDIA A100-80GB" \
+  --container-disk-in-gb 50 \
+  --network-volume-id "TU_VOLUME_ID" \
+  --volume-mount-path "/runpod-volume"
+```
+
+**Opción B: Override con ENV variables en RunPod**
+
+Si no quieres reconstruir imagen, puedes setear en RunPod UI:
+
+```
+PYVIDEOTRANS_NLLB_BATCH_LINES=256
+PYVIDEOTRANS_QWEN_TTS_BATCH_LINES=12
+PYVIDEOTRANS_PROCESS_MAX_GPU=2
+PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA=1
+```
+
+### 11.4 Validar que GPU tuning está activo
+
+En la consola de RunPod, busca estos logs cuando inicie doblaje:
+
+```
+[nllb200] ... alloc_gb=10+ reserved_gb=15+ batch_lines=256  ← Batching activo
+[qwen3tts] batch_start ... size=12 mode=clone              ← Batch 12 activo
+Concurrent task_nums=2                                      ← 2 tareas GPU en paralelo
+```
+
+Sin tuning (lento), verías:
+```
+[nllb200] ... batch_lines=10                ← Solo batch=10 (conservador)
+[qwen3tts] batch_start ... size=2           ← Solo batch=2
+Concurrent task_nums=1                      ← 1 tarea GPU (serializado)
+```
+
+### 11.5 Recomendaciones por tipo de GPU
+
+| GPU Model | VRAM | Recomendado | Notas |
+|-----------|------|-------------|-------|
+| RTX 4090 | 24GB | NLLB batch=256, Qwen TTS batch=12, process_max_gpu=2 | ✅ Óptimo |
+| A100-80GB | 80GB | NLLB batch=512, Qwen TTS batch=24, process_max_gpu=4 | Puedes ser más agresivo |
+| A100-40GB | 40GB | NLLB batch=256, Qwen TTS batch=12, process_max_gpu=2 | Estándar |
+| H100 | 80GB | NLLB batch=512, Qwen TTS batch=24, process_max_gpu=4 | Máximo rendimiento |
+| L40 | 48GB | NLLB batch=256, Qwen TTS batch=12, process_max_gpu=2 | Bueno |
+
+### 11.6 Si aún está lento después de tuning
+
+1. **Verificar que cfg.json tiene valores correctos:**
+   ```bash
+   cat /app/pyvideotrans/videotrans/cfg.json | jq '.process_max_gpu, .trans_thread, .aitrans_thread'
+   ```
+
+2. **Verificar GPU memory:**
+   ```bash
+   nvidia-smi
+   ```
+
+3. **Revisar logs detallados:**
+   - En app Gradio: visor de logs real-time
+   - Buscar `[nllb200]` y `[qwen3tts]` para ver memory usage actual
+
+4. **Aumentar batch size si hay VRAM disponible:**
+   - Si `reserved_gb < total_vram * 0.6`, puedes aumentar batch
+   - Ej: PYVIDEOTRANS_NLLB_BATCH_LINES=512 para A100-80GB
+
+### 11.7 Commits relacionados con performance
+
+- **51b7549**: Qwen3-TTS model singleton cache (elimina double-download)
+- **66eb9a3**: GPU tuning env override support
+- **ee72e0f**: Dockerfile con GPU tuning baked-in + cfg.json auto-update
+
+### 11.8 Troubleshooting performance específico
+
+**Síntoma: "Fetching 11 files" aparece dos veces (lento al inicio)**
+- ✅ Corregido en 51b7549 (actualiza a latest main)
+
+**Síntoma: Traducción muy lenta (<20 lin/seg)**
+- Verificar: PYVIDEOTRANS_NLLB_BATCH_LINES env var
+- Verificar: trans_thread en cfg.json sea >= 10
+- Verificar: GPU memory available (nvidia-smi)
+
+**Síntoma: Qwen3-TTS audio generation slow**
+- Verificar: PYVIDEOTRANS_QWEN_TTS_BATCH_LINES=12
+- Verificar: PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA=1
+- Nota: Primera línea es siempre lenta (model warmup); líneas 2-N son rápidas
+
+**Síntoma: GPU utilization baja (<50%)**
+- Aumentar process_max_gpu si tienes múltiples GPUs
+- Aumentar batch_lines si hay VRAM libre
+- Verificar: aitrans_thread >= 50 en cfg.json
