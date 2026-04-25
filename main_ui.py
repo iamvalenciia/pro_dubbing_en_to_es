@@ -30,6 +30,38 @@ from src.paths import (
 PYVIDEOTRANS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pyvideotrans")
 PYVIDEOTRANS_CLI = os.path.join(PYVIDEOTRANS_ROOT, "cli.py")
 PYVIDEOTRANS_PYTHON = os.environ.get("PYVIDEOTRANS_PYTHON", sys.executable)
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+VOICE_REFS_ROOT = os.path.join(REPO_ROOT, "input", "voice_refs")
+VOICE_REFS_NORMALIZED = os.path.join(VOICE_REFS_ROOT, "normalized")
+VOICE_REFS_PREVIEWS = os.path.join(VOICE_REFS_ROOT, "previews")
+VOICE_REFS_CATALOG = os.path.join(VOICE_REFS_ROOT, "voice_refs_catalog.json")
+VOICE_SPEAKER_MAP = os.path.join(VOICE_REFS_ROOT, "speaker_voice_map.json")
+VOICE_REFS_SOURCE = os.path.join(REPO_ROOT, "reference_voices")
+
+STATIC_VOICE_OPTIONS = [
+    {
+        "label": "Discovery Channel (Hombre)",
+        "ref_id": "discovery_channel-hombre-discovery_channel_clean",
+    },
+    {
+        "label": "Donald Trump (Hombre)",
+        "ref_id": "donald_trump-hombre-president_trump-enhanced-v2",
+    },
+    {
+        "label": "DW Documentales (Mujer)",
+        "ref_id": "dw_documentales-mujer-dw_documental_DeepFilterNet3_clean",
+    },
+    {
+        "label": "Professor Jiang (Hombre)",
+        "ref_id": "professor_jiang-hombre-professor_jiang-enhanced-v2",
+    },
+    {
+        "label": "Veritasium (Hombre)",
+        "ref_id": "veritasium-hombre-veritasium",
+    },
+]
+STATIC_VOICE_LABELS = [it["label"] for it in STATIC_VOICE_OPTIONS]
+STATIC_VOICE_REF_BY_LABEL = {it["label"]: it["ref_id"] for it in STATIC_VOICE_OPTIONS}
 
 if PYVIDEOTRANS_ROOT not in sys.path:
     sys.path.insert(0, PYVIDEOTRANS_ROOT)
@@ -49,6 +81,40 @@ except ImportError:
     ui_render_reel = None
 
 load_dotenv()  # Carga GEMINI_MODEL, HF_TOKEN, API_GOOGLE_STUDIO desde tu .env local
+
+
+def _parse_local_dotenv(dotenv_path: str) -> dict:
+    env_map = {}
+    try:
+        if not os.path.isfile(dotenv_path):
+            return env_map
+        with open(dotenv_path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                key = k.strip()
+                val = v.strip().strip('"').strip("'")
+                if key:
+                    env_map[key] = val
+    except Exception:
+        return {}
+    return env_map
+
+
+def _inject_ai_env_to_child(child_env: dict) -> dict:
+    """Ensure subprocess gets AI env vars even if parent process missed dotenv load."""
+    repo_env = _parse_local_dotenv(os.path.join(REPO_ROOT, ".env"))
+    forced_gemini_model = "gemini-3.1-flash-lite-preview"
+    for k in ("API_GOOGLE_STUDIO", "GEMINI_MODEL", "HF_TOKEN"):
+        val = os.environ.get(k) or repo_env.get(k)
+        if val:
+            child_env[k] = str(val).strip().strip('"').strip("'")
+    # Hard requirement for this pipeline: always use the configured Gemini model.
+    child_env["GEMINI_MODEL"] = forced_gemini_model
+    return child_env
+
 
 # =========================================================================
 # PARCHE ANTI-CAÍDAS DE RED (DNS & IPv6) PARA RUNPOD/DOCKER
@@ -305,6 +371,40 @@ body,
     -webkit-backdrop-filter: blur(16px);
 }
 
+.speaker-voice-dd {
+    position: relative !important;
+    z-index: 1500 !important;
+    overflow: visible !important;
+}
+
+.speaker-voice-dd .wrap {
+    overflow: visible !important;
+}
+
+.speaker-voice-dd .wrap-inner,
+.speaker-voice-dd .secondary-wrap,
+.speaker-voice-dd .reference {
+    overflow: visible !important;
+}
+
+.speaker-voice-dd .choices {
+    z-index: 20000 !important;
+}
+
+.speaker-voice-dd ul.options {
+    top: calc(100% + 6px) !important;
+    bottom: auto !important;
+    z-index: 20001 !important;
+    max-height: min(260px, 42vh) !important;
+    overflow-y: auto !important;
+}
+
+.gr-group,
+.gr-panel,
+.gr-column {
+    overflow: visible !important;
+}
+
 .gr-tabs,
 .tab-nav {
     background: transparent !important;
@@ -534,6 +634,203 @@ def convert_srt_to_timestamps_json(srt_path: str, json_path: str):
 def _ensure_dirs():
     ensure_local_dirs()
     setup_pipeline_logger(LOCAL_LOGS)
+    os.makedirs(VOICE_REFS_ROOT, exist_ok=True)
+    os.makedirs(VOICE_REFS_NORMALIZED, exist_ok=True)
+    os.makedirs(VOICE_REFS_PREVIEWS, exist_ok=True)
+
+
+def _voice_ref_audio_files(root_dir: str) -> list[str]:
+    if not os.path.isdir(root_dir):
+        return []
+    out: list[str] = []
+    for base, _, files in os.walk(root_dir):
+        for f in files:
+            low = f.lower()
+            if low.endswith((".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac", ".opus")):
+                out.append(os.path.join(base, f))
+    out.sort()
+    return out
+
+
+def _prepare_voice_references() -> tuple[str, list[str], str | None]:
+    _ensure_dirs()
+    candidates = _voice_ref_audio_files(VOICE_REFS_SOURCE)
+    if not candidates:
+        candidates = _voice_ref_audio_files(VOICE_REFS_ROOT)
+    if not candidates:
+        return "❌ No se encontraron audios de referencia en reference_voices ni input/voice_refs", [], None
+
+    catalog = []
+    log_lines = [f"Preparando {len(candidates)} referencia(s)..."]
+    for src in candidates:
+        base_name = os.path.splitext(os.path.basename(src))[0]
+        safe = re.sub(r"[^a-zA-Z0-9_-]", "-", base_name).strip("-") or "voice-ref"
+        parent = os.path.basename(os.path.dirname(src)).strip()
+        speaker_id = re.sub(r"[^a-zA-Z0-9_-]", "-", parent).strip("-") if parent else "unknown"
+        ref_id = f"{speaker_id}-{safe}" if speaker_id and speaker_id != safe else safe
+
+        normalized = os.path.join(VOICE_REFS_NORMALIZED, f"{ref_id}.wav")
+        preview = os.path.join(VOICE_REFS_PREVIEWS, f"{ref_id}_preview.wav")
+
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", src,
+            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            normalized,
+        ], check=True)
+        subprocess.run([
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", normalized,
+            "-t", "12",
+            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            preview,
+        ], check=True)
+
+        dur = _media_duration_seconds(normalized)
+        catalog.append({
+            "ref_id": ref_id,
+            "speaker_hint": speaker_id,
+            "source_path": src,
+            "normalized_path": normalized,
+            "preview_path": preview,
+            "duration_sec": round(dur, 2),
+        })
+        log_lines.append(f"✅ {ref_id} ({dur:.1f}s)")
+
+    with open(VOICE_REFS_CATALOG, "w", encoding="utf-8") as f:
+        json.dump({"voices": catalog}, f, indent=2, ensure_ascii=False)
+
+    choices = [f"{it['ref_id']}  ({it['duration_sec']:.1f}s)" for it in catalog]
+    default_preview = catalog[0]["preview_path"] if catalog else None
+    log_lines.append(f"Catálogo guardado en: {VOICE_REFS_CATALOG}")
+    return "\n".join(log_lines), choices, default_preview
+
+
+def _load_voice_catalog() -> list[dict]:
+    if not os.path.isfile(VOICE_REFS_CATALOG):
+        return []
+    try:
+        data = json.loads(open(VOICE_REFS_CATALOG, "r", encoding="utf-8").read())
+        arr = data.get("voices") if isinstance(data, dict) else []
+        return arr if isinstance(arr, list) else []
+    except Exception:
+        return []
+
+
+def _voice_choice_to_preview(choice: str) -> str | None:
+    if not choice:
+        return None
+    ref_id = choice.rsplit("  (", 1)[0].strip()
+    for it in _load_voice_catalog():
+        if it.get("ref_id") == ref_id:
+            p = it.get("preview_path")
+            if p and os.path.isfile(p):
+                return p
+    return None
+
+
+def _latest_speaker_artifact(suffix: str) -> str | None:
+    if not os.path.isdir(NETWORK_OUTPUT):
+        return None
+    files = []
+    for f in os.listdir(NETWORK_OUTPUT):
+        if f.endswith(suffix):
+            p = os.path.join(NETWORK_OUTPUT, f)
+            if os.path.isfile(p):
+                files.append(p)
+    if not files:
+        return None
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files[0]
+
+
+def _load_speaker_context_for_ui() -> tuple[str, str]:
+    profile_path = _latest_speaker_artifact("_speaker_profile.json")
+    identity_path = _latest_speaker_artifact("_speaker_identity.json")
+    if not profile_path:
+        return "❌ No hay speaker_profile reciente. Ejecuta primero un doblaje con Speaker Clone activo.", "{}"
+
+    profile = json.loads(open(profile_path, "r", encoding="utf-8").read())
+    identity_map = {}
+    if identity_path and os.path.isfile(identity_path):
+        try:
+            identity = json.loads(open(identity_path, "r", encoding="utf-8").read())
+            for it in (identity.get("speakers") or []):
+                k = str(it.get("speaker_id", "")).strip()
+                if k:
+                    identity_map[k] = it
+        except Exception:
+            identity_map = {}
+
+    voices = _load_voice_catalog()
+    voice_ids = [v.get("ref_id") for v in voices if v.get("ref_id")]
+
+    lines = [f"Perfil: {os.path.basename(profile_path)}"]
+    out_map = {}
+    for spk in (profile.get("speakers") or []):
+        sid = str(spk.get("speaker_id", "")).strip()
+        if not sid:
+            continue
+        ident = identity_map.get(sid, {})
+        role = ident.get("role_label", "-")
+        gender = ident.get("gender_label", "-")
+        conf = ident.get("confidence", 0)
+        head = (spk.get("sample_sentences_head") or [])[:1]
+        lines.append(
+            f"- {sid} | rol={role} | genero={gender} | conf={conf} | ejemplo={head[0] if head else '-'}"
+        )
+
+        suggested = None
+        if voice_ids:
+            # Heurística ligera para sugerencia inicial editable.
+            lower_sid = sid.lower()
+            if "trump" in lower_sid:
+                suggested = next((v for v in voice_ids if "trump" in v.lower()), voice_ids[0])
+            elif "jiang" in lower_sid or role == "profesor":
+                suggested = next((v for v in voice_ids if "jiang" in v.lower()), voice_ids[0])
+            elif gender == "mujer":
+                suggested = next((v for v in voice_ids if "mujer" in v.lower() or "dw" in v.lower()), voice_ids[0])
+            else:
+                suggested = voice_ids[0]
+
+        out_map[sid] = suggested
+
+    return "\n".join(lines), json.dumps(out_map, ensure_ascii=False, indent=2)
+
+
+def _save_speaker_map_from_json(mapping_text: str) -> str:
+    _ensure_dirs()
+    try:
+        payload = json.loads(mapping_text or "{}")
+    except Exception as exc:
+        return f"❌ JSON inválido: {exc}"
+
+    if not isinstance(payload, dict):
+        return "❌ El mapping debe ser un objeto JSON: {\"spk0\": \"ref_id\"}"
+
+    catalog = _load_voice_catalog()
+    by_ref = {it.get("ref_id"): it for it in catalog}
+    if not by_ref:
+        return "❌ Catálogo de voces vacío. Ejecuta primero 'Preparar referencias'"
+
+    saved = {}
+    for spk, ref_id in payload.items():
+        sid = re.sub(r"[^a-zA-Z0-9_-]", "-", str(spk)).strip()
+        if not sid:
+            continue
+        if not ref_id:
+            continue
+        ref = by_ref.get(str(ref_id).strip())
+        if not ref:
+            return f"❌ ref_id no existe en catálogo: {ref_id}"
+        saved[sid] = {
+            "ref": ref.get("normalized_path"),
+            "ref_id": ref.get("ref_id"),
+        }
+
+    with open(VOICE_SPEAKER_MAP, "w", encoding="utf-8") as f:
+        json.dump(saved, f, indent=2, ensure_ascii=False)
+    return f"✅ Mapping guardado en {VOICE_SPEAKER_MAP} con {len(saved)} speaker(s)"
 
 
 def _warmup_nllb200():
@@ -692,8 +989,14 @@ TRANSLATE_TYPE_MAP = {
     "nllb_local": 2,
     "m2m100_local": 2,
     "google": 0,
+    "microsoft": 1,
     "chatgpt": 3,
+    "gemini": 5,
     "deepseek": 4,
+    "openrouter": 9,
+    "qwenmt": 12,
+    "deepl": 16,
+    "deeplx": 17,
     "ollama": 8,
     "minimax": 23,
 }
@@ -821,6 +1124,521 @@ def _apply_video_enhancements(
     ]
     subprocess.run(gpu_cmd, check=True)
 
+def run_phase1(
+    video_file,
+    test_mode,
+):
+    """
+    Fase 1: ASR + traducción + diarización + análisis de speakers.
+    Yields (phase_text, log, spk_section_update, *row_updates×6, btn_phase2_update, state_speakers_value).
+    """
+    N = 6  # max speaker rows
+
+    def _empty_updates():
+        """Return updates that hide everything."""
+        base = [gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(value=None)]
+        rows_flat = base * N
+        return rows_flat
+
+    def _yield_error(msg):
+        empty_rows = []
+        for _ in range(N):
+            empty_rows += [gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(value=None)]
+        yield (msg, "", gr.update(visible=False), *empty_rows, gr.update(visible=False), [],
+               gr.update(interactive=True, value="Analizar video (Fase 1)"))
+
+    if not video_file:
+        yield from _yield_error("❌ Selecciona un video primero.")
+        return
+
+    video_path = _parse_dropdown_choice(video_file, NETWORK_USER_INPUT)
+    if not video_path or not os.path.isfile(video_path):
+        yield from _yield_error(f"❌ Archivo inválido: {video_path}")
+        return
+
+    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
+    translate_type = TRANSLATE_TYPE_MAP.get(llm_model)
+    if translate_type is None:
+        yield from _yield_error(f"❌ Translate model desconocido: {llm_model}")
+        return
+
+    asr_type = ASR_TYPE_MAP.get("faster")
+    asr_model_name = os.environ.get("QDP_ASR_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
+    _ensure_dirs()
+    clear_log()
+    setup_pipeline_logger(LOCAL_LOGS)
+
+    result = {"phase": "Iniciando Fase 1 (análisis)...", "target_dir": None, "done": False, "error": None}
+
+    def worker():
+        try:
+            current_video_path = video_path
+
+            if test_mode:
+                result["phase"] = "Modo Test: Recortando video a 30s..."
+                ui_log.info(result["phase"])
+                source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
+                safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
+                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}{source_ext or '.mp4'}")
+                subprocess.run([
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    "-i", current_video_path, "-t", "30", "-c", "copy", test_video_path
+                ], check=True)
+                current_video_path = test_video_path
+
+            cmd = [
+                PYVIDEOTRANS_PYTHON, PYVIDEOTRANS_CLI,
+                "--task", "analyze",
+                "--name", current_video_path,
+                "--source_language_code", "en",
+                "--target_language_code", "es",
+                "--recogn_type", str(asr_type),
+                "--model_name", asr_model_name,
+                "--translate_type", str(translate_type),
+                "--cuda",
+                "--enable_diariz",
+                "--nums_diariz", "0",
+            ]
+
+            result["phase"] = "Fase 1: Transcripción + traducción + diarización..."
+            ui_log.info(f"Ejecutando Fase 1: {' '.join(cmd)}")
+
+            child_env = os.environ.copy()
+            child_env.setdefault("PYTHONUTF8", "1")
+            child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            child_env.setdefault("TRANSFORMERS_VERBOSITY", "error")
+            child_env.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+            child_env.setdefault("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
+            child_env.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+            child_env = _inject_ai_env_to_child(child_env)
+            ui_log.info(
+                f"[ENV-PHASE1] gemini_api_set={bool(child_env.get('API_GOOGLE_STUDIO'))} "
+                f"gemini_model={child_env.get('GEMINI_MODEL', '')}"
+            )
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=PYVIDEOTRANS_ROOT,
+                env=child_env,
+            )
+            analyze_re = re.compile(r"^ANALYZE_DONE:(.+)$")
+            for line in iter(process.stdout.readline, ""):
+                if line:
+                    line_clean = line.strip()
+                    ui_log.info(f"[VT-PHASE1] {line_clean}")
+                    m = analyze_re.match(line_clean)
+                    if m:
+                        result["target_dir"] = m.group(1).strip()
+
+            process.wait()
+            if process.returncode != 0:
+                raise RuntimeError(f"Fase 1 falló con código {process.returncode}")
+
+            result["done"] = True
+            result["phase"] = "✅ Fase 1 completada. Asigna voces y arranca Fase 2."
+            ui_log.info(result["phase"])
+
+        except Exception as exc:
+            result["error"] = str(exc)
+            result["phase"] = f"❌ Error Fase 1: {exc}"
+            ui_log.error(f"Fase 1 error: {exc}\n{traceback.format_exc()}")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    # Stream progress while Phase 1 runs
+    empty_rows = []
+    for _ in range(N):
+        empty_rows += [gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(value=None)]
+
+    while t.is_alive():
+        time.sleep(1.0)
+        yield (result["phase"], read_log_tail(800), gr.update(visible=False), *empty_rows, gr.update(visible=False), [],
+               gr.update(interactive=False, value="⏳ Analizando..."))
+
+    t.join()
+
+    if result["error"] or not result["done"]:
+        yield from _yield_error(result["phase"])
+        return
+
+    # --- Parse artifacts from target_dir ---
+    target_dir = result.get("target_dir")
+    if not target_dir:
+        # Fallback: scan pyvideotrans/output for newest dir with speaker_profile.json
+        vt_output = os.path.join(PYVIDEOTRANS_ROOT, "output")
+        candidates = []
+        if os.path.isdir(vt_output):
+            for name in os.listdir(vt_output):
+                p = os.path.join(vt_output, name)
+                if os.path.isdir(p) and os.path.isfile(os.path.join(p, "speaker_profile.json")):
+                    candidates.append(p)
+        if candidates:
+            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            target_dir = candidates[0]
+
+    speakers = []
+    if target_dir:
+        profile_path = os.path.join(target_dir, "speaker_profile.json")
+        identity_path = os.path.join(target_dir, "speaker_identity.json")
+        profile = {}
+        identity_map = {}
+        if os.path.isfile(profile_path):
+            try:
+                profile = json.loads(open(profile_path, "r", encoding="utf-8").read())
+            except Exception:
+                profile = {}
+        if os.path.isfile(identity_path):
+            try:
+                raw = json.loads(open(identity_path, "r", encoding="utf-8").read())
+                for item in (raw.get("speakers") or []):
+                    k = str(item.get("speaker_id", "")).strip()
+                    if k:
+                        identity_map[k] = item
+            except Exception:
+                identity_map = {}
+
+        for spk in (profile.get("speakers") or []):
+            sid = str(spk.get("speaker_id", "")).strip()
+            if not sid:
+                continue
+            ident = identity_map.get(sid, {})
+            role = ident.get("role_label", "")
+            gender_raw = ident.get("gender_label", "")
+            # Build compact 1-2 word label
+            label_parts = [p for p in [role, gender_raw] if p and p not in ("-", "unknown")]
+            ai_label = " ".join(label_parts[:2]) if label_parts else sid
+            head_sents = (spk.get("sample_sentences_head") or [])
+            speakers.append({
+                "speaker_id": sid,
+                "ai_label": ai_label,
+                "sample": head_sents[0] if head_sents else "",
+                "target_dir": target_dir,
+            })
+
+    if not speakers:
+        # No diarization data — still allow Phase 2 with a single default row
+        ui_log.warning("Fase 1: no se detectaron speakers individuales (diarización no activa o sin marcas).")
+        speakers = [{"speaker_id": "default", "ai_label": "narrador", "sample": "", "target_dir": target_dir or ""}]
+
+    # Fixed choices to avoid dynamic value/label mismatches in Gradio updates.
+    voice_choices = STATIC_VOICE_LABELS[:]
+
+    # Build per-row updates (N_SPK_MAX = 6 rows)
+    row_updates = []
+    for i in range(N):
+        if i < len(speakers):
+            spk = speakers[i]
+            default_voice = voice_choices[0] if voice_choices else None
+            row_updates += [
+                gr.update(visible=True),                # group visibility
+                gr.update(value=spk["speaker_id"]),     # id textbox
+                gr.update(value=spk["ai_label"]),        # label textbox
+                gr.update(value=default_voice),  # voice dd
+            ]
+        else:
+            row_updates += [
+                gr.update(visible=False),
+                gr.update(value=""),
+                gr.update(value=""),
+                gr.update(value=None),
+            ]
+
+    yield (
+        result["phase"],
+        read_log_tail(800),
+        gr.update(visible=True),   # spk_section
+        *row_updates,              # 6×4 = 24 items
+        gr.update(visible=True),   # btn_phase2
+        speakers,                  # state_speakers
+        gr.update(interactive=True, value="Analizar video (Fase 1)"),  # btn_phase1
+    )
+
+
+def run_phase2(
+    video_file,
+    test_mode,
+    state_speakers,
+    spk_voice_0, spk_voice_1, spk_voice_2, spk_voice_3, spk_voice_4, spk_voice_5,
+    spk_label_0, spk_label_1, spk_label_2, spk_label_3, spk_label_4, spk_label_5,
+    apply_video_fx,
+    brightness,
+    contrast,
+    color,
+    sharpness,
+):
+    """
+    Fase 2: Doblaje completo usando el mapa de voz elegido en la UI.
+    Yields same 7-tuple as old run_pyvideotrans_pipeline.
+    """
+    if not video_file:
+        yield "Error", "Por favor selecciona un video.", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
+        return
+
+    video_path = _parse_dropdown_choice(video_file, NETWORK_USER_INPUT)
+    if not video_path or not os.path.isfile(video_path):
+        yield "Error", f"Archivo inválido: {video_path}", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
+        return
+
+    # --- Write speaker voice map from UI assignments ---
+    voice_inputs = [spk_voice_0, spk_voice_1, spk_voice_2, spk_voice_3, spk_voice_4, spk_voice_5]
+    active_speakers = state_speakers or []
+    catalog = _load_voice_catalog()
+    by_ref = {it["ref_id"]: it for it in catalog}
+    speaker_map = {}
+    for i, spk_data in enumerate(active_speakers[:6]):
+        choice = voice_inputs[i]
+        if not choice:
+            continue
+        ref_id = STATIC_VOICE_REF_BY_LABEL.get(str(choice).strip())
+        if not ref_id:
+            # Backward compatibility for old dynamic values.
+            ref_id = str(choice).rsplit("  (", 1)[0].strip()
+        ref_entry = by_ref.get(ref_id)
+        if ref_entry:
+            sid = spk_data["speaker_id"]
+            speaker_map[sid] = {
+                "ref": ref_entry["normalized_path"],
+                "ref_id": ref_id,
+            }
+    _ensure_dirs()
+    with open(VOICE_SPEAKER_MAP, "w", encoding="utf-8") as f:
+        json.dump(speaker_map, f, indent=2, ensure_ascii=False)
+    ui_log.info(f"Voice map escrito: {len(speaker_map)} speaker(s) → {VOICE_SPEAKER_MAP}")
+
+    # --- Now run the full pipeline (Fase 2) ---
+    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
+    tts_model = "qwen_local_clone"
+
+    asr_type = ASR_TYPE_MAP.get("faster")
+    asr_model_name = os.environ.get("QDP_ASR_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
+    translate_type = TRANSLATE_TYPE_MAP.get(llm_model)
+    tts_type = TTS_TYPE_MAP.get(tts_model)
+    if asr_type is None or translate_type is None or tts_type is None:
+        yield "Error", f"Config inválida: LLM={llm_model}, TTS={tts_model}", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
+        return
+
+    clear_log()
+    setup_pipeline_logger(LOCAL_LOGS)
+
+    ui_log.info("=" * 80)
+    ui_log.info("INICIANDO MOTOR PYVIDEOTRANS — FASE 2 (DOBLAJE)")
+    ui_log.info(f"Video: {video_path}")
+    ui_log.info(f"Speaker map: {len(speaker_map)} speaker(s) asignados")
+    ui_log.info("=" * 80)
+
+    result = {"audio": None, "video": None, "json_timestamps": None, "srt_file": None,
+              "download_audio": None, "status": "running", "error": None,
+              "phase": "Fase 2: Iniciando doblaje con voces asignadas..."}
+
+    def worker():
+        try:
+            current_video_path = video_path
+
+            if test_mode:
+                result["phase"] = "Modo Test: Recortando video a 30s..."
+                ui_log.info(result["phase"])
+                source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
+                safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
+                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}{source_ext or '.mp4'}")
+                subprocess.run([
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    "-i", current_video_path, "-t", "30", "-c", "copy", test_video_path
+                ], check=True)
+                current_video_path = test_video_path
+
+            cmd = [
+                PYVIDEOTRANS_PYTHON, PYVIDEOTRANS_CLI,
+                "--task", "vtv",
+                "--name", current_video_path,
+                "--source_language_code", "en",
+                "--target_language_code", "es",
+                "--recogn_type", str(asr_type),
+                "--model_name", asr_model_name,
+                "--translate_type", str(translate_type),
+                "--tts_type", str(tts_type),
+                "--cuda",
+                "--subtitle_type", "0",
+                "--video_autorate",
+                "--voice_role", "clone",
+                "--enable_diariz",
+                "--nums_diariz", "0",
+            ]
+
+            result["phase"] = "Fase 2: Pipeline de doblaje activo..."
+            ui_log.info(f"Ejecutando Fase 2: {' '.join(cmd)}")
+            run_started_at = time.time()
+
+            child_env = os.environ.copy()
+            child_env.setdefault("PYTHONUTF8", "1")
+            child_env.setdefault("PYTHONIOENCODING", "utf-8")
+            child_env.setdefault("TRANSFORMERS_VERBOSITY", "error")
+            child_env.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+            child_env.setdefault("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
+            child_env.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+            child_env = _inject_ai_env_to_child(child_env)
+            ui_log.info(
+                f"[ENV-PHASE2] gemini_api_set={bool(child_env.get('API_GOOGLE_STUDIO'))} "
+                f"gemini_model={child_env.get('GEMINI_MODEL', '')}"
+            )
+            sox_candidates = [
+                os.path.join(PYVIDEOTRANS_ROOT, "ffmpeg", "sox"),
+                os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\ChrisBagwell.SoX_Microsoft.Winget.Source_8wekyb3d8bbwe\sox-14.4.2"),
+                r"C:\Program Files\sox-14-4-2",
+            ]
+            sox_paths = [p for p in sox_candidates if os.path.isdir(p)]
+            if sox_paths:
+                child_env["PATH"] = os.pathsep.join(sox_paths + [child_env.get("PATH", "")])
+
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=PYVIDEOTRANS_ROOT,
+                env=child_env,
+            )
+            vt_recent_lines = []
+            qwen_re = re.compile(r"\[qwen3tts\]\s+(batch_start|batch_done)\s+([^\n]*)", re.IGNORECASE)
+            qwen_generated_re = re.compile(r"generated=(\d+)/(\d+)", re.IGNORECASE)
+            qwen_eta_re = re.compile(r"eta=(\d{2}:\d{2})", re.IGNORECASE)
+
+            for line in iter(process.stdout.readline, ""):
+                if line:
+                    line_clean = line.strip()
+                    ui_log.info(f"[VT-PHASE2] {line_clean}")
+                    qwen_match = qwen_re.search(line_clean)
+                    if qwen_match:
+                        generated = qwen_generated_re.search(line_clean)
+                        eta = qwen_eta_re.search(line_clean)
+                        if generated:
+                            done_n = int(generated.group(1))
+                            total_n = int(generated.group(2))
+                            pct = (done_n / max(total_n, 1)) * 100.0
+                            eta_txt = eta.group(1) if eta else "--:--"
+                            result["phase"] = f"Qwen TTS: {done_n}/{total_n} ({pct:.1f}%) · ETA {eta_txt}"
+                        else:
+                            result["phase"] = "Qwen TTS en progreso..."
+                    vt_recent_lines.append(line_clean)
+                    if len(vt_recent_lines) > 120:
+                        vt_recent_lines.pop(0)
+
+            process.wait()
+            if process.returncode != 0:
+                joined = "\n".join(vt_recent_lines)
+                hint = None
+                if "Kernel size can't be greater than actual input size" in joined:
+                    hint = "Referencia de voz demasiado corta para Qwen clone. Usa refs ≥1.2s."
+                raise RuntimeError(
+                    f"Fase 2 falló con código {process.returncode}. {hint or ''}"
+                )
+
+            joined = "\n".join(vt_recent_lines)
+            m = re.search(r"Success:\s*(\d+)\s*,\s*Failed:\s*(\d+)", joined)
+            if m:
+                ok_n = int(m.group(1))
+                fail_n = int(m.group(2))
+                if fail_n > 0 and ok_n <= fail_n:
+                    raise RuntimeError(
+                        f"TTS con demasiados fallos (Success={ok_n}, Failed={fail_n}). "
+                        "Revisa las referencias de voz."
+                    )
+
+            result["phase"] = "Recolectando outputs..."
+            ui_log.info(result["phase"])
+
+            original_base = os.path.splitext(os.path.basename(video_path))[0]
+            original_safe = re.sub(r'[\s\. #*?!:"]', '-', original_base)
+            current_base = os.path.splitext(os.path.basename(current_video_path))[0]
+            current_safe = re.sub(r'[\s\. #*?!:"]', '-', current_base)
+
+            vt_output_dir = _find_pyvideotrans_output_dir(
+                candidate_names=[current_safe, current_base, original_safe, original_base],
+                min_mtime=run_started_at - 120,
+            )
+            if not vt_output_dir:
+                raise RuntimeError("Fase 2 terminó pero no se encontró la carpeta de salida.")
+
+            safe_name = original_safe
+            vt_mp4 = _pick_best_output_mp4(vt_output_dir, ui_log)
+            final_mp4 = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed.mp4")
+            shutil.copy2(vt_mp4, final_mp4)
+
+            if apply_video_fx:
+                result["phase"] = "Aplicando ajustes visuales..."
+                enhanced_tmp = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed_enhanced_tmp.mp4")
+                _apply_video_enhancements(final_mp4, enhanced_tmp, brightness, contrast, color, sharpness)
+                os.replace(enhanced_tmp, final_mp4)
+
+            result["video"] = final_mp4
+
+            final_wav = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed.wav")
+            (
+                ffmpeg.input(final_mp4)
+                .output(final_wav, acodec="pcm_s16le", ac=1, ar="16000")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            video_sec = _media_duration_seconds(final_mp4)
+            audio_sec = _media_duration_seconds(final_wav)
+            min_ratio = float(os.environ.get("QDP_MIN_DUB_AUDIO_RATIO", "0.20") or "0.20")
+            if video_sec > 0 and audio_sec > 0 and (audio_sec / video_sec) < min_ratio:
+                raise RuntimeError(
+                    f"Audio doblado demasiado corto (audio={audio_sec:.1f}s, video={video_sec:.1f}s). "
+                    "Indica fallos masivos en TTS. Revisa referencias de voz."
+                )
+            result["audio"] = final_wav
+            result["download_audio"] = final_wav
+
+            srt_files = [f for f in os.listdir(vt_output_dir) if f.lower().endswith(".srt")]
+            if srt_files:
+                srt_files.sort(key=lambda f: os.path.getmtime(os.path.join(vt_output_dir, f)), reverse=True)
+                srt_path = os.path.join(vt_output_dir, srt_files[0])
+                final_srt = os.path.join(NETWORK_OUTPUT, f"{safe_name}_subtitles.srt")
+                shutil.copy2(srt_path, final_srt)
+                result["srt_file"] = final_srt
+                json_out = os.path.join(NETWORK_OUTPUT, f"{safe_name}_timestamps.json")
+                convert_srt_to_timestamps_json(srt_path, json_out)
+                result["json_timestamps"] = json_out
+
+            result["status"] = "ok"
+            result["phase"] = "¡Doblaje Fase 2 Completado!"
+            ui_log.info(result["phase"])
+
+        except Exception as e:
+            result["status"] = "fail"
+            result["error"] = str(e)
+            result["phase"] = f"❌ Error Fase 2: {e}"
+            ui_log.error(f"Fase 2 falló: {e}\n{traceback.format_exc()}")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+    while t.is_alive():
+        time.sleep(1.0)
+        yield (
+            result["phase"], read_log_tail(1500),
+            result["audio"], result["video"],
+            result.get("json_timestamps"), result.get("srt_file"), result.get("download_audio"),
+            gr.update(interactive=False, value="⏳ Doblando..."),
+        )
+
+    t.join()
+    yield (
+        result["phase"], read_log_tail(1500),
+        result["audio"], result["video"],
+        result.get("json_timestamps"), result.get("srt_file"), result.get("download_audio"),
+        gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)"),
+    )
+
+
 def run_pyvideotrans_pipeline(
     video_file,
     test_mode,
@@ -845,6 +1663,7 @@ def run_pyvideotrans_pipeline(
 
     # Defaults fijos para simplificar UX (sin 4 selectores técnicos en UI).
     asr_model = "faster"
+    asr_model_name = os.environ.get("QDP_ASR_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
     target_lang = "es"
     llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
     tts_model = "edge"
@@ -878,7 +1697,7 @@ def run_pyvideotrans_pipeline(
     ui_log.info(
         f"Config fija -> ASR: {asr_model}({asr_type}), Target: {target_lang}, "
         f"TTS: {effective_tts_model}({tts_type}), LLM: {llm_model}({translate_type}), "
-        f"SpeakerClone: {speaker_clone_mode}"
+        f"SpeakerClone: {speaker_clone_mode}, ASR model: {asr_model_name}"
     )
     ui_log.info(f"Procesando en NVMe: {LOCAL_DIR}")
     ui_log.info("=" * 80)
@@ -909,6 +1728,7 @@ def run_pyvideotrans_pipeline(
                 "--source_language_code", "en",
                 "--target_language_code", target_lang,
                 "--recogn_type", str(asr_type),
+                "--model_name", asr_model_name,
                 "--translate_type", str(translate_type),
                 "--tts_type", str(tts_type),
                 "--cuda",
@@ -946,6 +1766,11 @@ def run_pyvideotrans_pipeline(
             child_env.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
             child_env.setdefault("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
             child_env.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
+            child_env = _inject_ai_env_to_child(child_env)
+            ui_log.info(
+                f"[ENV-PIPELINE] gemini_api_set={bool(child_env.get('API_GOOGLE_STUDIO'))} "
+                f"gemini_model={child_env.get('GEMINI_MODEL', '')}"
+            )
             # Ensure SoX is discoverable (Winget/Program Files/local vendored paths).
             sox_candidates = [
                 os.path.join(PYVIDEOTRANS_ROOT, "ffmpeg", "sox"),
@@ -1116,6 +1941,15 @@ def run_pyvideotrans_pipeline(
                 ui_log.info(f"Contrato de Datos JSON construido exitosamente en: {json_out}")
             else:
                 ui_log.warning("PyVideoTrans no generó SRT; se omite timestamps.json en este run.")
+
+            # 4. Exponer artefactos de speaker intelligence para mapeo manual en UI.
+            for artifact_name in ("speaker_profile.json", "speaker_identity.json"):
+                src_art = os.path.join(vt_output_dir, artifact_name)
+                if not os.path.isfile(src_art):
+                    continue
+                dst_art = os.path.join(NETWORK_OUTPUT, f"{safe_name}_{artifact_name}")
+                shutil.copy2(src_art, dst_art)
+                ui_log.info(f"Artefacto speaker copiado: {dst_art}")
             
             result["status"] = "ok"
             result["phase"] = "¡Doblaje Master Completado!"
@@ -1190,11 +2024,58 @@ with gr.Blocks(
                 
             with gr.Row():
                 cb_test_mode = gr.Checkbox(label="Modo de prueba (cortar a 30s)", value=False, interactive=True)
-                cb_speaker_clone = gr.Checkbox(
-                    label="Speaker-aware clone (diarización + clon por hablante)",
-                    value=True,
-                    interactive=True,
-                )
+
+            # ── FASE 1: Análisis de Speakers ──────────────────────────────────────
+            gr.Markdown("### 🎙️ Fase 1 · Analizar video")
+            gr.Markdown(
+                "Transcribe, traduce y detecta quiénes hablan. "
+                "Después asigna una voz de referencia a cada speaker y lanza la Fase 2."
+            )
+            btn_phase1 = gr.Button("Analizar video (Fase 1)", variant="secondary", size="lg")
+
+            # ── SPEAKER SECTION (oculto hasta completar Fase 1) ─────────────────
+            N_SPK_MAX = 6
+            _initial_voice_choices = STATIC_VOICE_LABELS[:]
+
+            with gr.Column(visible=False) as spk_section:
+                gr.Markdown("### 🗣️ Speakers detectados — Asigna una voz a cada speaker")
+
+                # Pre-build N_SPK_MAX rows; Phase 1 callback makes them visible
+                spk_groups = []
+                spk_id_boxes = []
+                spk_label_boxes = []
+                spk_voice_dds = []
+                for _i in range(N_SPK_MAX):
+                    with gr.Group(visible=False) as _grp:
+                        with gr.Row():
+                            _id_box = gr.Textbox(
+                                label="ID", value=f"spk{_i}", interactive=False,
+                                scale=1, min_width=80,
+                            )
+                            _label_box = gr.Textbox(
+                                label="Identidad IA (editable)", interactive=True,
+                                scale=2,
+                            )
+                            _voice_dd = gr.Dropdown(
+                                label="Voz de referencia",
+                                choices=_initial_voice_choices,
+                                value=_initial_voice_choices[0] if _initial_voice_choices else None,
+                                interactive=True,
+                                scale=3,
+                                elem_classes=["speaker-voice-dd"],
+                            )
+                    spk_groups.append(_grp)
+                    spk_id_boxes.append(_id_box)
+                    spk_label_boxes.append(_label_box)
+                    spk_voice_dds.append(_voice_dd)
+
+            # State to pass detected speakers to Phase 2
+            state_speakers = gr.State([])
+
+            # ── FASE 2 ────────────────────────────────────────────────────────────
+            btn_phase2 = gr.Button(
+                "Doblar con voces asignadas (Fase 2)", variant="primary", size="lg", visible=False,
+            )
 
             gr.Markdown("### 🖼️ Editor de Frame (Referencia de Color)")
             with gr.Row():
@@ -1232,13 +2113,11 @@ with gr.Blocks(
                 interactive=True,
             )
 
-            btn_run_master = gr.Button("Ejecutar doblaje", variant="primary", size="lg")
-            
             ui_active_phase = gr.Textbox(label="Fase Activa", value="Esperando inicio...", interactive=False, lines=1)
             ui_terminal = gr.Textbox(label="Terminal de Logs", elem_id="qdp-log", interactive=False, lines=15, autoscroll=True)
             
             with gr.Row():
-                out_master_audio = gr.Audio(label="Audio Doblado (Fase 5 - Descarga Inmediata)", interactive=False)
+                out_master_audio = gr.Audio(label="Audio Doblado", interactive=False)
                 out_master_video = gr.Video(label="Resultado: Video Master Final (MP4)", interactive=False)
             
             with gr.Row():
@@ -1576,21 +2455,34 @@ with gr.Blocks(
         outputs=[frame_adjusted, ui_frame_log],
     )
 
-    btn_run_master.click(
-        run_pyvideotrans_pipeline,
-        inputs=[
-            dd_video,
-            cb_test_mode,
-            cb_speaker_clone,
-            cb_apply_video_fx,
-            slider_brightness,
-            slider_contrast,
-            slider_color,
-            slider_sharpness,
-        ],
-        outputs=[ui_active_phase, ui_terminal, out_master_audio, out_master_video, file_master_json, file_master_srt, file_master_audio]
+    # ── Phase 1: Analizar speakers ────────────────────────────────────────────
+    # Outputs: phase_text, log, spk_section, 6×(group, id, label, dd), btn_phase2, state
+    _p1_outputs = (
+        [ui_active_phase, ui_terminal, spk_section]
+        + [comp for i in range(N_SPK_MAX)
+           for comp in [spk_groups[i], spk_id_boxes[i], spk_label_boxes[i], spk_voice_dds[i]]]
+        + [btn_phase2, state_speakers, btn_phase1]
     )
-    
+    btn_phase1.click(
+        run_phase1,
+        inputs=[dd_video, cb_test_mode],
+        outputs=_p1_outputs,
+    )
+
+    # ── Phase 2: Doblar con voces asignadas ──────────────────────────────────
+    _p2_outputs = [ui_active_phase, ui_terminal, out_master_audio, out_master_video,
+                   file_master_json, file_master_srt, file_master_audio, btn_phase2]
+    btn_phase2.click(
+        run_phase2,
+        inputs=[
+            dd_video, cb_test_mode, state_speakers,
+            *spk_voice_dds,   # 6 voice dropdowns
+            *spk_label_boxes, # 6 label textboxes
+            cb_apply_video_fx, slider_brightness, slider_contrast, slider_color, slider_sharpness,
+        ],
+        outputs=_p2_outputs,
+    )
+
     # Tab 2: Subtítulos
     up_video_subs.upload(handle_subs_video_upload, inputs=[up_video_subs], outputs=[dd_video_subs])
     btn_refresh_subs.click(update_subs_video_dropdown, inputs=None, outputs=[dd_video_subs])

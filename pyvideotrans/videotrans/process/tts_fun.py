@@ -2,6 +2,8 @@
 # 返回元组
 # 失败：第一个值为False，则为失败，第二个值存储失败原因
 # 成功，第一个值存在需要的返回值，不需要时返回True，第二个值为None
+import json
+
 from videotrans.configure.config import logger,ROOT_DIR
 
 # ========== SINGLETON CACHE FOR QWEN3-TTS MODELS ==========

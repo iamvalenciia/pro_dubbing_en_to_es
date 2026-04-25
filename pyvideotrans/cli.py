@@ -214,7 +214,16 @@ def main():
     }
     from videotrans.configure import config    
     config.init_run()
-    from videotrans.configure.config import ROOT_DIR,tr,app_cfg,settings,TEMP_DIR,logger,defaulelang,HOME_DIR
+    from videotrans.configure.config import ROOT_DIR,tr,app_cfg,settings,TEMP_DIR,logger,defaulelang,HOME_DIR,params
+
+    # Bridge env vars into pyvideotrans params for headless/CLI runs.
+    env_gemini_key = os.environ.get("API_GOOGLE_STUDIO", "").strip().strip('"').strip("'")
+    env_gemini_model = os.environ.get("GEMINI_MODEL", "").strip().strip('"').strip("'")
+    forced_gemini_model = "gemini-3.1-flash-lite-preview"
+    if env_gemini_key and not params.get("gemini_key", ""):
+        params["gemini_key"] = env_gemini_key
+    # Hard requirement for headless pipeline translations.
+    params["gemini_model"] = forced_gemini_model if forced_gemini_model else (env_gemini_model or params.get("gemini_model", ""))
 
 
     from videotrans import recognition, translator, tts
@@ -277,10 +286,24 @@ def main():
         trk = TransCreate(cfg=TaskCfgVTT(**params))
         trk.prepare()
         trk.recogn()
+        trk.diariz()
         trk.trans()
         trk.dubbing()
         trk.align()
         trk.assembling()
+        trk.task_done()
+
+    # Fase 1: análisis de speakers (ASR + diarización + traducción, sin TTS)
+    def analyze_fun(params):
+        app_cfg.current_status = 'ing'
+        print(f"\n[Task] Speaker Analysis (Phase 1)")
+        print(tr('process_file', params.get('name')))
+        trk = TransCreate(cfg=TaskCfgVTT(**params))
+        trk.prepare()
+        trk.recogn()
+        trk.diariz()
+        trk.trans()
+        trk.run_speaker_analysis()
         trk.task_done()
 
     # True 为软件退出，不执行任何动作
@@ -298,7 +321,7 @@ def main():
     )
 
     # --- 核心参数 ---
-    parser.add_argument('--task', type=str, required=True, choices=['stt', 'tts', 'sts', 'vtv'],
+    parser.add_argument('--task', type=str, required=True, choices=['stt', 'tts', 'sts', 'vtv', 'analyze'],
                         help=tr("help_task"))
     parser.add_argument('--name', type=str, required=True,
                         help=tr("help_name"))
@@ -477,6 +500,42 @@ def main():
             "clear_cache": args.clear_cache
         }
         vtv_fun({**common_params, **vtv_params})
+
+    elif task == 'analyze':
+        # Fase 1: analizar speakers sin doblar
+        missing = []
+        if not args.source_language_code: missing.append(tr("miss_source_lang"))
+        if not args.target_language_code: missing.append(tr("miss_target_lang"))
+        if missing:
+            parser.error(tr("err_vtv_missing", ', '.join(missing)))
+
+        analyze_params = {
+            "source_language_code": args.source_language_code,
+            "target_language_code": args.target_language_code,
+            "recogn_type": args.recogn_type,
+            "model_name": args.model_name,
+            "is_cuda": args.cuda,
+            "remove_noise": args.remove_noise,
+            "enable_diariz": args.enable_diariz,
+            "nums_diariz": args.nums_diariz,
+            "rephrase": args.rephrase,
+            "fix_punc": args.fix_punc,
+            "translate_type": args.translate_type,
+            # TTS desactivado — no se dobla en Fase 1
+            "tts_type": 0,
+            "voice_role": "No",
+            "voice_rate": "+0%",
+            "volume": "+0%",
+            "pitch": "+0Hz",
+            "voice_autorate": False,
+            "video_autorate": False,
+            "align_sub_audio": False,
+            "is_separate": False,
+            "recogn2pass": False,
+            "subtitle_type": 0,
+            "clear_cache": False,  # Preservar caché para reutilizar en Fase 2
+        }
+        analyze_fun({**common_params, **analyze_params})
 
 
 if __name__ == "__main__":

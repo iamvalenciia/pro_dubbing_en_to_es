@@ -6,9 +6,10 @@ import os
 import re
 import shutil
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Any
 
 from videotrans import translator
 from videotrans.configure.config import ROOT_DIR,tr,app_cfg,settings,params,TEMP_DIR,logger,defaulelang,HOME_DIR
@@ -585,17 +586,33 @@ class TransCreate(BaseTask):
 
     def diariz(self):
         # 说话人设为1，不进行分离
-        if self._exit() or not self.cfg.enable_diariz or self.max_speakers == 1 or Path(
-                self.cfg.cache_folder + "/speaker.json").exists():
+        print(f"[DIARIZ-DEBUG] ENTRY: enable_diariz={self.cfg.enable_diariz}, max_speakers={self.max_speakers}, cache_exists={Path(self.cfg.cache_folder + '/speaker.json').exists()}", flush=True)
+        # Check if speaker.json exists AND is valid (not empty)
+        speaker_json_path = Path(self.cfg.cache_folder + "/speaker.json")
+        existing_valid = False
+        if speaker_json_path.exists():
+            try:
+                existing_data = json.loads(speaker_json_path.read_text(encoding='utf-8'))
+                if isinstance(existing_data, list) and len(existing_data) > 0:
+                    existing_valid = True
+            except Exception:
+                pass
+        
+        if self._exit() or not self.cfg.enable_diariz or self.max_speakers == 1 or existing_valid:
+            skip_reason = "already_valid" if existing_valid else ("_exit" if self._exit() else ("diariz_disabled" if not self.cfg.enable_diariz else "single_speaker"))
+            print(f"[DIARIZ-DEBUG] SKIP: reason={skip_reason}", flush=True)
             return
         # built pyannote reverb ali_CAM
         speaker_type = settings.get('speaker_type', 'built')
         hf_token = settings.get('hf_token')
+        print(f"[DIARIZ-DEBUG] speaker_type={speaker_type}, language={self.cfg.detect_language[:2]}", flush=True)
         if speaker_type == 'built' and self.cfg.detect_language[:2] not in ['zh', 'en']:
             logger.error(f'当前选择 built 说话人分离模型，但不支持当前语言:{self.cfg.detect_language}')
+            print(f"[DIARIZ-ERROR] built 模型不支持语言: {self.cfg.detect_language}", flush=True)
             return
         if speaker_type in ['pyannote', 'reverb'] and not hf_token:
             logger.error(f'当前选择 pyannote 说话人分离模型，但未设置 huggingface.co 的token: {self.cfg.detect_language}')
+            print(f"[DIARIZ-ERROR] 需要 huggingface token", flush=True)
             return
         if speaker_type in ['pyannote', 'reverb']:
             # 判断是否可访问 huggingface.co
@@ -649,12 +666,20 @@ class TransCreate(BaseTask):
             spk_list = self._new_process(callback=_run_speakers, title=title,
                                          is_cuda=self.cfg.is_cuda and speaker_type != 'built', kwargs=kw)
 
+            print(f"[DIARIZ-DEBUG] _new_process returned: type={type(spk_list)}, value={spk_list}", flush=True)
             if spk_list:
+                print(f"[DIARIZ-SUCCESS] speaker list generated with {len(spk_list)} entries", flush=True)
                 Path(self.cfg.cache_folder + "/speaker.json").write_text(json.dumps(spk_list), encoding='utf-8')
                 logger.debug('分离说话人成功完成')
                 shutil.copy2(self.cfg.cache_folder + "/speaker.json", self.cfg.target_dir + "/speaker.json")
+            else:
+                print(f"[DIARIZ-WARNING] _new_process returned empty/None result", flush=True)
             self._signal(text=tr('separating speakers end'))
-        except:
+        except Exception as exc:
+            import traceback
+            print(f"[DIARIZ-EXCEPTION] diariz() failed: {exc}", flush=True)
+            print(f"[DIARIZ-TRACEBACK] {traceback.format_exc()}", flush=True)
+            logger.error(f'diariz() exception: {exc}\n{traceback.format_exc()}')
             pass
 
     # 翻译字幕文件
@@ -983,8 +1008,236 @@ class TransCreate(BaseTask):
             logger.exception(f'人声背景声分离失败：{e}', exc_info=True)
 
     # 配音预处理，去掉无效字符，整理开始时间
-    def _tts(self, daz_json=None) -> None:
-        queue_tts = []
+    def _voice_refs_root(self) -> Path:
+        # ROOT_DIR points to repo/pyvideotrans; references live under repo/input/voice_refs.
+        return Path(ROOT_DIR).parent / 'input' / 'voice_refs'
+
+    def _voice_map_file(self) -> Path:
+        return self._voice_refs_root() / 'speaker_voice_map.json'
+
+    def _normalized_voice_refs_dir(self) -> Path:
+        return self._voice_refs_root() / 'normalized'
+
+    def _load_external_speaker_map(self) -> Dict[str, str]:
+        map_file = self._voice_map_file()
+        if not map_file.exists():
+            return {}
+
+        try:
+            raw = json.loads(map_file.read_text(encoding='utf-8'))
+        except Exception as exc:
+            raise RuntimeError(f'Invalid speaker voice map JSON: {map_file} -> {exc}') from exc
+
+        if not isinstance(raw, dict):
+            raise RuntimeError(f'Speaker voice map must be an object: {map_file}')
+
+        normalized_dir = self._normalized_voice_refs_dir()
+        result: Dict[str, str] = {}
+        for spk, val in raw.items():
+            k = re.sub(r'[^a-zA-Z0-9_-]', '-', str(spk)).strip()
+            if not k:
+                continue
+
+            ref_candidate = None
+            if isinstance(val, dict):
+                ref_candidate = val.get('ref') or val.get('path') or val.get('file')
+            else:
+                ref_candidate = val
+            if not ref_candidate:
+                continue
+
+            p = Path(str(ref_candidate).strip())
+            if p.is_absolute() and p.exists():
+                resolved = p
+            else:
+                resolved = normalized_dir / p.name
+                if not resolved.exists() and (self._voice_refs_root() / p.name).exists():
+                    resolved = self._voice_refs_root() / p.name
+
+            if not resolved.exists():
+                raise RuntimeError(
+                    f'Speaker map reference not found for speaker={k}: {ref_candidate}'
+                )
+            result[k] = resolved.as_posix()
+
+        return result
+
+    def _write_speaker_profile(
+        self,
+        *,
+        subs: List[Dict[str, Any]],
+        source_subs: List[Dict[str, Any]],
+        speaker_marks: List[Any],
+    ) -> None:
+        if not speaker_marks:
+            return
+
+        speakers: Dict[str, Dict[str, Any]] = {}
+        for idx, mark in enumerate(speaker_marks):
+            if idx >= len(subs) or not mark:
+                continue
+            spk_id = re.sub(r'[^a-zA-Z0-9_-]', '-', str(mark)).strip() or 'unknown'
+            t = subs[idx]
+            s = source_subs[idx] if source_subs and idx < len(source_subs) else t
+            entry = speakers.setdefault(
+                spk_id,
+                {
+                    'speaker_id': spk_id,
+                    'line_indices': [],
+                    'duration_ms': 0,
+                    'sample_sentences_head': [],
+                    'sample_sentences_tail': [],
+                    'sample_source_head': [],
+                    'sample_source_tail': [],
+                    'time_ranges': [],
+                },
+            )
+            entry['line_indices'].append(int(t.get('line', idx + 1)))
+            entry['duration_ms'] += max(0, int(t.get('end_time', 0)) - int(t.get('start_time', 0)))
+            entry['time_ranges'].append({
+                'line': int(t.get('line', idx + 1)),
+                'start': t.get('startraw'),
+                'end': t.get('endraw'),
+            })
+            text_target = str(t.get('text', '')).strip()
+            text_source = str(s.get('text', '')).strip()
+            if text_target:
+                if len(entry['sample_sentences_head']) < 3:
+                    entry['sample_sentences_head'].append(text_target)
+                entry['sample_sentences_tail'].append(text_target)
+                if len(entry['sample_sentences_tail']) > 3:
+                    entry['sample_sentences_tail'] = entry['sample_sentences_tail'][-3:]
+            if text_source:
+                if len(entry['sample_source_head']) < 3:
+                    entry['sample_source_head'].append(text_source)
+                entry['sample_source_tail'].append(text_source)
+                if len(entry['sample_source_tail']) > 3:
+                    entry['sample_source_tail'] = entry['sample_source_tail'][-3:]
+
+        profile = {
+            'created_at': datetime.utcnow().isoformat() + 'Z',
+            'target_sub': self.cfg.target_sub,
+            'source_sub': self.cfg.source_sub,
+            'speaker_count': len(speakers),
+            'speakers': sorted(speakers.values(), key=lambda x: x['speaker_id']),
+        }
+
+        profile_cache = Path(self.cfg.cache_folder) / 'speaker_profile.json'
+        profile_target = Path(self.cfg.target_dir) / 'speaker_profile.json'
+        payload = json.dumps(profile, ensure_ascii=False, indent=2)
+        profile_cache.write_text(payload, encoding='utf-8')
+        profile_target.write_text(payload, encoding='utf-8')
+
+    def _classify_speakers_with_gemini(self) -> None:
+        profile_path = Path(self.cfg.cache_folder) / 'speaker_profile.json'
+        if not profile_path.exists():
+            print('[GEMINI-SKIP] speaker_profile.json not found', flush=True)
+            return
+
+        api_key = os.environ.get('API_GOOGLE_STUDIO')
+        if not api_key:
+            print('[GEMINI-SKIP] API_GOOGLE_STUDIO not set in subprocess env', flush=True)
+            return
+
+        profile = json.loads(profile_path.read_text(encoding='utf-8'))
+        speakers = profile.get('speakers') or []
+        if not speakers:
+            print('[GEMINI-SKIP] no speakers in speaker_profile.json', flush=True)
+            return
+
+        try:
+            import google.generativeai as genai
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                'Gemini speaker classifier requires google-generativeai in the pyvideotrans Python env '
+                f'({sys.executable}). Install it in .venv-py310.'
+            ) from exc
+
+        configured_model = os.environ.get('GEMINI_MODEL', 'gemini-2.5-flash').strip() or 'gemini-2.5-flash'
+        model_candidates = [configured_model, 'gemini-2.5-flash', 'gemini-1.5-flash']
+        seen = set()
+        model_candidates = [m for m in model_candidates if not (m in seen or seen.add(m))]
+        genai.configure(api_key=api_key)
+
+        prompt = (
+            'Clasifica cada speaker en JSON estricto. '\
+            'No inventes datos biograficos. Usa solo contexto textual. '\
+            'Campos requeridos por speaker_id: role_label (profesor|estudiante|entrevistador|narrador|otro), '\
+            'gender_label (hombre|mujer|indeterminado), confidence (0..1), notes (string corto). '\
+            'Responde SOLO JSON con formato {"speakers": [{...}]}.\n\n'
+            + json.dumps({'speakers': speakers}, ensure_ascii=False)
+        )
+
+        last_exc = None
+        raw = ''
+        used_model = None
+        for model_name in model_candidates:
+            try:
+                print(f"[GEMINI-START] model={model_name} speakers={len(speakers)}", flush=True)
+                model = genai.GenerativeModel(model_name)
+                resp = model.generate_content(prompt)
+                raw = (resp.text or '').strip()
+                used_model = model_name
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[GEMINI-RETRY] model={model_name} failed: {exc}", flush=True)
+
+        if not used_model:
+            raise RuntimeError(f'All Gemini model candidates failed: {last_exc}')
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        parsed = json.loads(raw)
+        arr = parsed.get('speakers') if isinstance(parsed, dict) else None
+        if not isinstance(arr, list):
+            raise RuntimeError('Gemini speaker classifier returned invalid schema')
+
+        allowed_roles = {'profesor', 'estudiante', 'entrevistador', 'narrador', 'otro'}
+        allowed_gender = {'hombre', 'mujer', 'indeterminado'}
+        cleaned = []
+        for it in arr:
+            spk = re.sub(r'[^a-zA-Z0-9_-]', '-', str(it.get('speaker_id', ''))).strip()
+            if not spk:
+                continue
+            role = str(it.get('role_label', 'otro')).strip().lower()
+            if role not in allowed_roles:
+                role = 'otro'
+            gender = str(it.get('gender_label', 'indeterminado')).strip().lower()
+            if gender not in allowed_gender:
+                gender = 'indeterminado'
+            try:
+                confidence = float(it.get('confidence', 0.5))
+            except Exception:
+                confidence = 0.5
+            confidence = max(0.0, min(1.0, confidence))
+            notes = str(it.get('notes', '')).strip()[:240]
+            cleaned.append({
+                'speaker_id': spk,
+                'role_label': role,
+                'gender_label': gender,
+                'confidence': confidence,
+                'notes': notes,
+            })
+
+        identity = {
+            'created_at': datetime.utcnow().isoformat() + 'Z',
+            'model': used_model,
+            'speakers': cleaned,
+        }
+        out_cache = Path(self.cfg.cache_folder) / 'speaker_identity.json'
+        out_target = Path(self.cfg.target_dir) / 'speaker_identity.json'
+        data = json.dumps(identity, ensure_ascii=False, indent=2)
+        out_cache.write_text(data, encoding='utf-8')
+        out_target.write_text(data, encoding='utf-8')
+        print(f"[GEMINI-SUCCESS] wrote speaker_identity.json speakers={len(cleaned)}", flush=True)
+
+    def run_speaker_analysis(self) -> None:
+        """Phase 1 analysis: build speaker profile + AI identity without dubbing.
+
+        Reads the translated SRTs and speaker.json from the cache, writes
+        speaker_profile.json and speaker_identity.json to both cache and target_dir,
+        then prints a sentinel line so the UI can detect completion.
+        """
         subs = tools.get_subtitle_from_srt(self.cfg.target_sub)
         source_subs = tools.get_subtitle_from_srt(self.cfg.source_sub)
         speaker_marks = []
@@ -994,6 +1247,64 @@ class TransCreate(BaseTask):
                 speaker_marks = json.loads(speaker_json.read_text(encoding='utf-8'))
             except Exception:
                 speaker_marks = []
+
+        if not speaker_marks:
+            print(f"[ANALYZE] No speaker marks found — diarization may not have run.", flush=True)
+            print(f"ANALYZE_DONE:{self.cfg.target_dir}", flush=True)
+            return
+
+        try:
+            self._write_speaker_profile(subs=subs, source_subs=source_subs, speaker_marks=speaker_marks)
+        except Exception as exc:
+            logger.warning(f'speaker profile build failed: {exc}')
+
+        try:
+            self._classify_speakers_with_gemini()
+        except Exception as exc:
+            logger.warning(f'Gemini speaker classification skipped: {exc}')
+            print(f"[GEMINI-ERROR] {exc}", flush=True)
+
+        print(f"ANALYZE_DONE:{self.cfg.target_dir}", flush=True)
+
+    def _tts(self, daz_json=None) -> None:
+        queue_tts = []
+        subs = tools.get_subtitle_from_srt(self.cfg.target_sub)
+        source_subs = tools.get_subtitle_from_srt(self.cfg.source_sub)
+        speaker_marks = []
+        # Phase 1 copies speaker.json to target_dir; Phase 2 has a fresh cache_folder
+        # so we must check both locations.
+        speaker_json = Path(f"{self.cfg.cache_folder}/speaker.json")
+        if not speaker_json.exists():
+            speaker_json = Path(f"{self.cfg.target_dir}/speaker.json")
+        if speaker_json.exists():
+            try:
+                speaker_marks = json.loads(speaker_json.read_text(encoding='utf-8'))
+                # Also copy into the current cache_folder so downstream code can find it.
+                cache_copy = Path(f"{self.cfg.cache_folder}/speaker.json")
+                if not cache_copy.exists():
+                    import shutil as _shutil
+                    _shutil.copy2(str(speaker_json), str(cache_copy))
+            except Exception:
+                speaker_marks = []
+        if speaker_marks:
+            try:
+                self._write_speaker_profile(subs=subs, source_subs=source_subs, speaker_marks=speaker_marks)
+                self._classify_speakers_with_gemini()
+            except Exception as exc:
+                logger.warning(f'speaker profile/classification skipped: {exc}')
+                print(f"[GEMINI-ERROR] {exc}", flush=True)
+
+        external_speaker_map = self._load_external_speaker_map()
+        
+        # If diarization detected speakers but map only has 'default', replicate default voice to all detected speakers
+        if speaker_marks and 'default' in external_speaker_map and len(external_speaker_map) == 1:
+            default_ref = external_speaker_map['default']
+            unique_speakers = set(re.sub(r'[^a-zA-Z0-9_-]', '-', str(mark)).strip() for mark in speaker_marks if mark)
+            for spk_id in unique_speakers:
+                if spk_id and spk_id not in external_speaker_map:
+                    external_speaker_map[spk_id] = default_ref
+                    logger.debug(f"Assigned default voice ref to speaker: {spk_id}")
+        
         if len(subs) < 1:
             raise RuntimeError(f"SRT file error:{self.cfg.target_sub}")
         try:
@@ -1043,7 +1354,12 @@ class TransCreate(BaseTask):
             if str(voice).strip().lower() == 'clone' and self.cfg.tts_type in SUPPORT_CLONE:
                 if use_speaker_clone_refs and i < len(speaker_marks) and speaker_marks[i]:
                     safe_spk = re.sub(r'[^a-zA-Z0-9_-]', '-', str(speaker_marks[i]))
-                    tmp_dict['ref_wav'] = f"{self.cfg.cache_folder}/clone-{safe_spk}.wav"
+                    mapped_ref = external_speaker_map.get(safe_spk)
+                    if mapped_ref:
+                        tmp_dict['external_ref_wav'] = mapped_ref
+                        tmp_dict['ref_wav'] = f"{self.cfg.cache_folder}/external-{safe_spk}.wav"
+                    else:
+                        tmp_dict['ref_wav'] = f"{self.cfg.cache_folder}/clone-{safe_spk}.wav"
                     # Qwen clone can run with x_vector_only_mode when ref_text is empty.
                     # This avoids mismatches when using one shared reference per speaker.
                     tmp_dict['ref_text'] = ''
@@ -1112,9 +1428,14 @@ class TransCreate(BaseTask):
         # gets more material, producing a more accurate voice embedding.
         MAX_REF_MS = 60_000  # max 60 seconds of reference audio per speaker
         ref_segment_groups = {}  # ref_wav -> list of (duration_ms, item)
+        external_ref_targets = {}  # ref_wav -> external source file
         for item in self.queue_tts:
             ref_wav = item.get('ref_wav')
             if not ref_wav:
+                continue
+            external_ref = item.get('external_ref_wav')
+            if external_ref:
+                external_ref_targets[ref_wav] = external_ref
                 continue
             duration = int(item.get('end_time', 0)) - int(item.get('start_time', 0))
             ref_segment_groups.setdefault(ref_wav, []).append((duration, item))
@@ -1126,6 +1447,23 @@ class TransCreate(BaseTask):
         # Store total duration per ref_wav to later decide on emotion flag.
         # This info will be used in tts_fun to adjust temperature.
         self.ref_wav_durations = {}  # ref_wav -> total_duration_ms
+
+        # Materialize external mapped references into cache ref paths.
+        for ref_wav, src in external_ref_targets.items():
+            try:
+                tools.runffmpeg([
+                    '-y',
+                    '-i', str(src),
+                    '-acodec', 'pcm_s16le',
+                    '-ar', '16000',
+                    '-ac', '1',
+                    ref_wav,
+                ])
+                ms = int(tools.get_audio_time(ref_wav) or 0)
+                self.ref_wav_durations[ref_wav] = ms
+                logger.debug(f'External reference ready: {ref_wav} from {src}, {ms}ms total')
+            except Exception as e:
+                logger.exception(f'Failed to prepare external reference {src} -> {ref_wav}: {e}', exc_info=True)
 
         # 裁切对应片段为参考音频，多段则拼接
         def _srt_time_to_seconds(val) -> float:
@@ -1214,9 +1552,11 @@ class TransCreate(BaseTask):
 
         from concurrent.futures import ThreadPoolExecutor
         jobs = list(ref_segment_groups.items())
-        with ThreadPoolExecutor(max_workers=min(12, len(jobs), os.cpu_count())) as pool:
-            futs = [pool.submit(_build_ref_for_speaker, rw, segs) for rw, segs in jobs]
-            _ = [f.result() for f in futs]
+        if jobs:  # Only create thread pool if there are jobs to process
+            with ThreadPoolExecutor(max_workers=min(12, len(jobs), os.cpu_count())) as pool:
+                futs = [pool.submit(_build_ref_for_speaker, rw, segs) for rw, segs in jobs]
+                _ = [f.result() for f in futs]
+        logger.debug(f"_create_ref_from_vocal: processed {len(external_ref_targets)} external refs, {len(jobs)} speaker segment groups")
 
     # 添加背景音乐
     def _back_music(self) -> None:
