@@ -40,6 +40,7 @@ def is_connect_hf():
 
 # 从 huggingface.co 下载完整模型，先本地下载，失败则在线下载
 def check_and_down_hf(model_id, repo_id, local_dir, callback=None) -> bool:
+    offline_mode = str(os.environ.get("PYVIDEOTRANS_OFFLINE_MODE", "0")).strip().lower() in ("1", "true", "yes", "on")
     try:
         if model_id in FASTER_MODELS_DICT and (defaulelang == 'zh' or is_connect_hf() is False):
             if model_id == 'turbo':
@@ -67,6 +68,10 @@ def check_and_down_hf(model_id, repo_id, local_dir, callback=None) -> bool:
                 local_files_only=True
             )
         except LocalEntryNotFoundError:
+            if offline_mode:
+                raise RuntimeError(
+                    f"[OFFLINE MODE] Missing local HF model: {repo_id}. Expected at: {local_dir}"
+                )
             Path(local_dir).mkdir(exist_ok=True, parents=True)
             MyTqdmClass = None
             if callback:
@@ -252,6 +257,7 @@ def down_zip(local_dir, zip_url, callback=None) -> bool:
 def check_and_down_ms(model_id, callback=None, local_dir=None) -> bool:
     from modelscope.hub.callback import ProgressCallback, TqdmCallback
     from modelscope.hub.snapshot_download import snapshot_download
+    offline_mode = str(os.environ.get("PYVIDEOTRANS_OFFLINE_MODE", "0")).strip().lower() in ("1", "true", "yes", "on")
     class Pro(TqdmCallback):
         def __init__(self, *args):
             super().__init__(*args)
@@ -278,6 +284,11 @@ def check_and_down_ms(model_id, callback=None, local_dir=None) -> bool:
             if callback:
                 callback(f'{model_id} exists')
         except ValueError  as e:
+            if offline_mode:
+                _expected = f'{ROOT_DIR}/models/models/{model_id}/' if not local_dir else local_dir
+                raise RuntimeError(
+                    f"[OFFLINE MODE] Missing local ModelScope model: {model_id}. Expected at: {_expected}"
+                )
             if callback:
                 callback(f'{model_id}')
             snapshot_download(model_id=model_id, progress_callbacks=[Pro], local_dir=local_dir, max_workers=1)

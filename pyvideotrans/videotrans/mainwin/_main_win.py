@@ -17,7 +17,8 @@ import subprocess
 
 from videotrans.util.req_fac import custom_session_factory
 import huggingface_hub
-huggingface_hub.configure_http_backend(backend_factory=custom_session_factory)
+if hasattr(huggingface_hub, 'configure_http_backend'):
+    huggingface_hub.configure_http_backend(backend_factory=custom_session_factory)
 
 from videotrans.configure import config
 config.init_run()

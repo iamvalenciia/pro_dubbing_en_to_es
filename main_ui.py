@@ -63,6 +63,29 @@ STATIC_VOICE_OPTIONS = [
 STATIC_VOICE_LABELS = [it["label"] for it in STATIC_VOICE_OPTIONS]
 STATIC_VOICE_REF_BY_LABEL = {it["label"]: it["ref_id"] for it in STATIC_VOICE_OPTIONS}
 
+SUBTITLE_STYLE_PRESET_LABELS = {
+    "Documental limpio": "documental_limpio",
+    "YouTube moderno": "youtube_moderno",
+    "Caja negra broadcast": "caja_negra_broadcast",
+}
+SUBTITLE_STYLE_PRESET_LABELS_REV = {v: k for k, v in SUBTITLE_STYLE_PRESET_LABELS.items()}
+SUBTITLE_COLOR_OPTIONS = {
+    "Blanco": "#FFFFFF",
+    "Amarillo": "#F9E547",
+    "Cian": "#8BE9FD",
+    "Verde menta": "#A8F0C6",
+}
+SUBTITLE_BORDER_OPTIONS = {
+    "Negro": "#000000",
+    "Azul noche": "#18243A",
+    "Marfil": "#F3E7C9",
+}
+SUBTITLE_BOX_OPTIONS = {
+    "Negro": "#000000",
+    "Grafito": "#202020",
+    "Azul oscuro": "#132033",
+}
+
 if PYVIDEOTRANS_ROOT not in sys.path:
     sys.path.insert(0, PYVIDEOTRANS_ROOT)
 
@@ -72,6 +95,13 @@ except ImportError:
     print("Warning: subtitle_ui_wrapper not available")
     ui_generate_subtitles = None
     ui_render_subtitles = None
+
+try:
+    from subtitle_renderer import build_style_config, render_subtitle_preview_on_frame
+except ImportError:
+    print("Warning: subtitle_renderer helpers not available")
+    build_style_config = None
+    render_subtitle_preview_on_frame = None
 
 try:
     from reel_ui_wrapper import ui_analyze_reels, ui_render_reel
@@ -374,6 +404,7 @@ body,
 .speaker-voice-dd {
     position: relative !important;
     z-index: 1500 !important;
+    isolation: isolate;
     overflow: visible !important;
 }
 
@@ -392,11 +423,49 @@ body,
 }
 
 .speaker-voice-dd ul.options {
-    top: calc(100% + 6px) !important;
-    bottom: auto !important;
+    top: auto !important;
+    bottom: calc(100% + 6px) !important;
     z-index: 20001 !important;
     max-height: min(260px, 42vh) !important;
+    border: 1px solid var(--qdp-border-strong) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 18px 40px rgba(15, 23, 42, 0.18) !important;
+    background: rgba(255, 252, 247, 0.98) !important;
     overflow-y: auto !important;
+    overscroll-behavior: contain !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(32, 58, 103, 0.42) rgba(32, 58, 103, 0.08);
+}
+
+.speaker-voice-dd ul.options::-webkit-scrollbar {
+    width: 9px;
+}
+
+.speaker-voice-dd ul.options::-webkit-scrollbar-track {
+    background: rgba(32, 58, 103, 0.08);
+    border-radius: 999px;
+}
+
+.speaker-voice-dd ul.options::-webkit-scrollbar-thumb {
+    background: rgba(32, 58, 103, 0.35);
+    border-radius: 999px;
+}
+
+.speaker-voice-dd ul.options li,
+.speaker-voice-dd ul.options li span,
+.speaker-voice-dd .option {
+    font-size: 15px !important;
+    line-height: 1.35 !important;
+}
+
+.speaker-voice-dd ul.options li {
+    padding-top: 10px !important;
+    padding-bottom: 10px !important;
+}
+
+#qdp-frame-editor {
+    position: relative !important;
+    z-index: 1 !important;
 }
 
 .gr-group,
@@ -583,6 +652,72 @@ label,
         padding: 7px 10px !important;
         font-size: 10px !important;
         margin-bottom: 6px !important;
+    }
+
+    .speaker-voice-dd ul.options {
+        max-height: min(220px, 34vh) !important;
+        bottom: calc(100% + 4px) !important;
+    }
+
+    .speaker-voice-dd ul.options li,
+    .speaker-voice-dd ul.options li span,
+    .speaker-voice-dd .option {
+        font-size: 13px !important;
+        line-height: 1.28 !important;
+    }
+
+    .speaker-voice-dd ul.options li {
+        padding-top: 8px !important;
+        padding-bottom: 8px !important;
+    }
+}
+
+/* ─── Speaker Scroll Container (Dynamic) ─────────────────────────────── */
+#spk-scroll-container {
+    max-height: 70vh !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    padding-right: 6px !important;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(154, 123, 47, 0.4) rgba(154, 123, 47, 0.1);
+}
+
+#spk-scroll-container::-webkit-scrollbar {
+    width: 10px;
+}
+
+#spk-scroll-container::-webkit-scrollbar-track {
+    background: rgba(154, 123, 47, 0.05);
+    border-radius: 999px;
+}
+
+#spk-scroll-container::-webkit-scrollbar-thumb {
+    background: rgba(154, 123, 47, 0.35);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+}
+
+#spk-scroll-container::-webkit-scrollbar-thumb:hover {
+    background: rgba(154, 123, 47, 0.55);
+    background-clip: content-box;
+}
+
+@media (prefers-color-scheme: dark) {
+    #spk-scroll-container {
+        scrollbar-color: rgba(214, 180, 106, 0.4) rgba(214, 180, 106, 0.1);
+    }
+
+    #spk-scroll-container::-webkit-scrollbar-track {
+        background: rgba(214, 180, 106, 0.05);
+    }
+
+    #spk-scroll-container::-webkit-scrollbar-thumb {
+        background: rgba(214, 180, 106, 0.35);
+    }
+
+    #spk-scroll-container::-webkit-scrollbar-thumb:hover {
+        background: rgba(214, 180, 106, 0.55);
     }
 }
 """
@@ -931,6 +1066,93 @@ def _get_user_audios():
     return _list_network_files(_AUDIO_EXTS)
 
 
+def _resolve_subtitle_media_path(video_input) -> str | None:
+    if not video_input:
+        return None
+    if isinstance(video_input, str) and os.path.isfile(video_input):
+        return video_input
+    if isinstance(video_input, str):
+        return _parse_dropdown_choice(video_input, NETWORK_USER_INPUT)
+    return None
+
+
+def _resolve_file_component_path(file_value) -> str | None:
+    if not file_value:
+        return None
+    if isinstance(file_value, str):
+        return file_value if os.path.exists(file_value) else None
+    if isinstance(file_value, (tuple, list)) and file_value:
+        candidate = file_value[0]
+        return candidate if isinstance(candidate, str) and os.path.exists(candidate) else None
+    if isinstance(file_value, dict):
+        for key in ("path", "name"):
+            candidate = file_value.get(key)
+            if isinstance(candidate, str) and os.path.exists(candidate):
+                return candidate
+    return None
+
+
+def _subtitle_style_payload(
+    preset_label,
+    fontsize,
+    font_color_label,
+    border_color_label,
+    border_width,
+    box_enabled,
+    box_color_label,
+    box_opacity,
+    max_chars_per_line,
+    max_lines,
+    alignment,
+    position_preset,
+    margin_bottom,
+    line_spacing,
+    sample_text,
+):
+    preset_key = SUBTITLE_STYLE_PRESET_LABELS.get(preset_label, "documental_limpio")
+    return {
+        "preset": preset_key,
+        "fontsize": int(fontsize),
+        "font_color": SUBTITLE_COLOR_OPTIONS.get(font_color_label, "#FFFFFF"),
+        "border_color": SUBTITLE_BORDER_OPTIONS.get(border_color_label, "#000000"),
+        "border_width": int(border_width),
+        "box_enabled": bool(box_enabled),
+        "box_color": SUBTITLE_BOX_OPTIONS.get(box_color_label, "#000000"),
+        "box_opacity": float(box_opacity),
+        "max_chars_per_line": int(max_chars_per_line),
+        "max_lines": int(max_lines),
+        "alignment": str(alignment or "center").lower(),
+        "position_preset": str(position_preset or "bottom").lower(),
+        "bottom_margin": int(margin_bottom),
+        "line_spacing": int(line_spacing),
+        "sample_text": str(sample_text or "").strip() or "Este es un preview profesional de subtitulos en espanol.",
+    }
+
+
+def _subtitle_preset_updates(preset_label):
+    if build_style_config is None:
+        return tuple(gr.update() for _ in range(13))
+    style = build_style_config({"preset": SUBTITLE_STYLE_PRESET_LABELS.get(preset_label, "documental_limpio")})
+    font_color_label = next((label for label, value in SUBTITLE_COLOR_OPTIONS.items() if value.lower() == style.font_color.lower()), "Blanco")
+    border_color_label = next((label for label, value in SUBTITLE_BORDER_OPTIONS.items() if value.lower() == style.border_color.lower()), "Negro")
+    box_color_label = next((label for label, value in SUBTITLE_BOX_OPTIONS.items() if value.lower() == style.box_color.lower()), "Negro")
+    return (
+        gr.update(value=int(style.fontsize)),
+        gr.update(value=font_color_label),
+        gr.update(value=border_color_label),
+        gr.update(value=int(style.border_width)),
+        gr.update(value=bool(style.box_enabled)),
+        gr.update(value=box_color_label),
+        gr.update(value=float(style.box_opacity)),
+        gr.update(value=int(style.max_chars_per_line)),
+        gr.update(value=str(style.max_lines)),
+        gr.update(value=str(style.alignment)),
+        gr.update(value=str(style.position_preset)),
+        gr.update(value=int(style.bottom_margin)),
+        gr.update(value=int(style.line_spacing)),
+    )
+
+
 def _get_local_jsons():
     """Lee los timelines JSON generados en el entorno NVMe local.
     Retorna strings 'nombre.json  (12.3 KB)' — la reconstruccion a path
@@ -1113,16 +1335,20 @@ def _apply_video_enhancements(
 ):
     video_filter = _build_video_filter(brightness, contrast, saturation, sharpness)
 
-    # High-quality path only: hardware encode, fail fast on errors.
-    gpu_cmd = [
+    # A100/H100/datacenter GPUs do NOT have NVENC hardware encoder (only NvDec).
+    # Use CUDA-accelerated decode (-hwaccel cuda) which runs on GPU, then encode
+    # with libx264 ultrafast.  On A100's EPYC/Xeon CPUs this processes >300fps
+    # so a 30s clip finishes in under 1s — negligible cost.
+    cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-hwaccel", "cuda",          # GPU-accelerated decode (NvDec on A100)
         "-i", input_video,
         "-vf", video_filter,
-        "-c:v", "h264_nvenc", "-preset", "p4",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
         "-c:a", "copy",
         output_video,
     ]
-    subprocess.run(gpu_cmd, check=True)
+    subprocess.run(cmd, check=True)
 
 def run_phase1(
     video_file,
@@ -1132,7 +1358,7 @@ def run_phase1(
     Fase 1: ASR + traducción + diarización + análisis de speakers.
     Yields (phase_text, log, spk_section_update, *row_updates×6, btn_phase2_update, state_speakers_value).
     """
-    N = 6  # max speaker rows
+    N = N_SPK_MAX  # max speaker rows available in the UI
 
     def _empty_updates():
         """Return updates that hide everything."""
@@ -1227,6 +1453,7 @@ def run_phase1(
                 env=child_env,
             )
             analyze_re = re.compile(r"^ANALYZE_DONE:(.+)$")
+            analyze_done_seen = False
             for line in iter(process.stdout.readline, ""):
                 if line:
                     line_clean = line.strip()
@@ -1234,8 +1461,25 @@ def run_phase1(
                     m = analyze_re.match(line_clean)
                     if m:
                         result["target_dir"] = m.group(1).strip()
+                        analyze_done_seen = True
+                        break
 
-            process.wait()
+            if analyze_done_seen and process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    ui_log.warning(
+                        "Fase 1 recibió ANALYZE_DONE pero el proceso siguió abierto; la UI continúa con los artefactos ya generados."
+                    )
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+
+            if process.poll() is None:
+                process.wait()
             if process.returncode != 0:
                 raise RuntimeError(f"Fase 1 falló con código {process.returncode}")
 
@@ -1364,13 +1608,7 @@ def run_phase2(
     video_file,
     test_mode,
     state_speakers,
-    spk_voice_0, spk_voice_1, spk_voice_2, spk_voice_3, spk_voice_4, spk_voice_5,
-    spk_label_0, spk_label_1, spk_label_2, spk_label_3, spk_label_4, spk_label_5,
-    apply_video_fx,
-    brightness,
-    contrast,
-    color,
-    sharpness,
+    *speaker_and_render_args,
 ):
     """
     Fase 2: Doblaje completo usando el mapa de voz elegido en la UI.
@@ -1385,13 +1623,24 @@ def run_phase2(
         yield "Error", f"Archivo inválido: {video_path}", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
         return
 
+    expected_tail_args = 6
+    expected_speaker_args = N_SPK_MAX * 2
+    if len(speaker_and_render_args) < expected_speaker_args + expected_tail_args:
+        raise RuntimeError(
+            f"Fase 2 recibió {len(speaker_and_render_args)} argumentos dinámicos; se esperaban al menos {expected_speaker_args + expected_tail_args}."
+        )
+
+    voice_inputs = list(speaker_and_render_args[:N_SPK_MAX])
+    label_inputs = list(speaker_and_render_args[N_SPK_MAX:expected_speaker_args])
+    tail_args = list(speaker_and_render_args[expected_speaker_args:expected_speaker_args + expected_tail_args])
+    apply_video_fx, backaudio_volume, brightness, contrast, color, sharpness = tail_args
+
     # --- Write speaker voice map from UI assignments ---
-    voice_inputs = [spk_voice_0, spk_voice_1, spk_voice_2, spk_voice_3, spk_voice_4, spk_voice_5]
     active_speakers = state_speakers or []
     catalog = _load_voice_catalog()
     by_ref = {it["ref_id"]: it for it in catalog}
     speaker_map = {}
-    for i, spk_data in enumerate(active_speakers[:6]):
+    for i, spk_data in enumerate(active_speakers[:N_SPK_MAX]):
         choice = voice_inputs[i]
         if not choice:
             continue
@@ -1402,10 +1651,13 @@ def run_phase2(
         ref_entry = by_ref.get(ref_id)
         if ref_entry:
             sid = spk_data["speaker_id"]
+            chosen_label = str(label_inputs[i]).strip() if i < len(label_inputs) and label_inputs[i] else ""
             speaker_map[sid] = {
                 "ref": ref_entry["normalized_path"],
                 "ref_id": ref_id,
             }
+            if chosen_label:
+                speaker_map[sid]["label"] = chosen_label
     _ensure_dirs()
     with open(VOICE_SPEAKER_MAP, "w", encoding="utf-8") as f:
         json.dump(speaker_map, f, indent=2, ensure_ascii=False)
@@ -1463,6 +1715,7 @@ def run_phase2(
                 "--translate_type", str(translate_type),
                 "--tts_type", str(tts_type),
                 "--cuda",
+                "--no-clear-cache",
                 "--subtitle_type", "0",
                 "--video_autorate",
                 "--voice_role", "clone",
@@ -1482,9 +1735,13 @@ def run_phase2(
             child_env.setdefault("HF_HUB_CACHE", os.path.expanduser("~/.cache/huggingface/hub"))
             child_env.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
             child_env = _inject_ai_env_to_child(child_env)
+            child_env["QDP_BACKAUDIO_VOLUME"] = str(float(backaudio_volume))
+            child_env.setdefault("QDP_BACKAUDIO_SOURCE", "original")
             ui_log.info(
                 f"[ENV-PHASE2] gemini_api_set={bool(child_env.get('API_GOOGLE_STUDIO'))} "
-                f"gemini_model={child_env.get('GEMINI_MODEL', '')}"
+                f"gemini_model={child_env.get('GEMINI_MODEL', '')} "
+                f"backaudio_volume={child_env.get('QDP_BACKAUDIO_VOLUME', '')} "
+                f"backaudio_source={child_env.get('QDP_BACKAUDIO_SOURCE', '')}"
             )
             sox_candidates = [
                 os.path.join(PYVIDEOTRANS_ROOT, "ffmpeg", "sox"),
@@ -1732,6 +1989,7 @@ def run_pyvideotrans_pipeline(
                 "--translate_type", str(translate_type),
                 "--tts_type", str(tts_type),
                 "--cuda",
+                "--no-clear-cache",
                 "--subtitle_type", "0",  # Sin subs quemados (como requiere el SPEC)
                 "--video_autorate"       # Delega la isocronía a pyvideotrans
             ]
@@ -2034,40 +2292,45 @@ with gr.Blocks(
             btn_phase1 = gr.Button("Analizar video (Fase 1)", variant="secondary", size="lg")
 
             # ── SPEAKER SECTION (oculto hasta completar Fase 1) ─────────────────
-            N_SPK_MAX = 6
+            # Configuración dinámica de speakers (máximo 50)
+            N_SPK_MAX = int(os.environ.get("PYVIDEOTRANS_MAX_SPEAKERS", "50"))
+            N_SPK_MAX = max(12, min(N_SPK_MAX, 100))  # Rango 12-100
             _initial_voice_choices = STATIC_VOICE_LABELS[:]
 
             with gr.Column(visible=False) as spk_section:
                 gr.Markdown("### 🗣️ Speakers detectados — Asigna una voz a cada speaker")
+                gr.Markdown(f"*Máximo {N_SPK_MAX} speakers soportados. Usa `PYVIDEOTRANS_MAX_SPEAKERS` para personalizar.*")
 
                 # Pre-build N_SPK_MAX rows; Phase 1 callback makes them visible
-                spk_groups = []
-                spk_id_boxes = []
-                spk_label_boxes = []
-                spk_voice_dds = []
-                for _i in range(N_SPK_MAX):
-                    with gr.Group(visible=False) as _grp:
-                        with gr.Row():
-                            _id_box = gr.Textbox(
-                                label="ID", value=f"spk{_i}", interactive=False,
-                                scale=1, min_width=80,
-                            )
-                            _label_box = gr.Textbox(
-                                label="Identidad IA (editable)", interactive=True,
-                                scale=2,
-                            )
-                            _voice_dd = gr.Dropdown(
-                                label="Voz de referencia",
-                                choices=_initial_voice_choices,
-                                value=_initial_voice_choices[0] if _initial_voice_choices else None,
-                                interactive=True,
-                                scale=3,
-                                elem_classes=["speaker-voice-dd"],
-                            )
-                    spk_groups.append(_grp)
-                    spk_id_boxes.append(_id_box)
-                    spk_label_boxes.append(_label_box)
-                    spk_voice_dds.append(_voice_dd)
+                # Contenedor con scroll para muchos speakers
+                with gr.Group(elem_id="spk-scroll-container"):
+                    spk_groups = []
+                    spk_id_boxes = []
+                    spk_label_boxes = []
+                    spk_voice_dds = []
+                    for _i in range(N_SPK_MAX):
+                        with gr.Group(visible=False) as _grp:
+                            with gr.Row():
+                                _id_box = gr.Textbox(
+                                    label="ID", value=f"spk{_i}", interactive=False,
+                                    scale=1, min_width=80,
+                                )
+                                _label_box = gr.Textbox(
+                                    label="Identidad IA (editable)", interactive=True,
+                                    scale=2,
+                                )
+                                _voice_dd = gr.Dropdown(
+                                    label="Voz de referencia",
+                                    choices=_initial_voice_choices,
+                                    value=_initial_voice_choices[0] if _initial_voice_choices else None,
+                                    interactive=True,
+                                    scale=3,
+                                    elem_classes=["speaker-voice-dd"],
+                                )
+                        spk_groups.append(_grp)
+                        spk_id_boxes.append(_id_box)
+                        spk_label_boxes.append(_label_box)
+                        spk_voice_dds.append(_voice_dd)
 
             # State to pass detected speakers to Phase 2
             state_speakers = gr.State([])
@@ -2077,41 +2340,51 @@ with gr.Blocks(
                 "Doblar con voces asignadas (Fase 2)", variant="primary", size="lg", visible=False,
             )
 
-            gr.Markdown("### 🖼️ Editor de Frame (Referencia de Color)")
-            with gr.Row():
-                frame_second = gr.Slider(
-                    minimum=0,
-                    maximum=300,
-                    step=1,
-                    value=10,
-                    label="Segundo del video para extraer frame",
+            with gr.Column(elem_id="qdp-frame-editor"):
+                gr.Markdown("### 🖼️ Editor de Frame (Referencia de Color)")
+                with gr.Row():
+                    frame_second = gr.Slider(
+                        minimum=0,
+                        maximum=300,
+                        step=1,
+                        value=10,
+                        label="Segundo del video para extraer frame",
+                        interactive=True,
+                    )
+                    btn_extract_frame = gr.Button("Extraer frame", variant="secondary")
+
+                with gr.Row():
+                    slider_brightness = gr.Slider(0.5, 1.8, value=1.0, step=0.05, label="Brillo")
+                    slider_contrast = gr.Slider(0.5, 1.8, value=1.0, step=0.05, label="Contraste")
+                    slider_color = gr.Slider(0.5, 1.8, value=1.0, step=0.05, label="Color")
+                    slider_sharpness = gr.Slider(0.5, 2.5, value=1.0, step=0.05, label="Nitidez")
+
+                with gr.Row():
+                    frame_original = gr.Image(label="Frame Original", interactive=False, type="filepath")
+                    frame_adjusted = gr.Image(label="Frame Ajustado", interactive=False, type="filepath")
+
+                btn_apply_frame = gr.Button("Aplicar ajustes al frame", variant="secondary")
+                ui_frame_log = gr.Textbox(
+                    label="Log Editor de Frame",
+                    interactive=False,
+                    lines=2,
+                    value="Esperando extracción de frame...",
+                )
+
+                cb_apply_video_fx = gr.Checkbox(
+                    label="Aplicar estos ajustes al video final doblado",
+                    value=True,
                     interactive=True,
                 )
-                btn_extract_frame = gr.Button("Extraer frame", variant="secondary")
 
-            with gr.Row():
-                slider_brightness = gr.Slider(0.5, 1.8, value=1.0, step=0.05, label="Brillo")
-                slider_contrast = gr.Slider(0.5, 1.8, value=1.0, step=0.05, label="Contraste")
-                slider_color = gr.Slider(0.5, 1.8, value=1.0, step=0.05, label="Color")
-                slider_sharpness = gr.Slider(0.5, 2.5, value=1.0, step=0.05, label="Nitidez")
-
-            with gr.Row():
-                frame_original = gr.Image(label="Frame Original", interactive=False, type="filepath")
-                frame_adjusted = gr.Image(label="Frame Ajustado", interactive=False, type="filepath")
-
-            btn_apply_frame = gr.Button("Aplicar ajustes al frame", variant="secondary")
-            ui_frame_log = gr.Textbox(
-                label="Log Editor de Frame",
-                interactive=False,
-                lines=2,
-                value="Esperando extracción de frame...",
-            )
-
-            cb_apply_video_fx = gr.Checkbox(
-                label="Aplicar estos ajustes al video final doblado",
-                value=True,
-                interactive=True,
-            )
+                slider_backaudio_volume = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=0.28,
+                    step=0.01,
+                    label="Volumen de audio original de fondo",
+                    interactive=True,
+                )
 
             ui_active_phase = gr.Textbox(label="Fase Activa", value="Esperando inicio...", interactive=False, lines=1)
             ui_terminal = gr.Textbox(label="Terminal de Logs", elem_id="qdp-log", interactive=False, lines=15, autoscroll=True)
@@ -2151,14 +2424,116 @@ with gr.Blocks(
                     scale=2
                 )
                 btn_refresh_subs = gr.Button("Refrescar videos", scale=1, min_width=120)
-            
-            dd_subs_lang = gr.Dropdown(
-                choices=["es", "en", "fr", "de", "pt", "zh"],
-                value="es",
-                label="Idioma para subtitulos",
-                interactive=True
-            )
-            
+
+            with gr.Row():
+                dd_subs_lang = gr.Dropdown(
+                    choices=["es", "en", "fr", "de", "pt", "zh"],
+                    value="es",
+                    label="Idioma para subtitulos",
+                    interactive=True,
+                    scale=1,
+                )
+                cb_subs_preview_mode = gr.Checkbox(
+                    label="Modo preview de 30 segundos",
+                    value=False,
+                    interactive=True,
+                    scale=1,
+                )
+
+            with gr.Group():
+                gr.Markdown("### 🧩 Preview y estilo de subtítulos")
+                gr.Markdown(
+                    "Extrae un frame del video y úsalo como template para ajustar el look de los subtítulos antes de renderizar."
+                )
+
+                with gr.Row():
+                    subs_frame_second = gr.Slider(
+                        minimum=0,
+                        maximum=300,
+                        step=1,
+                        value=12,
+                        label="Segundo del video para extraer frame",
+                        interactive=True,
+                        scale=3,
+                    )
+                    btn_extract_subs_frame = gr.Button("Extraer frame base", variant="secondary", scale=1)
+                    btn_apply_subs_style_preview = gr.Button("Actualizar preview de subtítulos", variant="secondary", scale=1)
+
+                with gr.Row():
+                    dd_subs_preset = gr.Dropdown(
+                        choices=list(SUBTITLE_STYLE_PRESET_LABELS.keys()),
+                        value="Documental limpio",
+                        label="Preset visual",
+                        interactive=True,
+                        scale=1,
+                    )
+                    tb_subs_sample_text = gr.Textbox(
+                        label="Texto de preview",
+                        value="Es totalmente posible que a los iraníes les vaya a ir mal.",
+                        interactive=True,
+                        scale=2,
+                    )
+
+                with gr.Row():
+                    slider_subs_fontsize = gr.Slider(36, 96, value=60, step=2, label="Tamaño de fuente")
+                    dd_subs_font_color = gr.Dropdown(
+                        choices=list(SUBTITLE_COLOR_OPTIONS.keys()),
+                        value="Blanco",
+                        label="Color de texto",
+                        interactive=True,
+                    )
+                    dd_subs_border_color = gr.Dropdown(
+                        choices=list(SUBTITLE_BORDER_OPTIONS.keys()),
+                        value="Negro",
+                        label="Color de borde",
+                        interactive=True,
+                    )
+                    slider_subs_border_width = gr.Slider(0, 8, value=4, step=1, label="Grosor de borde")
+
+                with gr.Row():
+                    cb_subs_box_enabled = gr.Checkbox(label="Caja de fondo", value=False, interactive=True)
+                    dd_subs_box_color = gr.Dropdown(
+                        choices=list(SUBTITLE_BOX_OPTIONS.keys()),
+                        value="Negro",
+                        label="Color de caja",
+                        interactive=True,
+                    )
+                    slider_subs_box_opacity = gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Opacidad de caja")
+                    slider_subs_max_chars = gr.Slider(18, 52, value=34, step=1, label="Máx. caracteres por línea")
+
+                with gr.Row():
+                    dd_subs_max_lines = gr.Dropdown(
+                        choices=["1", "2"],
+                        value="2",
+                        label="Número de líneas",
+                        interactive=True,
+                    )
+                    dd_subs_alignment = gr.Dropdown(
+                        choices=["center", "left", "right"],
+                        value="center",
+                        label="Alineación",
+                        interactive=True,
+                    )
+                    dd_subs_position = gr.Dropdown(
+                        choices=["top", "middle", "bottom"],
+                        value="bottom",
+                        label="Posición vertical",
+                        interactive=True,
+                    )
+                    slider_subs_bottom_margin = gr.Slider(20, 180, value=72, step=2, label="Margen inferior")
+                    slider_subs_line_spacing = gr.Slider(0, 24, value=10, step=1, label="Espaciado entre líneas")
+
+                with gr.Row():
+                    frame_original_subs = gr.Image(label="Frame base", interactive=False, type="filepath")
+                    frame_preview_subs = gr.Image(label="Preview de subtítulos", interactive=False, type="filepath")
+
+                ui_subs_style_log = gr.Textbox(
+                    label="Log de preview de subtítulos",
+                    interactive=False,
+                    lines=2,
+                    value="Extrae un frame y ajusta el estilo del subtítulo.",
+                )
+
             with gr.Row():
                 btn_gen_subs = gr.Button("Generar subtitulos", variant="primary", scale=1)
                 btn_render_subs = gr.Button("Renderizar video con subtitulos", scale=1)
@@ -2282,7 +2657,7 @@ with gr.Blocks(
     # =====================================================================
     
     # Helpers para subtítulos
-    def handle_subtitle_generation(video_input, lang):
+    def handle_subtitle_generation(video_input, lang, preview_mode):
         """Generar subtítulos del video doblado."""
         if not video_input:
             return "", "", "❌ Selecciona un video primero"
@@ -2290,18 +2665,21 @@ with gr.Blocks(
         try:
             if ui_generate_subtitles is None:
                 return "", "", "❌ Módulo de subtítulos no disponible"
-            
-            # Determinar si es un archivo o una ruta
-            if isinstance(video_input, str) and os.path.exists(video_input):
-                video_path = video_input
-            else:
+
+            video_path = _resolve_subtitle_media_path(video_input)
+            if not video_path or not os.path.exists(video_path):
                 return "", "", "❌ Video no encontrado"
-            
+
             # Ejecutar en background
             def update_log(msg):
                 ui_log.info(msg)
-            
-            srt, json_file, msg = ui_generate_subtitles(video_path, lang, update_log)
+
+            srt, json_file, msg = ui_generate_subtitles(
+                video_path,
+                lang,
+                update_log,
+                preview_duration_sec=30.0 if preview_mode else None,
+            )
             
             # Preparar archivos para descarga
             srt_obj = (srt, Path(srt).name) if os.path.exists(srt) else None
@@ -2312,7 +2690,26 @@ with gr.Blocks(
         except Exception as e:
             return "", "", f"❌ Error: {str(e)}"
     
-    def handle_subtitle_rendering(video_input, srt_path):
+    def handle_subtitle_rendering(
+        video_input,
+        srt_path,
+        preview_mode,
+        preset_label,
+        fontsize,
+        font_color_label,
+        border_color_label,
+        border_width,
+        box_enabled,
+        box_color_label,
+        box_opacity,
+        max_chars_per_line,
+        max_lines,
+        alignment,
+        position_preset,
+        margin_bottom,
+        line_spacing,
+        sample_text,
+    ):
         """Renderizar video con subtítulos."""
         if not video_input:
             return "", "❌ Selecciona un video primero"
@@ -2323,27 +2720,159 @@ with gr.Blocks(
         try:
             if ui_render_subtitles is None:
                 return "", "❌ Módulo de subtítulos no disponible"
-            
-            # Determinar si es un archivo o una ruta
-            if isinstance(video_input, str) and os.path.exists(video_input):
-                video_path = video_input
-            else:
+
+            video_path = _resolve_subtitle_media_path(video_input)
+            if not video_path or not os.path.exists(video_path):
                 return "", "❌ Video no encontrado"
+
+            subtitle_file_path = _resolve_file_component_path(srt_path)
+            if not subtitle_file_path:
+                return "", "❌ No se pudo resolver el archivo SRT para renderizar"
 
             # Render requiere fuente de video. Si es audio, sugerir usar un video.
             if Path(video_path).suffix.lower() in {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}:
                 return "", "❌ Para renderizar subtítulos sobre imagen, selecciona un archivo de video. El audio sí sirve para generar SRT/JSON."
+
+            style_config = _subtitle_style_payload(
+                preset_label,
+                fontsize,
+                font_color_label,
+                border_color_label,
+                border_width,
+                box_enabled,
+                box_color_label,
+                box_opacity,
+                max_chars_per_line,
+                max_lines,
+                alignment,
+                position_preset,
+                margin_bottom,
+                line_spacing,
+                sample_text,
+            )
             
             # Ejecutar en background
             def update_log(msg):
                 ui_log.info(msg)
             
-            output_video, msg = ui_render_subtitles(video_path, srt_path, 'srt', update_log)
+            output_video, msg = ui_render_subtitles(
+                video_path,
+                subtitle_file_path,
+                'srt',
+                update_log,
+                style_config=style_config,
+                preview_duration_sec=30.0 if preview_mode else None,
+            )
             
             return output_video, msg
         
         except Exception as e:
             return "", f"❌ Error: {str(e)}"
+
+    def handle_extract_subtitle_frame(
+        video_input,
+        second,
+        preset_label,
+        fontsize,
+        font_color_label,
+        border_color_label,
+        border_width,
+        box_enabled,
+        box_color_label,
+        box_opacity,
+        max_chars_per_line,
+        max_lines,
+        alignment,
+        position_preset,
+        margin_bottom,
+        line_spacing,
+        sample_text,
+    ):
+        if extract_frame is None or render_subtitle_preview_on_frame is None:
+            return None, None, "❌ Preview de subtítulos no disponible"
+        video_path = _resolve_subtitle_media_path(video_input)
+        if not video_path or not os.path.isfile(video_path):
+            return None, None, "❌ Selecciona un video válido primero"
+        if Path(video_path).suffix.lower() in {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}:
+            return None, None, "❌ El preview visual necesita un video, no solo audio"
+        try:
+            frame_path = extract_frame(video_path, LOCAL_TEMP, float(second))
+            style_config = _subtitle_style_payload(
+                preset_label,
+                fontsize,
+                font_color_label,
+                border_color_label,
+                border_width,
+                box_enabled,
+                box_color_label,
+                box_opacity,
+                max_chars_per_line,
+                max_lines,
+                alignment,
+                position_preset,
+                margin_bottom,
+                line_spacing,
+                sample_text,
+            )
+            preview_path = render_subtitle_preview_on_frame(
+                frame_path,
+                style_config=style_config,
+                sample_text=style_config.get("sample_text"),
+                output_path=os.path.join(LOCAL_TEMP, "subtitle_style_preview.jpg"),
+            )
+            return frame_path, preview_path, f"✅ Frame y preview generados en t={int(second)}s"
+        except Exception as exc:
+            return None, None, f"❌ Error generando preview: {exc}"
+
+    def handle_update_subtitle_style_preview(
+        frame_input,
+        preset_label,
+        fontsize,
+        font_color_label,
+        border_color_label,
+        border_width,
+        box_enabled,
+        box_color_label,
+        box_opacity,
+        max_chars_per_line,
+        max_lines,
+        alignment,
+        position_preset,
+        margin_bottom,
+        line_spacing,
+        sample_text,
+    ):
+        if render_subtitle_preview_on_frame is None:
+            return None, "❌ Preview de subtítulos no disponible"
+        if not frame_input:
+            return None, "❌ Extrae un frame base primero"
+        try:
+            style_config = _subtitle_style_payload(
+                preset_label,
+                fontsize,
+                font_color_label,
+                border_color_label,
+                border_width,
+                box_enabled,
+                box_color_label,
+                box_opacity,
+                max_chars_per_line,
+                max_lines,
+                alignment,
+                position_preset,
+                margin_bottom,
+                line_spacing,
+                sample_text,
+            )
+            preview_path = render_subtitle_preview_on_frame(
+                frame_input,
+                style_config=style_config,
+                sample_text=style_config.get("sample_text"),
+                output_path=os.path.join(LOCAL_TEMP, "subtitle_style_preview.jpg"),
+            )
+            return preview_path, "✅ Preview de subtítulos actualizado"
+        except Exception as exc:
+            return None, f"❌ Error actualizando preview: {exc}"
     
     def update_subs_video_dropdown():
         media_files = _get_user_videos() + _get_user_audios()
@@ -2456,7 +2985,7 @@ with gr.Blocks(
     )
 
     # ── Phase 1: Analizar speakers ────────────────────────────────────────────
-    # Outputs: phase_text, log, spk_section, 6×(group, id, label, dd), btn_phase2, state
+    # Outputs: phase_text, log, spk_section, N_SPK_MAX×(group, id, label, dd), btn_phase2, state
     _p1_outputs = (
         [ui_active_phase, ui_terminal, spk_section]
         + [comp for i in range(N_SPK_MAX)
@@ -2476,9 +3005,10 @@ with gr.Blocks(
         run_phase2,
         inputs=[
             dd_video, cb_test_mode, state_speakers,
-            *spk_voice_dds,   # 6 voice dropdowns
-            *spk_label_boxes, # 6 label textboxes
-            cb_apply_video_fx, slider_brightness, slider_contrast, slider_color, slider_sharpness,
+            *spk_voice_dds,
+            *spk_label_boxes,
+            cb_apply_video_fx, slider_backaudio_volume,
+            slider_brightness, slider_contrast, slider_color, slider_sharpness,
         ],
         outputs=_p2_outputs,
     )
@@ -2486,16 +3016,65 @@ with gr.Blocks(
     # Tab 2: Subtítulos
     up_video_subs.upload(handle_subs_video_upload, inputs=[up_video_subs], outputs=[dd_video_subs])
     btn_refresh_subs.click(update_subs_video_dropdown, inputs=None, outputs=[dd_video_subs])
+    dd_subs_preset.change(
+        _subtitle_preset_updates,
+        inputs=[dd_subs_preset],
+        outputs=[
+            slider_subs_fontsize,
+            dd_subs_font_color,
+            dd_subs_border_color,
+            slider_subs_border_width,
+            cb_subs_box_enabled,
+            dd_subs_box_color,
+            slider_subs_box_opacity,
+            slider_subs_max_chars,
+            dd_subs_max_lines,
+            dd_subs_alignment,
+            dd_subs_position,
+            slider_subs_bottom_margin,
+            slider_subs_line_spacing,
+        ],
+    )
+
+    _subs_style_inputs = [
+        dd_subs_preset,
+        slider_subs_fontsize,
+        dd_subs_font_color,
+        dd_subs_border_color,
+        slider_subs_border_width,
+        cb_subs_box_enabled,
+        dd_subs_box_color,
+        slider_subs_box_opacity,
+        slider_subs_max_chars,
+        dd_subs_max_lines,
+        dd_subs_alignment,
+        dd_subs_position,
+        slider_subs_bottom_margin,
+        slider_subs_line_spacing,
+        tb_subs_sample_text,
+    ]
+
+    btn_extract_subs_frame.click(
+        handle_extract_subtitle_frame,
+        inputs=[dd_video_subs, subs_frame_second, *_subs_style_inputs],
+        outputs=[frame_original_subs, frame_preview_subs, ui_subs_style_log],
+    )
+
+    btn_apply_subs_style_preview.click(
+        handle_update_subtitle_style_preview,
+        inputs=[frame_original_subs, *_subs_style_inputs],
+        outputs=[frame_preview_subs, ui_subs_style_log],
+    )
     
     btn_gen_subs.click(
         handle_subtitle_generation,
-        inputs=[dd_video_subs, dd_subs_lang],
+        inputs=[dd_video_subs, dd_subs_lang, cb_subs_preview_mode],
         outputs=[file_srt, file_json, ui_subs_log]
     )
     
     btn_render_subs.click(
         handle_subtitle_rendering,
-        inputs=[dd_video_subs, file_srt],
+        inputs=[dd_video_subs, file_srt, cb_subs_preview_mode, *_subs_style_inputs],
         outputs=[out_video_subs, ui_subs_log]
     )
     

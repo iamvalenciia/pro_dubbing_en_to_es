@@ -202,7 +202,7 @@ def fix_punc(*, text_dict,  is_cuda=False, logs_file=None, device_index=0):
 # 4. ali_CAM阿里 说话人分离  https://modelscope.cn/models/iic/speech_campplus_speaker-diarization_common/files
 def cam_speakers(*, input_file, subtitles, num_speakers=-1,  is_cuda=False, logs_file=None,
                  device_index=0):
-    import torch, os, shutil, time
+    import torch, os, shutil, time, numpy as np
     from modelscope.pipelines import pipeline
     import platform
     if platform.system() == 'Darwin' and torch.backends.mps.is_available():
@@ -222,10 +222,46 @@ def cam_speakers(*, input_file, subtitles, num_speakers=-1,  is_cuda=False, logs
             disable_log=True,
             device=device
         )
+        
+        # NOTE: GPU Batch Optimization Documented
+        # ==========================================
+        # Root cause of low GPU utilization (15-30%):
+        # SegmentationClusteringPipeline.forward() in ModelScope iterates over 1.5s windows one-by-one,
+        # calling self.sv_pipeline([chunk], output_emb=True) for each window.
+        # For a 1-hour video: ~4000 segments → ~4000 separate GPU calls with batch_size=1
+        # This causes GPU kernel-launch overhead to dominate, preventing true parallelism.
+        #
+        # Mitigation Applied:
+        # - Attempting to apply batching optimization patch
+        # - Detailed logging to diagnose segment count and processing time
+        # - Environment variable PYVIDEOTRANS_DIARIZATION_BATCH_SIZE (default: 16)
+        #
+        # For details, see: pyvideotrans/videotrans/process/diarization_batching_patch.py
+        
+        _diar_start = time.time()
+        
+        # Attempt to apply batching optimization
+        try:
+            from videotrans.process.diarization_batching_patch import apply_diarization_batching
+            batch_size = int(os.environ.get('PYVIDEOTRANS_DIARIZATION_BATCH_SIZE', '16'))
+            ans = apply_diarization_batching(ans, batch_size=batch_size, num_speakers=num_speakers)
+            _batching_applied = True
+        except Exception as e:
+            logger.debug(f'Could not apply batching optimization: {e}')
+            _batching_applied = False
+        
         # 如果有先验信息，输入实际的说话人数，会得到更准确的预测结果
         # result 类似 {'text': [[0.0, 2.04, 0], [4.18, 24.97, 0], [25.33, 81.0, 0], [81.0, 97.55, 1], [99.49, 141.11, 0], [142.41, 155.93, 0], [158.28, 190.34, 0]]}
         result = ans(input_file, oracle_num=num_speakers, ignore_errors=True) if num_speakers > 1 else ans(input_file,
                                                                                                            ignore_errors=True)
+        
+        _diar_elapsed = time.time() - _diar_start
+        
+        # Diagnostic logging
+        if result and 'text' in result:
+            num_segments = len(result['text'])
+            rtf = (num_segments * 1.5 / 1000.0) / max(0.1, _diar_elapsed)  # Real-time factor
+            logger.info(f'[DIAR] Segments={num_segments}, RTF={rtf:.2f}x, elapsed={_diar_elapsed:.1f}s, device={device}, batching={"yes" if _batching_applied else "no"}')
         # 整理为 [ [[start_ms,end_ms],"spk\d"],... ]
         logger.debug(f'说话人分离原始返回结果:{result=}')
         diarizations = [[[int(it[0] * 1000), int(it[1] * 1000)], f'spk{int(it[2])}'] for it in result['text']]
@@ -530,7 +566,7 @@ def reverb_speakers(*, input_file, subtitles, num_speakers=-1,  is_cuda=False, l
 # 内置中英文说话人分离模型
 # 仅使用cpu，不使用gpu
 def built_speakers(*, input_file, subtitles, num_speakers=-1, language="zh",  logs_file=None,
-                   is_cuda=False):
+                   is_cuda=False, device_index=None, **_ignored_kwargs):
     from pathlib import Path
     import torch
     import os, shutil, time
@@ -548,7 +584,7 @@ def built_speakers(*, input_file, subtitles, num_speakers=-1, language="zh",  lo
             return audio, target_sample_rate
         return audio, sample_rate
 
-    def init_speaker_diarization(language, num_speakers=-1):
+    def init_speaker_diarization(language, num_speakers=-1, is_cuda=False):
         import sherpa_onnx
         segmentation_model = f"{ROOT_DIR}/models/onnx/seg_model.onnx"
         embedding_extractor_model = (
@@ -557,27 +593,44 @@ def built_speakers(*, input_file, subtitles, num_speakers=-1, language="zh",  lo
         if not Path(embedding_extractor_model).exists():
             raise RuntimeError('Not found speaker_diarization model')
 
-        _cf = sherpa_onnx.OfflineSpeakerDiarizationConfig(
-            segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
-                pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
-                    model=segmentation_model
-                ),
-            ),
-            embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
-                model=embedding_extractor_model
-            ),
-            clustering=sherpa_onnx.FastClusteringConfig(
-                num_clusters=num_speakers, threshold=0.5  # cluster_threshold
-            ),
-            min_duration_on=0.3,
-            min_duration_off=0.5,
-        )
-        if not _cf.validate():
-            raise RuntimeError(
-                "Please check your config and make sure all required files exist"
-            )
-
-        return sherpa_onnx.OfflineSpeakerDiarization(_cf)
+        num_threads = min(8, os.cpu_count() or 4)
+        # Try CUDA first if requested, fall back to CPU automatically
+        providers = ["cuda", "cpu"] if is_cuda else ["cpu"]
+        for provider in providers:
+            try:
+                _cf = sherpa_onnx.OfflineSpeakerDiarizationConfig(
+                    segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
+                        pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(
+                            model=segmentation_model
+                        ),
+                        provider=provider,
+                        num_threads=num_threads,
+                    ),
+                    embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+                        model=embedding_extractor_model,
+                        provider=provider,
+                        num_threads=num_threads,
+                    ),
+                    clustering=sherpa_onnx.FastClusteringConfig(
+                        num_clusters=num_speakers, threshold=0.5  # cluster_threshold
+                    ),
+                    min_duration_on=0.3,
+                    min_duration_off=0.5,
+                )
+                if not _cf.validate():
+                    raise RuntimeError(
+                        "Please check your config and make sure all required files exist"
+                    )
+                if provider == "cuda":
+                    print(f"[DIARIZ] sherpa_onnx speaker diarization using CUDA (num_threads={num_threads})", flush=True)
+                else:
+                    print(f"[DIARIZ] sherpa_onnx speaker diarization using CPU (num_threads={num_threads})", flush=True)
+                return sherpa_onnx.OfflineSpeakerDiarization(_cf)
+            except Exception as e:
+                if provider == "cuda":
+                    print(f"[DIARIZ-WARN] CUDA provider failed ({e}), falling back to CPU", flush=True)
+                    continue
+                raise
 
     def _progress_callback(num_processed_chunk: int, num_total_chunks: int) -> int:
         progress = num_processed_chunk / num_total_chunks * 100
@@ -589,7 +642,7 @@ def built_speakers(*, input_file, subtitles, num_speakers=-1, language="zh",  lo
 
         # Since we know there are 4 speakers in the above test wave file, we use
         # num_speakers 4 here
-        sd = init_speaker_diarization(language, num_speakers)
+        sd = init_speaker_diarization(language, num_speakers, is_cuda=is_cuda)
 
         # Resample audio to match the expected sample rate
         target_sample_rate = sd.sample_rate

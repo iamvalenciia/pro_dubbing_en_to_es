@@ -18,11 +18,20 @@ weights/
 *.pt
 *.safetensors
 *.bin
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
 input/
 output/
 temp_workspace/
 youtube_video/
 cache/
+reference_voices/
+diagnostic_extracted_audio.wav
+tmp_final_audio.wav
+C/
 
 # Vendored pyvideotrans runtime artifacts
 pyvideotrans/models/

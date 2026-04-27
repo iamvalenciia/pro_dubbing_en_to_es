@@ -15,7 +15,8 @@ import time
 def generate_subtitles_worker(
     video_path: str,
     language: str = 'es',
-    progress_callback=None
+    progress_callback=None,
+    preview_duration_sec: Optional[float] = None,
 ) -> Tuple[str, str, str]:
     """
     Background worker for subtitle generation.
@@ -36,8 +37,9 @@ def generate_subtitles_worker(
         base_name = Path(video_path).stem
         output_dir = Path(video_path).parent
         
-        srt_file = str(output_dir / f"{base_name}_subtitles.srt")
-        json_file = str(output_dir / f"{base_name}_subtitles.json")
+        suffix = "_subtitles_preview" if preview_duration_sec else "_subtitles"
+        srt_file = str(output_dir / f"{base_name}{suffix}.srt")
+        json_file = str(output_dir / f"{base_name}{suffix}.json")
         
         if progress_callback:
             progress_callback(f"📝 Transcribiendo con {language}...")
@@ -46,7 +48,8 @@ def generate_subtitles_worker(
             video_path,
             output_srt=srt_file,
             language=language,
-            output_json=json_file
+            output_json=json_file,
+            preview_duration_sec=preview_duration_sec,
         )
         
         if progress_callback:
@@ -62,7 +65,9 @@ def render_subtitles_worker(
     video_path: str,
     subtitle_path: str,
     subtitle_format: str = 'srt',
-    progress_callback=None
+    progress_callback=None,
+    style_config: Optional[dict] = None,
+    preview_duration_sec: Optional[float] = None,
 ) -> Tuple[str, str]:
     """
     Background worker for subtitle rendering.
@@ -86,12 +91,17 @@ def render_subtitles_worker(
         output_dir = Path(video_path).parent
         output_video = str(output_dir / f"{base_name}_subtitled.mp4")
         
+        suffix = "_subtitled_preview.mp4" if preview_duration_sec else "_subtitled.mp4"
+        output_video = str(output_dir / f"{base_name}{suffix}")
+
         result = add_subtitles_to_video_ffmpeg(
             video_path,
             subtitle_path,
             output_path=output_video,
             subtitle_format=subtitle_format,
-            fontsize=60
+            fontsize=60,
+            style_config=style_config,
+            preview_duration_sec=preview_duration_sec,
         )
         
         if progress_callback:
@@ -103,7 +113,12 @@ def render_subtitles_worker(
         return "", f"❌ Error: {str(e)}"
 
 
-def ui_generate_subtitles(video_path: str, language: str = 'es', ui_log_update=None):
+def ui_generate_subtitles(
+    video_path: str,
+    language: str = 'es',
+    ui_log_update=None,
+    preview_duration_sec: Optional[float] = None,
+):
     """
     UI wrapper for subtitle generation - runs in background.
     """
@@ -114,7 +129,12 @@ def ui_generate_subtitles(video_path: str, language: str = 'es', ui_log_update=N
         if ui_log_update:
             ui_log_update(f"[Subtítulos] {msg}")
     
-    srt, json_file, msg = generate_subtitles_worker(video_path, language, progress)
+    srt, json_file, msg = generate_subtitles_worker(
+        video_path,
+        language,
+        progress,
+        preview_duration_sec=preview_duration_sec,
+    )
     
     # Return file objects for Gradio outputs
     if os.path.exists(srt) and os.path.exists(json_file):
@@ -126,7 +146,9 @@ def ui_render_subtitles(
     video_path: str,
     subtitle_path: str,
     subtitle_format: str = 'srt',
-    ui_log_update=None
+    ui_log_update=None,
+    style_config: Optional[dict] = None,
+    preview_duration_sec: Optional[float] = None,
 ):
     """
     UI wrapper for subtitle rendering - runs in background.
@@ -145,7 +167,9 @@ def ui_render_subtitles(
         video_path,
         subtitle_path,
         subtitle_format,
-        progress
+        progress,
+        style_config=style_config,
+        preview_duration_sec=preview_duration_sec,
     )
     
     if os.path.exists(output_video):

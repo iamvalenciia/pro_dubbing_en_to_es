@@ -7,13 +7,14 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Optional
-import numpy as np
-import librosa
-import soundfile as sf
+from typing import Dict, List, Optional
 
 
-def get_audio_from_video(video_path: str, output_audio: Optional[str] = None) -> str:
+def get_audio_from_video(
+    video_path: str,
+    output_audio: Optional[str] = None,
+    preview_duration_sec: Optional[float] = None,
+) -> str:
     """Get 16k mono WAV from video or audio input using ffmpeg."""
     from videotrans.util import tools
     
@@ -23,16 +24,18 @@ def get_audio_from_video(video_path: str, output_audio: Optional[str] = None) ->
     ext = Path(video_path).suffix.lower()
     audio_exts = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}
 
+    cmd = ['-y', '-i', video_path]
+    if preview_duration_sec:
+        cmd.extend(['-t', str(float(preview_duration_sec))])
+
     if ext in audio_exts:
         # Normalize input audio to 16k mono WAV for ASR consistency.
-        tools.runffmpeg([
-            '-y', '-i', video_path,
+        tools.runffmpeg(cmd + [
             '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
             output_audio
         ])
     else:
-        tools.runffmpeg([
-            '-y', '-i', video_path,
+        tools.runffmpeg(cmd + [
             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
             output_audio
         ])
@@ -102,7 +105,8 @@ def generate_subtitles_from_video(
     video_path: str,
     output_srt: Optional[str] = None,
     language: str = 'es',
-    output_json: Optional[str] = None
+    output_json: Optional[str] = None,
+    preview_duration_sec: Optional[float] = None,
 ) -> tuple[str, str]:
     """
     Complete pipeline: extract audio, transcribe, generate SRT and JSON.
@@ -125,7 +129,7 @@ def generate_subtitles_from_video(
     
     # Extract audio
     print(f"[Subtitle] Extracting audio from video...")
-    temp_audio = get_audio_from_video(video_path)
+    temp_audio = get_audio_from_video(video_path, preview_duration_sec=preview_duration_sec)
     
     try:
         # Transcribe

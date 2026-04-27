@@ -10,6 +10,7 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv_clean/
 .venv-py310/
 .env
 .env.local

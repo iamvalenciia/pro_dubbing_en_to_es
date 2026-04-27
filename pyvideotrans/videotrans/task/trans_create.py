@@ -23,6 +23,74 @@ from ._base import BaseTask
 from videotrans.util.help_ffmpeg import get_video_codec
 from videotrans.task._rate import SpeedRate
 
+
+def _resolve_backaudio_volume(default_value=0.28):
+    raw = os.environ.get("QDP_BACKAUDIO_VOLUME")
+    if raw is not None:
+        try:
+            v = float(raw)
+            if v < 0.0:
+                return 0.0
+            if v > 1.0:
+                return 1.0
+            logger.debug(f'[backaudio-volume] ENV override applied: {v}')
+            return v
+        except Exception:
+            pass
+    result = float(default_value)
+    logger.debug(f'[backaudio-volume] Using default: {result}')
+    return result
+
+
+def _resolve_dubbed_audio_volume(default_value=1.25):
+    raw = os.environ.get("QDP_DUBBED_AUDIO_VOLUME")
+    if raw is not None:
+        try:
+            v = float(raw)
+            if v < 0.0:
+                return 0.0
+            if v > 3.0:
+                return 3.0
+            logger.debug(f'[dubbed-volume] ENV override applied: {v}')
+            return v
+        except Exception:
+            pass
+    result = float(default_value)
+    logger.debug(f'[dubbed-volume] Using default: {result}')
+    return result
+
+
+def _get_mean_volume_db(audio_file: str):
+    if not audio_file or not tools.vail_file(audio_file):
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-i",
+                audio_file,
+                "-af",
+                "volumedetect",
+                "-f",
+                "null",
+                os.devnull,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        m = re.search(r"mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", output)
+        if not m:
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
 @dataclass
 class TransCreate(BaseTask):
     # 存放原始语言字幕
@@ -586,9 +654,17 @@ class TransCreate(BaseTask):
 
     def diariz(self):
         # 说话人设为1，不进行分离
-        print(f"[DIARIZ-DEBUG] ENTRY: enable_diariz={self.cfg.enable_diariz}, max_speakers={self.max_speakers}, cache_exists={Path(self.cfg.cache_folder + '/speaker.json').exists()}", flush=True)
         # Check if speaker.json exists AND is valid (not empty)
+        # Also check target_dir fallback so Phase 2 always skips when Phase 1 already ran diarization.
         speaker_json_path = Path(self.cfg.cache_folder + "/speaker.json")
+        if not speaker_json_path.exists():
+            _td_speaker = Path(self.cfg.target_dir + "/speaker.json")
+            if _td_speaker.exists():
+                try:
+                    shutil.copy2(str(_td_speaker), str(speaker_json_path))
+                    print(f"[DIARIZ-DEBUG] Copied speaker.json from target_dir to cache_folder (Phase 2 skip)", flush=True)
+                except Exception:
+                    pass
         existing_valid = False
         if speaker_json_path.exists():
             try:
@@ -597,6 +673,7 @@ class TransCreate(BaseTask):
                     existing_valid = True
             except Exception:
                 pass
+        print(f"[DIARIZ-DEBUG] ENTRY: enable_diariz={self.cfg.enable_diariz}, max_speakers={self.max_speakers}, cache_exists={speaker_json_path.exists()}, existing_valid={existing_valid}", flush=True)
         
         if self._exit() or not self.cfg.enable_diariz or self.max_speakers == 1 or existing_valid:
             skip_reason = "already_valid" if existing_valid else ("_exit" if self._exit() else ("diariz_disabled" if not self.cfg.enable_diariz else "single_speaker"))
@@ -640,7 +717,7 @@ class TransCreate(BaseTask):
                     "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/3dspeaker_speech_eres2net_large_sv_zh-cn_3dspeaker_16k.onnx"
                 ], callback=self._process_callback)
                 from videotrans.process.prepare_audio import built_speakers as _run_speakers
-                del kw['is_cuda']
+                # built_speakers handles its own is_cuda/num_threads logic
                 kw['num_speakers'] = -1 if self.max_speakers < 1 else self.max_speakers
                 kw['language'] = self.cfg.detect_language
             elif speaker_type == 'ali_CAM':
@@ -664,7 +741,7 @@ class TransCreate(BaseTask):
                 )
 
             spk_list = self._new_process(callback=_run_speakers, title=title,
-                                         is_cuda=self.cfg.is_cuda and speaker_type != 'built', kwargs=kw)
+                                         is_cuda=self.cfg.is_cuda, kwargs=kw)
 
             print(f"[DIARIZ-DEBUG] _new_process returned: type={type(spk_list)}, value={spk_list}", flush=True)
             if spk_list:
@@ -1563,16 +1640,42 @@ class TransCreate(BaseTask):
         if self._exit() or not self.shoud_dubbing:
             return
 
-        if not tools.vail_file(self.cfg.target_wav) or not tools.vail_file(self.cfg.background_music):
+        if not tools.vail_file(self.cfg.target_wav):
             return
         try:
+            vol = _resolve_backaudio_volume()
+            dubbed_vol = _resolve_dubbed_audio_volume()
+            source_mode = os.environ.get("QDP_BACKAUDIO_SOURCE", "original").strip().lower()
+            background_source = self.cfg.background_music
+
+            if source_mode == "original":
+                background_source = self.cfg.cache_folder + "/original_full_bed.wav"
+                tools.runffmpeg([
+                    "-y",
+                    "-i",
+                    self.cfg.name,
+                    "-vn",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
+                    "-c:a",
+                    "pcm_s16le",
+                    background_source,
+                ])
+
+            if not tools.vail_file(background_source):
+                logger.warning(f"[_back_music] Background source missing for mode={source_mode}; skipping background mix")
+                return
+
             self._signal(text=tr("Adding background audio"))
+            logger.info(f'[_back_music] Applying background volume={vol}, dubbed volume={dubbed_vol} using source_mode={source_mode}')
             # 获取视频长度
             vtime = tools.get_audio_time(self.cfg.target_wav)
             # 获取背景音频长度
-            atime = tools.get_audio_time(self.cfg.background_music)
+            atime = tools.get_audio_time(background_source)
             bgm_file = self.cfg.cache_folder + f'/bgm_file.wav'
-            self.convert_to_wav(self.cfg.background_music, bgm_file)
+            self.convert_to_wav(background_source, bgm_file)
             self.cfg.background_music = bgm_file
             beishu = math.ceil(vtime / atime)
             if settings.get('loop_backaudio') and beishu > 1 and vtime - 1000 > atime:
@@ -1588,7 +1691,7 @@ class TransCreate(BaseTask):
             tools.runffmpeg(
                 ['-y',
                  '-i', self.cfg.background_music,
-                 "-filter:a", f"volume={settings.get('backaudio_volume', 0.8)}",
+                 "-filter:a", f"volume={_resolve_backaudio_volume()}",
                  '-c:a', 'pcm_s16le',
                  self.cfg.cache_folder + f"/bgm_file_extend_volume.wav"
                  ])
@@ -1596,7 +1699,7 @@ class TransCreate(BaseTask):
             cmd = ['-y',
                    '-i', os.path.basename(self.cfg.target_wav),
                    '-i', "bgm_file_extend_volume.wav",
-                   '-filter_complex', "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2",
+                     '-filter_complex', f"[0:a]volume={dubbed_vol}[dub];[dub][1:a]amix=inputs=2:duration=first:dropout_transition=2",
                    '-ac', '2',
                    '-c:a', 'pcm_s16le',
                    "lastend.wav"
@@ -1607,15 +1710,23 @@ class TransCreate(BaseTask):
             logger.exception(f'添加背景音乐失败:{str(e)}', exc_info=True)
 
     def _separate(self) -> None:
+        source_mode = os.environ.get("QDP_BACKAUDIO_SOURCE", "original").strip().lower()
+        if source_mode == "original":
+            logger.info("[_separate] Skipping separation-based re-embed because source_mode=original")
+            return
         if self._exit() or not self.shoud_separate or not self.cfg.embed_bgm:
             return
         # 如果背景音频分离失败，则静默返回
         if not tools.vail_file(self.cfg.instrument):
+            logger.warning('[_separate] instrument file missing, skipping re-embed')
             return
         if not tools.vail_file(self.cfg.target_wav):
+            logger.warning('[_separate] target_wav missing, skipping re-embed')
             return
         try:
+            vol = _resolve_backaudio_volume()
             self._signal(text=tr("Re-embedded background sounds"))
+            logger.info(f'[_separate] Re-embedding instrument with background volume={vol}')
             vtime = tools.get_audio_time(self.cfg.target_wav)
             atime = tools.get_audio_time(self.cfg.instrument)
             beishu = math.ceil(vtime / atime)
@@ -1634,8 +1745,50 @@ class TransCreate(BaseTask):
                     # 延长背景音
                     tools.change_speed_rubberband(instrument_file, self.cfg.cache_folder + f"/instrument-concat.wav", vtime)
                 instrument_file=self.cfg.cache_folder + f"/instrument-concat.wav"
+
+            # Select background source strategy:
+            # - original (default): always use the original full audio as bed
+            # - instrument: use separated background stem only
+            # - auto: use instrument unless too quiet, then fallback to original
+            source_mode = os.environ.get("QDP_BACKAUDIO_SOURCE", "original").strip().lower()
+            min_db_raw = os.environ.get("QDP_BACKAUDIO_MIN_DB", "-45")
+            try:
+                min_db = float(min_db_raw)
+            except Exception:
+                min_db = -45.0
+
+            selected_backwav = instrument_file
+            instrument_db = _get_mean_volume_db(instrument_file)
+            logger.info(f"[_separate] source_mode={source_mode} instrument mean_volume_db={instrument_db}, min_db={min_db}")
+
+            use_original = source_mode == "original"
+            if source_mode == "auto" and instrument_db is not None and instrument_db < min_db:
+                use_original = True
+
+            if use_original:
+                original_bed = self.cfg.cache_folder + "/original_full_bed.wav"
+                try:
+                    tools.runffmpeg([
+                        "-y",
+                        "-i",
+                        self.cfg.name,
+                        "-vn",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                        "-c:a",
+                        "pcm_s16le",
+                        original_bed,
+                    ])
+                    if tools.vail_file(original_bed):
+                        selected_backwav = original_bed
+                        logger.warning("[_separate] Using original full audio as background bed")
+                except Exception as e:
+                    logger.exception(f"[_separate] Original bed extraction failed: {e}", exc_info=True)
+
             # 背景音合并配音
-            self._backandvocal(instrument_file, self.cfg.target_wav)
+            self._backandvocal(selected_backwav, self.cfg.target_wav)
         except Exception as e:
             logger.exception(e, exc_info=True)
 
@@ -1645,10 +1798,11 @@ class TransCreate(BaseTask):
         tmpdir = self.cfg.cache_folder
         tmpwav = Path(tmpdir + f'/{time.time()}-1.wav').as_posix()
         tmpm4a = Path(tmpdir + f'/{time.time()}.wav').as_posix()
+        dubbed_vol = _resolve_dubbed_audio_volume()
         # 背景转为m4a文件,音量降低为0.8
-        self.convert_to_wav(backwav, tmpm4a, ["-filter:a", f"volume={settings.get('backaudio_volume', 0.8)}"])
+        self.convert_to_wav(backwav, tmpm4a, ["-filter:a", f"volume={_resolve_backaudio_volume()}"])
         tools.runffmpeg(['-y', '-i', os.path.basename(peiyinm4a), '-i', os.path.basename(tmpm4a), '-filter_complex',
-                         "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2", '-ac', '2', "-b:a", "128k",
+                         f"[0:a]volume={dubbed_vol}[dub];[dub][1:a]amix=inputs=2:duration=first:dropout_transition=2", '-ac', '2', "-b:a", "128k",
                          '-c:a', 'pcm_s16le', os.path.basename(tmpwav)], cmd_dir=self.cfg.cache_folder)
         shutil.copy2(tmpwav, peiyinm4a)
 

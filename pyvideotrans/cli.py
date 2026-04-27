@@ -11,7 +11,8 @@ if sys.platform == "win32":
 # 将这个工厂函数注册给 huggingface_hub
 from videotrans.util.req_fac import custom_session_factory
 import huggingface_hub
-huggingface_hub.configure_http_backend(backend_factory=custom_session_factory)
+if hasattr(huggingface_hub, 'configure_http_backend'):
+    huggingface_hub.configure_http_backend(backend_factory=custom_session_factory)
 
 
 

@@ -75,6 +75,40 @@ def runffmpeg(arg, *, noextname=None, uuid=None, force_cpu=True,cmd_dir=None):
         raise
     except subprocess.CalledProcessError as e:
         error_message = e.stderr or ""
+        fps_mode_unsupported = (
+            ('Unrecognized option' in error_message and 'fps_mode' in error_message)
+            or ('Option not found' in error_message and '-fps_mode' in ' '.join(cmd))
+        )
+        if fps_mode_unsupported and '-fps_mode' in cmd:
+            retry_cmd = []
+            skip_next = False
+            for token in cmd:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if token == '-fps_mode':
+                    skip_next = True
+                    continue
+                retry_cmd.append(token)
+            logger.warning('FFmpeg no soporta -fps_mode; reintentando comando sin ese flag.')
+            try:
+                subprocess.run(
+                    retry_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding='utf-8',
+                    errors='replace',
+                    check=True,
+                    text=True,
+                    creationflags=creationflags,
+                    cwd=cmd_dir
+                )
+                if noextname:
+                    app_cfg.queue_novice[noextname] = "end"
+                return True
+            except subprocess.CalledProcessError as retry_err:
+                error_message = retry_err.stderr or error_message
+                e = retry_err
         logger.warning(f"FFmpeg 命令执行失败 (force_cpu={force_cpu})。\n命令: {' '.join(cmd)}\n错误: {error_message} {e.stdout}")
         err=extract_concise_error(e.stderr)
         if noextname:
