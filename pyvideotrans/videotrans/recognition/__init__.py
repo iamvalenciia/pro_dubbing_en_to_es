@@ -1,7 +1,7 @@
+import os
 from typing import Union, List, Dict
 from pathlib import Path
 from videotrans.configure.config import tr,settings,params,app_cfg,logger,ROOT_DIR
-from videotrans.recognition._overall import FasterAll
 
 
 FASTER_WHISPER = 0
@@ -38,6 +38,7 @@ STT_API = 19
 CUSTOM_API = 20
 WHISPER_NET = 21
 CAMB_ASR = 22
+ASSEMBLYAI_SPEECH = 23
 
 _ID_NAME_DICT = {
     FASTER_WHISPER:tr("Faster-whisper"),
@@ -69,6 +70,7 @@ _ID_NAME_DICT = {
     CUSTOM_API:tr("Custom API"),
     WHISPER_NET:"Whisper.NET",
     CAMB_ASR:"CAMB AI",
+    ASSEMBLYAI_SPEECH:"AssemblyAI",
 }
 RECOGN_NAME_LIST=list(_ID_NAME_DICT.values())
 
@@ -100,7 +102,7 @@ except Exception as e:
 # langcode=语言代码，recogn_type=识别渠道,model_name=模型名字
 def is_allow_lang(langcode: str = None, recogn_type: int = None, model_name=None):
     # faster-whisper/openai-whisper支持所有语言
-    if recogn_type in [FASTER_WHISPER,OPENAI_WHISPER,WHISPERX_API,Faster_Whisper_XXL,Whisper_CPP,OPENAI_API,AI_302,GEMINI_SPEECH,WHISPER_NET]:
+    if recogn_type in [FASTER_WHISPER,OPENAI_WHISPER,WHISPERX_API,Faster_Whisper_XXL,Whisper_CPP,OPENAI_API,AI_302,GEMINI_SPEECH,WHISPER_NET,ASSEMBLYAI_SPEECH]:
         return True
     # huggingface_asr 渠道里的 openai 和 Systran 模型也支持所有语言
     if recogn_type == HUGGINGFACE_ASR and not HUGGINGFACE_ASR_MODELS.get(model_name):
@@ -109,7 +111,7 @@ def is_allow_lang(langcode: str = None, recogn_type: int = None, model_name=None
         if langcode not in HUGGINGFACE_ASR_MODELS[model_name]:
             return tr("Only support")+tr(HUGGINGFACE_ASR_MODELS[model_name])
         return True
-    if (langcode == 'auto' or not langcode) and recogn_type not in [FASTER_WHISPER, OPENAI_WHISPER, GEMINI_SPEECH, ElevenLabs,Faster_Whisper_XXL,Whisper_CPP,WHISPERX_API,AI_302,OPENAI_API,WHISPER_NET]:
+    if (langcode == 'auto' or not langcode) and recogn_type not in [FASTER_WHISPER, OPENAI_WHISPER, GEMINI_SPEECH, ElevenLabs,Faster_Whisper_XXL,Whisper_CPP,WHISPERX_API,AI_302,OPENAI_API,WHISPER_NET,ASSEMBLYAI_SPEECH]:
         return tr("Recognition language is only supported in faster-whisper or openai-whisper or Gemini  modes.")
 
     return True
@@ -192,6 +194,12 @@ def is_input_api(recogn_type: int = None, return_str=False):
         from videotrans.winform import cambtts as cambasr_win
         cambasr_win.openwin()
         return False
+    if recogn_type == ASSEMBLYAI_SPEECH and not (
+        params.get('assemblyai_key', '') or os.environ.get('ASSEMBLY_AI_KEY') or os.environ.get('ASSEMBLYAI_API_KEY')
+    ):
+        if return_str:
+            return "Please configure ASSEMBLY_AI_KEY for AssemblyAI speech recognition."
+        return False
     return True
 
 
@@ -257,9 +265,6 @@ def run(*,
     if recogn_type == QWENASR:
         from videotrans.recognition._qwenasrlocal import QwenasrlocalRecogn
         return QwenasrlocalRecogn(**kwargs).run()
-    if recogn_type == FUNASR_CN:
-        from videotrans.recognition._funasr import FunasrRecogn
-        return FunasrRecogn(**kwargs).run()
     if recogn_type == Deepgram:
         from videotrans.recognition._deepgram import DeepgramRecogn
         return DeepgramRecogn(**kwargs).run()
@@ -275,9 +280,6 @@ def run(*,
     if recogn_type == ElevenLabs:
         from videotrans.recognition._elevenlabs import ElevenLabsRecogn
         return ElevenLabsRecogn(**kwargs).run()
-    if recogn_type == HUGGINGFACE_ASR:
-        from videotrans.recognition._huggingface import HuggingfaceRecogn
-        return HuggingfaceRecogn(**kwargs).run()
     if recogn_type == ZHIPU_API:
         from videotrans.recognition._glmasr import GLMASRRecogn
         return GLMASRRecogn(**kwargs).run()
@@ -289,5 +291,23 @@ def run(*,
     if recogn_type == CAMB_ASR:
         from videotrans.recognition._camb import CambRecogn
         return CambRecogn(**kwargs).run()
+    if recogn_type == ASSEMBLYAI_SPEECH:
+        from videotrans.recognition._assemblyai import AssemblyAIRecogn
+        return AssemblyAIRecogn(**kwargs).run()
 
-    return FasterAll(**kwargs).run()
+    if recogn_type in [
+        FASTER_WHISPER,
+        OPENAI_WHISPER,
+        FUNASR_CN,
+        HUGGINGFACE_ASR,
+        Whisper_CPP,
+        Faster_Whisper_XXL,
+        WHISPERX_API,
+        WHISPER_NET,
+    ]:
+        raise RuntimeError(
+            "Legacy local recognizers were removed from the active workflow. "
+            "Use AssemblyAI speech recognition instead."
+        )
+
+    raise RuntimeError(f"Unsupported recognizer type after cleanup: {recogn_type}")

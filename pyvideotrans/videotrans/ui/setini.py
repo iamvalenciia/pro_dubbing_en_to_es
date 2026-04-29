@@ -88,11 +88,11 @@ class Ui_setini(object):
                 "whisper_prepare": "是否提前将音频切割为句子片段后再发给whisper模型识别?\n若使用clone配音角色，请选中，并将最短语音设为3000，最大语音设为10，提供语音克隆可靠性",
 
 
-                "speaker_type": "用于说话人分离的模型，默认内置模型支持中英. \n若选 pyannote 必须拥有 https://huggingface.co 上的token，\n并且同意pyannote组织的授权协议\n\n具体请访问URL查看教程:\nhttps://pvt9.com/shuohuaren",
-                "hf_token": "填写你在 huggingface.co 的token，否则无法使用 pyannote，具体查看教程\nhttps://pvt9.com/shuohuaren",
+                "speaker_type": "当前桌面流程的说话人分离固定为 AssemblyAI。",
+                "hf_token": "Legacy: ya no se usa para diarización en el flujo activo。",
 
-                "model_list": "faster-whipser的模型列表，英文逗号分隔",
-                "Whisper_cpp_models": "whisper.cpp的模型名字列表，英文逗号分隔",
+                "model_list": "Legacy: faster-whisper local ya no se usa en el flujo activo。",
+                "Whisper_cpp_models": "Legacy: whisper.cpp ya no se usa en el flujo activo。",
                 "cuda_com_type": "faster模式时cuda数据类型，int8=消耗资源少，速度快，精度低，float32=消耗资源多，速度慢，精度高，float16适合GPU加速。default默认自选",
                 "beam_size": "字幕识别时精度调整，1-5，1=消耗显存最低，5=消耗显存最多",
                 "best_of": "字幕识别时精度调整，1-5，1=消耗显存最低，5=消耗显存最多",
@@ -196,9 +196,9 @@ class Ui_setini(object):
 
             "no_speech_threshold": "no speech threshold",
 
-            "speaker_type": "说话人分离模型",
+            "speaker_type": "说话人分离后端",
 
-            "hf_token": "Huggingface的token",
+            "hf_token": "HF token legado",
 
             "show_more_settings": "主界面显示所有参数?",
 
@@ -214,8 +214,8 @@ class Ui_setini(object):
             "azure_model": "Azure模型列表",
             "localllm_model": "本地LLM模型列表",
             "zijiehuoshan_model": "字节火山推理接入点",
-            "model_list": "faster-whisper模型",
-            "Whisper_cpp_models": "whisper.cpp模型",
+            "model_list": "faster-whisper legado",
+            "Whisper_cpp_models": "whisper.cpp legado",
             "homedir": "设置输出目录",
             "lang": "软件界面语言",
             "save_segment_audio": "保留每条字幕的配音文件",
@@ -342,12 +342,12 @@ class Ui_setini(object):
                     "whisper_prepare": "Should we pre-segment the speech using VAD before sending it to the Whisper model for recognition? \nIf using cloned voice-over characters, please select this option and set the shortest speech length to 3000 and the maximum speech length to 10 to improve the reliability of the voice cloning.",
 
                     "vad_type":"Select VAD",
-                    "speaker_type": "The model used for speaker separation. The default is the built-in model, supporting both Chinese and English. Pyannote is optional. \nIf selected, you must have a token from \nhttps://huggingface.co \nand agree to the Pyannote licensing agreement. \nFor details, please visit the URL for a tutorial: \nhttps://pvt9.com/shuohuaren",
+                    "speaker_type": "Speaker separation is AssemblyAI-only in the active desktop workflow.",
 
-                    "hf_token": "Enter your token from huggingface.co. Otherwise, you cannot use Pyannote speaker separation. \nFor details, please see the tutorial: \nhttps://pvt9.com/shuohuaren",
+                    "hf_token": "Legacy: no longer required for active speaker diarization.",
 
-                    "model_list": "Comma-separated list of model names for faster-whisper modes.",
-                    "Whisper_cpp_models": "Comma-separated list of model names for whisper.cpp mode.",
+                    "model_list": "Legacy: local faster-whisper models are no longer used in the active workflow.",
+                    "Whisper_cpp_models": "Legacy: whisper.cpp models are no longer used in the active workflow.",
                     "cuda_com_type": "CUDA compute type for faster-whisper (e.g., int8, float16, float32).",
                     "beam_size": "Beam size for transcription (1-5). Higher is more accurate but uses more VRAM.",
                     "best_of": "Best-of for transcription (1-5). Higher is more accurate but uses more VRAM.",
@@ -452,9 +452,9 @@ class Ui_setini(object):
                 "whisper_prepare": "Whisper model Pre-segmented audio",
                 "vad_type":"Select VAD",
 
-                "speaker_type": "Model for speaker separation",
+                "speaker_type": "Speaker separation backend",
 
-                "hf_token": "Your token from huggingface.co",
+                "hf_token": "Legacy HF token",
 
                 "show_more_settings": "Show all parameters?",
 
@@ -468,8 +468,8 @@ class Ui_setini(object):
                 "azure_model": "Azure model list",
                 "localllm_model": "Local LLM model list",
                 "zijiehuoshan_model": "ByteDance Volcano Engine inference endpoint",
-                "model_list": "faster-whisper models",
-                "Whisper_cpp_models": "whisper.cpp models",
+                "model_list": "Legacy faster-whisper",
+                "Whisper_cpp_models": "Legacy whisper.cpp",
                 "homedir": "Set output directory",
                 "lang": "Software interface language",
                 "save_segment_audio": "Save dubbed audio for each subtitle line",
@@ -572,7 +572,17 @@ class Ui_setini(object):
             label_title.setStyleSheet("""color:#148CD2;font-size:18px;""")
             label_title.setObjectName(f"label_{headkey}")
             box.layout().addWidget(label_title)
+            hidden_legacy_keys = {
+                'Faster_Whisper_XXL',
+                'Whisper_cpp',
+                'Whisper_cpp_models',
+                'Whisper_net_models',
+                'model_list',
+                'hf_token',
+            }
             for key, tips_str in item.items():
+                if key in hidden_legacy_keys:
+                    continue
                 tmp = QtWidgets.QHBoxLayout()
                 tmp_0 = QtWidgets.QPushButton()
                 tmp_0.setStyleSheet("""background-color:transparent;""")
@@ -603,7 +613,7 @@ class Ui_setini(object):
                 elif key == 'vad_type':
                     combobox_data = ['tenvad', 'silero']
                 elif key == 'speaker_type':
-                    combobox_data = ['built','ali_CAM', 'pyannote','reverb']
+                    combobox_data = ['assemblyai']
                 elif key == 'video_codec':
                     combobox_data = ['264', '265']
 

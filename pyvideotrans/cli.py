@@ -4,12 +4,15 @@ import sys
 import os
 import re
 import argparse
+import json
+import time
 from multiprocessing import freeze_support
 from pathlib import Path
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 # 将这个工厂函数注册给 huggingface_hub
 from videotrans.util.req_fac import custom_session_factory
+
 import huggingface_hub
 if hasattr(huggingface_hub, 'configure_http_backend'):
     huggingface_hub.configure_http_backend(backend_factory=custom_session_factory)
@@ -18,6 +21,39 @@ if hasattr(huggingface_hub, 'configure_http_backend'):
 
 # 调度函数 避免子进程重复执行
 def main():
+    def _require_phase1_speaker_marks(trk, min_mtime: float | None = None):
+        candidates = [
+            Path(trk.cfg.cache_folder) / 'speaker.json',
+            Path(trk.cfg.target_dir) / 'speaker.json',
+        ]
+        invalid_details = []
+
+        for candidate in candidates:
+            if not candidate.exists():
+                continue
+            try:
+                data = json.loads(candidate.read_text(encoding='utf-8'))
+            except Exception as exc:
+                invalid_details.append(f'{candidate} inválido: {exc}')
+                continue
+            if min_mtime is not None:
+                try:
+                    if candidate.stat().st_mtime < (min_mtime - 1.0):
+                        invalid_details.append(f'{candidate} heredado (mtime antiguo)')
+                        continue
+                except Exception as exc:
+                    invalid_details.append(f'{candidate} sin mtime válido: {exc}')
+                    continue
+            if isinstance(data, list) and len(data) > 0:
+                return candidate
+            invalid_details.append(f'{candidate} vacío')
+
+        detail = '; '.join(invalid_details) if invalid_details else 'speaker.json no fue generado'
+        raise RuntimeError(
+            'La diarización es obligatoria en Fase 1 y no produjo speakers válidos. '
+            f'Se cancela antes de traducir. Detalle: {detail}'
+        )
+
     TEXT_DB = {
         # --- 日志与标题 ---
         "exec_stt_task": {
@@ -300,12 +336,28 @@ def main():
         print(f"\n[Task] Speaker Analysis (Phase 1)")
         print(tr('process_file', params.get('name')))
         trk = TransCreate(cfg=TaskCfgVTT(**params))
-        trk.prepare()
-        trk.recogn()
-        trk.diariz()
-        trk.trans()
-        trk.run_speaker_analysis()
-        trk.task_done()
+        run_started_at = time.time()
+        try:
+            trk.prepare()
+            trk.recogn()
+            trk.diariz()
+            speaker_json = _require_phase1_speaker_marks(trk, min_mtime=run_started_at)
+            print(f"[ANALYZE] Speaker diarization OK: {speaker_json}", flush=True)
+            trk.trans()
+            trk.run_speaker_analysis()
+            # ANALYZE_DONE ya fue emitido por run_speaker_analysis()
+            # Salir sin hacer task_done() para evitar errores post-análisis
+        except Exception as e:
+            logger.exception(f"[ANALYZE-ERROR] {e}", exc_info=True)
+            print(f"[ANALYZE-ERROR] {e}", flush=True)
+            raise
+        finally:
+            # Limpieza mínima sin afectar artefactos
+            try:
+                if hasattr(trk, 'hasend'):
+                    trk.hasend = True
+            except:
+                pass
 
     # True 为软件退出，不执行任何动作
     app_cfg.exit_soft = False
@@ -314,7 +366,7 @@ def main():
     trans_help = ", ".join([f'{i}={it}' for i, it in enumerate(translator.TRANSLASTE_NAME_LIST)])
     tts_help = ", ".join([f'{i}={it}' for i, it in enumerate(tts.TTS_NAME_LIST)])
     target_language_help = ', '.join(translator.LANGNAME_DICT.keys())
-    model_help_list = 'tiny, small, base, medium, large-v3-turbo, large-v1, large-v2, large-v3'
+    model_help_list = 'universal-3-pro, universal-2'
 
     parser = argparse.ArgumentParser(
         description=tr("cli_desc"),
@@ -329,11 +381,11 @@ def main():
 
     # --- STT 相关参数组 ---
     stt_group = parser.add_argument_group(tr("group_stt"))
-    stt_group.add_argument('--recogn_type', type=int, default=0,
+    stt_group.add_argument('--recogn_type', type=int, default=23,
                            help=f"{tr('help_recogn_type')}\n{recogn_help}")
     stt_group.add_argument('--detect_language', type=str, default='auto',
                            help=tr("help_detect_lang"))
-    stt_group.add_argument('--model_name', type=str, default='tiny',
+    stt_group.add_argument('--model_name', type=str, default='universal-3-pro',
                            help=tr("help_model_name", model_help_list))
     stt_group.add_argument('--cuda', action='store_true', help=tr("help_cuda"))
     stt_group.add_argument('--remove_noise', action='store_true', help=tr("help_remove_noise"))
@@ -377,6 +429,16 @@ def main():
 
     # 解析参数
     args = parser.parse_args()
+
+    # Production hard-gate: analyze/vtv must use AssemblyAI for ASR + diarization.
+    if args.task in {'analyze', 'vtv'}:
+        args.recogn_type = 23
+        args.model_name = os.environ.get('ASSEMBLYAI_SPEECH_MODEL', 'universal-3-pro').strip() or 'universal-3-pro'
+        args.enable_diariz = True
+        os.environ['PYVIDEOTRANS_DIARIZ_BACKEND'] = 'assemblyai'
+        os.environ.setdefault('PYVIDEOTRANS_DIARIZ_STRICT_GPU', '1')
+        if not (os.environ.get('ASSEMBLY_AI_KEY') or '').strip():
+            parser.error('ASSEMBLY_AI_KEY is required for analyze/vtv (AssemblyAI-only policy).')
 
     # ==========================================
     # 任务调度与参数校验构建
@@ -513,6 +575,7 @@ def main():
         analyze_params = {
             "source_language_code": args.source_language_code,
             "target_language_code": args.target_language_code,
+            "app_mode": "analyze",
             "recogn_type": args.recogn_type,
             "model_name": args.model_name,
             "is_cuda": args.cuda,

@@ -10,6 +10,46 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
 
+def _to_seconds(raw) -> float:
+    try:
+        val = float(raw)
+    except Exception:
+        return 0.0
+    if val < 0:
+        return 0.0
+    if val > 86400:
+        return val / 1000.0
+    return val
+
+
+def _load_segments_from_json(json_path: str) -> List[Dict]:
+    payload = json.loads(Path(json_path).read_text(encoding='utf-8'))
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get('segments') or payload.get('sentences') or payload.get('paragraphs') or []
+    else:
+        rows = []
+
+    normalized = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        start = _to_seconds(item.get('start') if item.get('start') is not None else item.get('start_ms'))
+        end = _to_seconds(item.get('end') if item.get('end') is not None else item.get('end_ms'))
+        if end <= start:
+            continue
+        normalized.append(
+            {
+                'start_ms': int(round(start * 1000.0)),
+                'end_ms': int(round(end * 1000.0)),
+                'text_es': str(item.get('text_es') or item.get('text') or item.get('text_en') or '').strip(),
+                'speaker_id': str(item.get('speaker_id') or item.get('speaker') or 'unknown').strip() or 'unknown',
+            }
+        )
+    return normalized
+
+
 def analyze_content_with_gemini(
     json_path: str,
     gemini_model: str = "gemini-2.0-flash-lite",
@@ -37,8 +77,7 @@ def analyze_content_with_gemini(
     genai.configure(api_key=api_key)
     
     # Read timestamps
-    timestamps = json.loads(Path(json_path).read_text(encoding='utf-8'))
-    segments = timestamps.get('segments', [])
+    segments = _load_segments_from_json(json_path)
     
     if not segments:
         raise ValueError("No segments found in timestamps JSON")
@@ -324,7 +363,18 @@ def _extract_captions_for_segment(subtitle_path: str, start_ms: int, end_ms: int
                         })
             except Exception:
                 continue
-    
+    elif subtitle_path.endswith('.json'):
+        rows = _load_segments_from_json(subtitle_path)
+        for item in rows:
+            seg_start = int(item['start_ms'])
+            seg_end = int(item['end_ms'])
+            if seg_start < end_ms and seg_end > start_ms:
+                captions.append({
+                    'start_ms': max(seg_start, start_ms),
+                    'end_ms': min(seg_end, end_ms),
+                    'text': str(item.get('text_es') or '').strip(),
+                })
+
     return captions
 
 

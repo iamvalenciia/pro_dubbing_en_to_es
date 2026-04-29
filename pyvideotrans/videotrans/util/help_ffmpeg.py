@@ -307,7 +307,7 @@ def _run_ffprobe_internal(cmd: list[str]) -> str:
         )
         return p.stdout.strip()
     except FileNotFoundError as e:
-        msg = f"Command not found: ffmpeg. Ensure FFmpeg is installed and in your PATH."
+        msg = f"Command not found: ffprobe. Ensure FFmpeg/ffprobe is installed and in your PATH."
         logger.warning(msg)
         raise _FFprobeInternalError(msg) from e
     except subprocess.CalledProcessError as e:
@@ -350,7 +350,7 @@ def get_video_info(mp4_file, *, video_fps=False, video_scale=False, video_time=F
         raise Exception(f'{mp4_file} is not exists')
     try:
         out_json = runffprobe(
-            ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', mp4_file]
+            ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', mp4_file]
         )
         if not out_json:
             raise RuntimeError(tr('Failed to parse {} information, please confirm that the file can be played normally',mp4_file))

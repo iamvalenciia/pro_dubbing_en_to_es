@@ -638,7 +638,6 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.action_yingyinhebing.triggered.connect(lambda: self._open_winform('fn_vas'))
         self.action_clipvideo.triggered.connect(lambda: self._open_winform('clipvideo'))
         self.action_textmatching.triggered.connect(lambda: self._open_winform('textmatching'))
-        self.action_realtime_stt.triggered.connect(lambda: self._open_winform('realtime_stt'))
         self.action_fanyi.triggered.connect(lambda: self._open_winform('fn_fanyisrt'))
         self.action_yuyinshibie.triggered.connect(lambda: self._open_winform('fn_recogn'))
 
@@ -751,10 +750,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
             window.show()
             return
         if name == 'realtime_stt':
-            from videotrans.component.realtime_stt import RealTimeWindow
-            window = RealTimeWindow()
-            app_cfg.child_forms[name] = window
-            window.show()
+            from videotrans.util import tools
+            tools.show_error('Real-time local ONNX speech-to-text was removed from this build.')
             return
 
         return winform.get_win(name).openwin()

@@ -561,11 +561,13 @@ label,
 }
 
 #qdp-log,
+#qdp-subs-log,
 #qdp-reels-log {
     border-radius: 11px !important;
 }
 
 #qdp-log textarea,
+#qdp-subs-log textarea,
 #qdp-reels-log textarea {
     font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace !important;
     font-size: 12.4px !important;
@@ -581,15 +583,87 @@ label,
 }
 
 #qdp-log textarea::-webkit-scrollbar,
+#qdp-subs-log textarea::-webkit-scrollbar,
 #qdp-reels-log textarea::-webkit-scrollbar {
     height: 8px;
     width: 8px;
 }
 
 #qdp-log textarea::-webkit-scrollbar-thumb,
+#qdp-subs-log textarea::-webkit-scrollbar-thumb,
 #qdp-reels-log textarea::-webkit-scrollbar-thumb {
     background: rgba(255, 255, 255, 0.24);
     border-radius: 4px;
+}
+
+#qdp-phase-badges {
+    margin: 8px 0 14px;
+}
+
+.qdp-phase-badges {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.qdp-phase-badge {
+    border: 1px solid var(--qdp-border);
+    border-radius: 12px;
+    background: var(--qdp-pill);
+    padding: 10px;
+    transition: border-color 0.28s ease, box-shadow 0.28s ease, background 0.28s ease;
+    animation: qdpBadgeIn 0.22s ease both;
+}
+
+@keyframes qdpBadgeIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to   { opacity: 1; transform: none; }
+}
+
+.qdp-phase-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--qdp-text);
+}
+
+.qdp-phase-state {
+    margin-top: 4px;
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+}
+
+.qdp-phase-note {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--qdp-muted);
+}
+
+.qdp-phase-badge.state-done {
+    border-color: rgba(28, 166, 78, 0.42);
+    box-shadow: 0 0 0 1px rgba(28, 166, 78, 0.16) inset;
+}
+
+.qdp-phase-badge.state-ready {
+    border-color: rgba(154, 123, 47, 0.48);
+    box-shadow: 0 0 0 1px rgba(154, 123, 47, 0.2) inset;
+}
+
+.qdp-phase-badge.state-blocked {
+    border-color: rgba(191, 68, 68, 0.5);
+    box-shadow: 0 0 0 1px rgba(191, 68, 68, 0.18) inset;
+}
+
+.qdp-phase-badge.state-done .qdp-phase-state {
+    color: #1ca64e;
+}
+
+.qdp-phase-badge.state-ready .qdp-phase-state {
+    color: var(--qdp-focus);
+}
+
+.qdp-phase-badge.state-blocked .qdp-phase-state {
+    color: #bf4444;
 }
 
 .gr-image,
@@ -669,6 +743,10 @@ label,
     .speaker-voice-dd ul.options li {
         padding-top: 8px !important;
         padding-bottom: 8px !important;
+    }
+
+    .qdp-phase-badges {
+        grid-template-columns: 1fr;
     }
 }
 
@@ -793,7 +871,7 @@ def _prepare_voice_references() -> tuple[str, list[str], str | None]:
     if not candidates:
         candidates = _voice_ref_audio_files(VOICE_REFS_ROOT)
     if not candidates:
-        return "❌ No se encontraron audios de referencia en reference_voices ni input/voice_refs", [], None
+        return "No se encontraron audios de referencia en reference_voices ni input/voice_refs", [], None
 
     catalog = []
     log_lines = [f"Preparando {len(candidates)} referencia(s)..."]
@@ -830,7 +908,7 @@ def _prepare_voice_references() -> tuple[str, list[str], str | None]:
             "preview_path": preview,
             "duration_sec": round(dur, 2),
         })
-        log_lines.append(f"✅ {ref_id} ({dur:.1f}s)")
+        log_lines.append(f"OK {ref_id} ({dur:.1f}s)")
 
     with open(VOICE_REFS_CATALOG, "w", encoding="utf-8") as f:
         json.dump({"voices": catalog}, f, indent=2, ensure_ascii=False)
@@ -883,7 +961,7 @@ def _load_speaker_context_for_ui() -> tuple[str, str]:
     profile_path = _latest_speaker_artifact("_speaker_profile.json")
     identity_path = _latest_speaker_artifact("_speaker_identity.json")
     if not profile_path:
-        return "❌ No hay speaker_profile reciente. Ejecuta primero un doblaje con Speaker Clone activo.", "{}"
+        return "No hay speaker_profile reciente. Ejecuta primero un doblaje con Speaker Clone activo.", "{}"
 
     profile = json.loads(open(profile_path, "r", encoding="utf-8").read())
     identity_map = {}
@@ -938,15 +1016,15 @@ def _save_speaker_map_from_json(mapping_text: str) -> str:
     try:
         payload = json.loads(mapping_text or "{}")
     except Exception as exc:
-        return f"❌ JSON inválido: {exc}"
+        return f"JSON inválido: {exc}"
 
     if not isinstance(payload, dict):
-        return "❌ El mapping debe ser un objeto JSON: {\"spk0\": \"ref_id\"}"
+        return "El mapping debe ser un objeto JSON: {\"spk0\": \"ref_id\"}"
 
     catalog = _load_voice_catalog()
     by_ref = {it.get("ref_id"): it for it in catalog}
     if not by_ref:
-        return "❌ Catálogo de voces vacío. Ejecuta primero 'Preparar referencias'"
+        return "Catálogo de voces vacío. Ejecuta primero 'Preparar referencias'"
 
     saved = {}
     for spk, ref_id in payload.items():
@@ -957,7 +1035,7 @@ def _save_speaker_map_from_json(mapping_text: str) -> str:
             continue
         ref = by_ref.get(str(ref_id).strip())
         if not ref:
-            return f"❌ ref_id no existe en catálogo: {ref_id}"
+            return f"ref_id no existe en catálogo: {ref_id}"
         saved[sid] = {
             "ref": ref.get("normalized_path"),
             "ref_id": ref.get("ref_id"),
@@ -965,7 +1043,7 @@ def _save_speaker_map_from_json(mapping_text: str) -> str:
 
     with open(VOICE_SPEAKER_MAP, "w", encoding="utf-8") as f:
         json.dump(saved, f, indent=2, ensure_ascii=False)
-    return f"✅ Mapping guardado en {VOICE_SPEAKER_MAP} con {len(saved)} speaker(s)"
+    return f"Mapping guardado en {VOICE_SPEAKER_MAP} con {len(saved)} speaker(s)"
 
 
 def _warmup_nllb200():
@@ -1001,7 +1079,74 @@ def _warmup_nllb200():
 
 
 def _start_background_warmups():
-    threading.Thread(target=_warmup_nllb200, name="nllb-warmup", daemon=True).start()
+    # Warm-ups legacy desactivados en el workflow actual.
+    return
+
+
+def _phase_badges_html(video_file: str | None) -> str:
+    def _badge(title: str, state: str, note: str) -> str:
+        return (
+            f"<div class='qdp-phase-badge state-{state}'>"
+            f"<div class='qdp-phase-title'>{title}</div>"
+            f"<div class='qdp-phase-state'>{state}</div>"
+            f"<div class='qdp-phase-note'>{note}</div>"
+            "</div>"
+        )
+
+    _STATE_LABELS = {"done": "Completado", "ready": "Pendiente", "blocked": "Bloqueado"}
+
+    if not video_file:
+        phase1_state, phase1_note = "blocked", "Input no definido"
+        phase2_state, phase2_note = "blocked", "Requiere artifact P1"
+    else:
+        video_path = _parse_dropdown_choice(video_file, NETWORK_USER_INPUT)
+        valid_video = bool(video_path and os.path.isfile(video_path))
+        if not valid_video:
+            phase1_state, phase1_note = "blocked", "Archivo de entrada no válido"
+            phase2_state, phase2_note = "blocked", "Requiere artifact P1"
+        else:
+            source_name = os.path.splitext(os.path.basename(video_path))[0]
+            safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
+            vt_output_root = os.path.join(PYVIDEOTRANS_ROOT, "output")
+            done_phase1 = False
+            if os.path.isdir(vt_output_root):
+                for folder in os.listdir(vt_output_root):
+                    folder_path = os.path.join(vt_output_root, folder)
+                    if not os.path.isdir(folder_path):
+                        continue
+                    if safe_name in folder and os.path.isfile(os.path.join(folder_path, "speaker_profile.json")):
+                        done_phase1 = True
+                        break
+            done_phase2 = os.path.isfile(os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed.mp4"))
+
+            phase1_state = "done" if done_phase1 else "ready"
+            phase1_note = "Speaker profile disponible" if done_phase1 else "Pendiente de ejecución"
+
+            if done_phase2:
+                phase2_state, phase2_note = "done", "Output generado en /output"
+            elif done_phase1:
+                phase2_state, phase2_note = "ready", "Artifact P1 validado"
+            else:
+                phase2_state, phase2_note = "blocked", "Requiere artifact P1"
+
+    def _state_label(s: str) -> str:
+        return _STATE_LABELS.get(s, s)
+
+    def _badge_labeled(title: str, state: str, note: str) -> str:
+        return (
+            f"<div class='qdp-phase-badge state-{state}'>"
+            f"<div class='qdp-phase-title'>{title}</div>"
+            f"<div class='qdp-phase-state'>{_state_label(state)}</div>"
+            f"<div class='qdp-phase-note'>{note}</div>"
+            "</div>"
+        )
+
+    return (
+        "<div class='qdp-phase-badges'>"
+        + _badge_labeled("P1 · ASR / Diarización", phase1_state, phase1_note)
+        + _badge_labeled("P2 · Síntesis TTS", phase2_state, phase2_note)
+        + "</div>"
+    )
 
 _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 _AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".aac", ".opus")
@@ -1370,22 +1515,23 @@ def run_phase1(
         empty_rows = []
         for _ in range(N):
             empty_rows += [gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(value=None)]
-        yield (msg, "", gr.update(visible=False), *empty_rows, gr.update(visible=False), [],
-               gr.update(interactive=True, value="Analizar video (Fase 1)"))
+        yield (msg, "", gr.update(visible=False), *empty_rows,
+               gr.update(interactive=False, value="P2 · Pendiente artifact P1"), [],
+               gr.update(interactive=True, value="Ejecutar P1 · ASR + Diarización"))
 
     if not video_file:
-        yield from _yield_error("❌ Selecciona un video primero.")
+        yield from _yield_error("P1 ERROR · Se requiere seleccionar un archivo de entrada.")
         return
 
     video_path = _parse_dropdown_choice(video_file, NETWORK_USER_INPUT)
     if not video_path or not os.path.isfile(video_path):
-        yield from _yield_error(f"❌ Archivo inválido: {video_path}")
+        yield from _yield_error(f"P1 ERROR · Ruta de entrada no válida: {video_path}")
         return
 
     llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
     translate_type = TRANSLATE_TYPE_MAP.get(llm_model)
     if translate_type is None:
-        yield from _yield_error(f"❌ Translate model desconocido: {llm_model}")
+        yield from _yield_error(f"P1 ERROR · Modelo de traducción no reconocido: {llm_model}")
         return
 
     asr_type = ASR_TYPE_MAP.get("faster")
@@ -1394,14 +1540,14 @@ def run_phase1(
     clear_log()
     setup_pipeline_logger(LOCAL_LOGS)
 
-    result = {"phase": "Iniciando Fase 1 (análisis)...", "target_dir": None, "done": False, "error": None}
+    result = {"phase": "P1 · Inicializando pipeline ASR...", "target_dir": None, "done": False, "error": None}
 
     def worker():
         try:
             current_video_path = video_path
 
             if test_mode:
-                result["phase"] = "Modo Test: Recortando video a 30s..."
+                result["phase"] = "TEST · Truncando stream a 30 s..."
                 ui_log.info(result["phase"])
                 source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
                 safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
@@ -1426,7 +1572,7 @@ def run_phase1(
                 "--nums_diariz", "0",
             ]
 
-            result["phase"] = "Fase 1: Transcripción + traducción + diarización..."
+            result["phase"] = "P1 · ASR + diarización + traducción en curso..."
             ui_log.info(f"Ejecutando Fase 1: {' '.join(cmd)}")
 
             child_env = os.environ.copy()
@@ -1484,12 +1630,12 @@ def run_phase1(
                 raise RuntimeError(f"Fase 1 falló con código {process.returncode}")
 
             result["done"] = True
-            result["phase"] = "✅ Fase 1 completada. Asigna voces y arranca Fase 2."
+            result["phase"] = "P1 · Completado. Configura speakers e inicia P2."
             ui_log.info(result["phase"])
 
         except Exception as exc:
             result["error"] = str(exc)
-            result["phase"] = f"❌ Error Fase 1: {exc}"
+            result["phase"] = f"P1 ERROR · {exc}"
             ui_log.error(f"Fase 1 error: {exc}\n{traceback.format_exc()}")
 
     t = threading.Thread(target=worker, daemon=True)
@@ -1502,8 +1648,9 @@ def run_phase1(
 
     while t.is_alive():
         time.sleep(1.0)
-        yield (result["phase"], read_log_tail(800), gr.update(visible=False), *empty_rows, gr.update(visible=False), [],
-               gr.update(interactive=False, value="⏳ Analizando..."))
+        yield (result["phase"], read_log_tail(800), gr.update(visible=False), *empty_rows,
+               gr.update(interactive=False, value="P2 · Pendiente artifact P1"), [],
+               gr.update(interactive=False, value="P1 · Ejecutando..."))
 
     t.join()
 
@@ -1598,9 +1745,9 @@ def run_phase1(
         read_log_tail(800),
         gr.update(visible=True),   # spk_section
         *row_updates,              # 6×4 = 24 items
-        gr.update(visible=True),   # btn_phase2
+        gr.update(interactive=True, value="Ejecutar P2 · Síntesis TTS"),
         speakers,                  # state_speakers
-        gr.update(interactive=True, value="Analizar video (Fase 1)"),  # btn_phase1
+        gr.update(interactive=True, value="Ejecutar P1 · ASR + Diarización"),  # btn_phase1
     )
 
 
@@ -1615,12 +1762,12 @@ def run_phase2(
     Yields same 7-tuple as old run_pyvideotrans_pipeline.
     """
     if not video_file:
-        yield "Error", "Por favor selecciona un video.", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
+        yield "Error", "P2 ERROR · Se requiere seleccionar un archivo de entrada.", None, None, None, None, None, gr.update(interactive=True, value="Ejecutar P2 · Síntesis TTS")
         return
 
     video_path = _parse_dropdown_choice(video_file, NETWORK_USER_INPUT)
     if not video_path or not os.path.isfile(video_path):
-        yield "Error", f"Archivo inválido: {video_path}", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
+        yield "Error", f"P2 ERROR · Ruta de entrada no válida: {video_path}", None, None, None, None, None, gr.update(interactive=True, value="Ejecutar P2 · Síntesis TTS")
         return
 
     expected_tail_args = 6
@@ -1672,7 +1819,7 @@ def run_phase2(
     translate_type = TRANSLATE_TYPE_MAP.get(llm_model)
     tts_type = TTS_TYPE_MAP.get(tts_model)
     if asr_type is None or translate_type is None or tts_type is None:
-        yield "Error", f"Config inválida: LLM={llm_model}, TTS={tts_model}", None, None, None, None, None, gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)")
+        yield "Error", f"P2 ERROR · Config. de modelos inválida — LLM={llm_model}, TTS={tts_model}", None, None, None, None, None, gr.update(interactive=True, value="Ejecutar P2 · Síntesis TTS")
         return
 
     clear_log()
@@ -1686,14 +1833,14 @@ def run_phase2(
 
     result = {"audio": None, "video": None, "json_timestamps": None, "srt_file": None,
               "download_audio": None, "status": "running", "error": None,
-              "phase": "Fase 2: Iniciando doblaje con voces asignadas..."}
+              "phase": "P2 · Inicializando pipeline TTS..."}
 
     def worker():
         try:
             current_video_path = video_path
 
             if test_mode:
-                result["phase"] = "Modo Test: Recortando video a 30s..."
+                result["phase"] = "TEST · Truncando stream a 30 s..."
                 ui_log.info(result["phase"])
                 source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
                 safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
@@ -1723,7 +1870,7 @@ def run_phase2(
                 "--nums_diariz", "0",
             ]
 
-            result["phase"] = "Fase 2: Pipeline de doblaje activo..."
+            result["phase"] = "P2 · Pipeline TTS/doblaje activo..."
             ui_log.info(f"Ejecutando Fase 2: {' '.join(cmd)}")
             run_started_at = time.time()
 
@@ -1782,7 +1929,7 @@ def run_phase2(
                             eta_txt = eta.group(1) if eta else "--:--"
                             result["phase"] = f"Qwen TTS: {done_n}/{total_n} ({pct:.1f}%) · ETA {eta_txt}"
                         else:
-                            result["phase"] = "Qwen TTS en progreso..."
+                            result["phase"] = "P2 · Qwen TTS en curso..."
                     vt_recent_lines.append(line_clean)
                     if len(vt_recent_lines) > 120:
                         vt_recent_lines.pop(0)
@@ -1808,7 +1955,7 @@ def run_phase2(
                         "Revisa las referencias de voz."
                     )
 
-            result["phase"] = "Recolectando outputs..."
+            result["phase"] = "P2 · Recolectando artefactos de salida..."
             ui_log.info(result["phase"])
 
             original_base = os.path.splitext(os.path.basename(video_path))[0]
@@ -1821,7 +1968,7 @@ def run_phase2(
                 min_mtime=run_started_at - 120,
             )
             if not vt_output_dir:
-                raise RuntimeError("Fase 2 terminó pero no se encontró la carpeta de salida.")
+                raise RuntimeError("P2 ERROR · Pipeline completó pero no se encontró carpeta de salida.")
 
             safe_name = original_safe
             vt_mp4 = _pick_best_output_mp4(vt_output_dir, ui_log)
@@ -1829,7 +1976,7 @@ def run_phase2(
             shutil.copy2(vt_mp4, final_mp4)
 
             if apply_video_fx:
-                result["phase"] = "Aplicando ajustes visuales..."
+                result["phase"] = "P2 · Aplicando filtros de video..."
                 enhanced_tmp = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed_enhanced_tmp.mp4")
                 _apply_video_enhancements(final_mp4, enhanced_tmp, brightness, contrast, color, sharpness)
                 os.replace(enhanced_tmp, final_mp4)
@@ -1866,13 +2013,13 @@ def run_phase2(
                 result["json_timestamps"] = json_out
 
             result["status"] = "ok"
-            result["phase"] = "¡Doblaje Fase 2 Completado!"
+            result["phase"] = "P2 · Pipeline completado."
             ui_log.info(result["phase"])
 
         except Exception as e:
             result["status"] = "fail"
             result["error"] = str(e)
-            result["phase"] = f"❌ Error Fase 2: {e}"
+            result["phase"] = f"P2 ERROR · {e}"
             ui_log.error(f"Fase 2 falló: {e}\n{traceback.format_exc()}")
 
     t = threading.Thread(target=worker, daemon=True)
@@ -1884,7 +2031,7 @@ def run_phase2(
             result["phase"], read_log_tail(1500),
             result["audio"], result["video"],
             result.get("json_timestamps"), result.get("srt_file"), result.get("download_audio"),
-            gr.update(interactive=False, value="⏳ Doblando..."),
+            gr.update(interactive=False, value="P2 · Procesando..."),
         )
 
     t.join()
@@ -1892,7 +2039,7 @@ def run_phase2(
         result["phase"], read_log_tail(1500),
         result["audio"], result["video"],
         result.get("json_timestamps"), result.get("srt_file"), result.get("download_audio"),
-        gr.update(interactive=True, value="Doblar con voces asignadas (Fase 2)"),
+        gr.update(interactive=True, value="Ejecutar P2 · Síntesis TTS"),
     )
 
 
@@ -1959,14 +2106,14 @@ def run_pyvideotrans_pipeline(
     ui_log.info(f"Procesando en NVMe: {LOCAL_DIR}")
     ui_log.info("=" * 80)
 
-    result = {"audio": None, "video": None, "json_timestamps": None, "srt_file": None, "download_audio": None, "status": "running", "error": None, "phase": "Preparando motor pyvideotrans..."}
+    result = {"audio": None, "video": None, "json_timestamps": None, "srt_file": None, "download_audio": None, "status": "running", "error": None, "phase": "Pipeline · Inicializando motor pyvideotrans..."}
 
     def worker():
         try:
             current_video_path = video_path
             
             if test_mode:
-                result["phase"] = "Modo Test: Recortando video a 30 segundos..."
+                result["phase"] = "TEST · Truncando stream a 30 s..."
                 ui_log.info(result["phase"])
                 source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
                 safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
@@ -2008,7 +2155,7 @@ def run_pyvideotrans_pipeline(
                 # Sin diarización explícita, Qwen local puede clonar por línea.
                 cmd.extend(["--voice_role", "clone"])
             
-            result["phase"] = "Fase Activa: Procesando pipeline pesado de pyvideotrans..."
+            result["phase"] = "Pipeline · ASR + TTS en proceso..."
             ui_log.info(f"Ejecutando subproceso: {' '.join(cmd)}")
             run_started_at = time.time()
 
@@ -2076,7 +2223,7 @@ def run_pyvideotrans_pipeline(
                                 f"({pct:.1f}%) · ETA {eta_txt}"
                             )
                         else:
-                            result["phase"] = "Qwen TTS en progreso..."
+                            result["phase"] = "Pipeline · Qwen TTS en curso..."
                     vt_recent_lines.append(line_clean)
                     if len(vt_recent_lines) > 120:
                         vt_recent_lines.pop(0)
@@ -2115,7 +2262,7 @@ def run_pyvideotrans_pipeline(
                     )
             
             # === RECOLECTAR Y ADAPTAR OUTPUTS ===
-            result["phase"] = "Adaptando datos e incrustando en el ecosistema QDP..."
+            result["phase"] = "Pipeline · Consolidando artefactos de salida..."
             ui_log.info(result["phase"])
             
             original_base = os.path.splitext(os.path.basename(video_path))[0]
@@ -2138,7 +2285,7 @@ def run_pyvideotrans_pipeline(
             shutil.copy2(vt_mp4, final_mp4)
 
             if apply_video_fx:
-                result["phase"] = "Aplicando ajustes visuales al video final..."
+                result["phase"] = "Pipeline · Aplicando filtros de video..."
                 ui_log.info(
                     "Aplicando filtros de video: "
                     f"brightness={brightness}, contrast={contrast}, color={color}, sharpness={sharpness}"
@@ -2210,13 +2357,13 @@ def run_pyvideotrans_pipeline(
                 ui_log.info(f"Artefacto speaker copiado: {dst_art}")
             
             result["status"] = "ok"
-            result["phase"] = "¡Doblaje Master Completado!"
+            result["phase"] = "Pipeline · Completado con éxito."
             ui_log.info(result["phase"])
             
         except Exception as e:
             result["status"] = "fail"
             result["error"] = str(e)
-            result["phase"] = f"Error crítico: {e}"
+            result["phase"] = f"PIPELINE ERROR · {e}"
             ui_log.error(f"Fallo en motor PyVideoTrans: {e}\n{traceback.format_exc()}")
 
     t = threading.Thread(target=worker, daemon=True)
@@ -2254,7 +2401,7 @@ with gr.Blocks(
 ) as demo:
     gr.HTML(STARFIELD_HTML)
     gr.HTML("<div id='qdp-header'>QUANTUM DUBBING PIPELINE</div>"
-            "<div id='qdp-subheader'>Apple-Style Minimalist Interface</div>")
+            "<div id='qdp-subheader'>Interfaz de trabajo por fases</div>")
 
     with gr.Tabs():
         # =================================================================
@@ -2283,13 +2430,16 @@ with gr.Blocks(
             with gr.Row():
                 cb_test_mode = gr.Checkbox(label="Modo de prueba (cortar a 30s)", value=False, interactive=True)
 
+            with gr.Row():
+                ui_phase_badges = gr.HTML(_phase_badges_html(None), elem_id="qdp-phase-badges")
+
             # ── FASE 1: Análisis de Speakers ──────────────────────────────────────
-            gr.Markdown("### 🎙️ Fase 1 · Analizar video")
+            gr.Markdown("### Fase 1 · Analizar video")
             gr.Markdown(
                 "Transcribe, traduce y detecta quiénes hablan. "
                 "Después asigna una voz de referencia a cada speaker y lanza la Fase 2."
             )
-            btn_phase1 = gr.Button("Analizar video (Fase 1)", variant="secondary", size="lg")
+            btn_phase1 = gr.Button("Ejecutar P1 · ASR + Diarización", variant="secondary", size="lg")
 
             # ── SPEAKER SECTION (oculto hasta completar Fase 1) ─────────────────
             # Configuración dinámica de speakers (máximo 50)
@@ -2298,7 +2448,7 @@ with gr.Blocks(
             _initial_voice_choices = STATIC_VOICE_LABELS[:]
 
             with gr.Column(visible=False) as spk_section:
-                gr.Markdown("### 🗣️ Speakers detectados — Asigna una voz a cada speaker")
+                gr.Markdown("### Speakers detectados — Asigna una voz a cada speaker")
                 gr.Markdown(f"*Máximo {N_SPK_MAX} speakers soportados. Usa `PYVIDEOTRANS_MAX_SPEAKERS` para personalizar.*")
 
                 # Pre-build N_SPK_MAX rows; Phase 1 callback makes them visible
@@ -2337,11 +2487,11 @@ with gr.Blocks(
 
             # ── FASE 2 ────────────────────────────────────────────────────────────
             btn_phase2 = gr.Button(
-                "Doblar con voces asignadas (Fase 2)", variant="primary", size="lg", visible=False,
+                "P2 · Pendiente artifact P1", variant="primary", size="lg", interactive=False,
             )
 
             with gr.Column(elem_id="qdp-frame-editor"):
-                gr.Markdown("### 🖼️ Editor de Frame (Referencia de Color)")
+                gr.Markdown("### Editor de Frame (Referencia de Color)")
                 with gr.Row():
                     frame_second = gr.Slider(
                         minimum=0,
@@ -2386,7 +2536,7 @@ with gr.Blocks(
                     interactive=True,
                 )
 
-            ui_active_phase = gr.Textbox(label="Fase Activa", value="Esperando inicio...", interactive=False, lines=1)
+            ui_active_phase = gr.Textbox(label="Estado del pipeline", value="Sin pipeline activo", interactive=False, lines=1)
             ui_terminal = gr.Textbox(label="Terminal de Logs", elem_id="qdp-log", interactive=False, lines=15, autoscroll=True)
             
             with gr.Row():
@@ -2405,7 +2555,7 @@ with gr.Blocks(
             gr.Markdown(
                 "### Generador de subtitulos para video doblado\n"
                 "Carga el video ya doblado y genera automáticamente subtítulos estilizados "
-                "en español usando transcripción con IA (Whisper).\n"
+                "en español usando transcripción con IA (Qwen ASR).\n"
                 "El resultado será un video con subtítulos profesionales estilo documental."
             )
             
@@ -2441,7 +2591,7 @@ with gr.Blocks(
                 )
 
             with gr.Group():
-                gr.Markdown("### 🧩 Preview y estilo de subtítulos")
+                gr.Markdown("###  Preview y estilo de subtítulos")
                 gr.Markdown(
                     "Extrae un frame del video y úsalo como template para ajustar el look de los subtítulos antes de renderizar."
                 )
@@ -2540,7 +2690,7 @@ with gr.Blocks(
             
             ui_subs_log = gr.Textbox(
                 label="Terminal de Subtítulos",
-                elem_id="qdp-log",
+                elem_id="qdp-subs-log",
                 interactive=False,
                 lines=8,
                 autoscroll=True,
@@ -2660,15 +2810,15 @@ with gr.Blocks(
     def handle_subtitle_generation(video_input, lang, preview_mode):
         """Generar subtítulos del video doblado."""
         if not video_input:
-            return "", "", "❌ Selecciona un video primero"
+            return "", "", " Selecciona un video primero"
         
         try:
             if ui_generate_subtitles is None:
-                return "", "", "❌ Módulo de subtítulos no disponible"
+                return "", "", " Módulo de subtítulos no disponible"
 
             video_path = _resolve_subtitle_media_path(video_input)
             if not video_path or not os.path.exists(video_path):
-                return "", "", "❌ Video no encontrado"
+                return "", "", " Video no encontrado"
 
             # Ejecutar en background
             def update_log(msg):
@@ -2688,7 +2838,7 @@ with gr.Blocks(
             return srt_obj, json_obj, msg
         
         except Exception as e:
-            return "", "", f"❌ Error: {str(e)}"
+            return "", "", f" Error: {str(e)}"
     
     def handle_subtitle_rendering(
         video_input,
@@ -2712,26 +2862,26 @@ with gr.Blocks(
     ):
         """Renderizar video con subtítulos."""
         if not video_input:
-            return "", "❌ Selecciona un video primero"
+            return "", " Selecciona un video primero"
         
         if not srt_path:
-            return "", "❌ Carga un archivo SRT primero"
+            return "", " Carga un archivo SRT primero"
         
         try:
             if ui_render_subtitles is None:
-                return "", "❌ Módulo de subtítulos no disponible"
+                return "", " Módulo de subtítulos no disponible"
 
             video_path = _resolve_subtitle_media_path(video_input)
             if not video_path or not os.path.exists(video_path):
-                return "", "❌ Video no encontrado"
+                return "", " Video no encontrado"
 
             subtitle_file_path = _resolve_file_component_path(srt_path)
             if not subtitle_file_path:
-                return "", "❌ No se pudo resolver el archivo SRT para renderizar"
+                return "", " No se pudo resolver el archivo SRT para renderizar"
 
             # Render requiere fuente de video. Si es audio, sugerir usar un video.
             if Path(video_path).suffix.lower() in {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}:
-                return "", "❌ Para renderizar subtítulos sobre imagen, selecciona un archivo de video. El audio sí sirve para generar SRT/JSON."
+                return "", " Para renderizar subtítulos sobre imagen, selecciona un archivo de video. El audio sí sirve para generar SRT/JSON."
 
             style_config = _subtitle_style_payload(
                 preset_label,
@@ -2767,7 +2917,7 @@ with gr.Blocks(
             return output_video, msg
         
         except Exception as e:
-            return "", f"❌ Error: {str(e)}"
+            return "", f" Error: {str(e)}"
 
     def handle_extract_subtitle_frame(
         video_input,
@@ -2789,12 +2939,12 @@ with gr.Blocks(
         sample_text,
     ):
         if extract_frame is None or render_subtitle_preview_on_frame is None:
-            return None, None, "❌ Preview de subtítulos no disponible"
+            return None, None, " Preview de subtítulos no disponible"
         video_path = _resolve_subtitle_media_path(video_input)
         if not video_path or not os.path.isfile(video_path):
-            return None, None, "❌ Selecciona un video válido primero"
+            return None, None, " Selecciona un video válido primero"
         if Path(video_path).suffix.lower() in {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}:
-            return None, None, "❌ El preview visual necesita un video, no solo audio"
+            return None, None, " El preview visual necesita un video, no solo audio"
         try:
             frame_path = extract_frame(video_path, LOCAL_TEMP, float(second))
             style_config = _subtitle_style_payload(
@@ -2820,9 +2970,9 @@ with gr.Blocks(
                 sample_text=style_config.get("sample_text"),
                 output_path=os.path.join(LOCAL_TEMP, "subtitle_style_preview.jpg"),
             )
-            return frame_path, preview_path, f"✅ Frame y preview generados en t={int(second)}s"
+            return frame_path, preview_path, f" Frame y preview generados en t={int(second)}s"
         except Exception as exc:
-            return None, None, f"❌ Error generando preview: {exc}"
+            return None, None, f" Error generando preview: {exc}"
 
     def handle_update_subtitle_style_preview(
         frame_input,
@@ -2843,9 +2993,9 @@ with gr.Blocks(
         sample_text,
     ):
         if render_subtitle_preview_on_frame is None:
-            return None, "❌ Preview de subtítulos no disponible"
+            return None, " Preview de subtítulos no disponible"
         if not frame_input:
-            return None, "❌ Extrae un frame base primero"
+            return None, " Extrae un frame base primero"
         try:
             style_config = _subtitle_style_payload(
                 preset_label,
@@ -2870,9 +3020,9 @@ with gr.Blocks(
                 sample_text=style_config.get("sample_text"),
                 output_path=os.path.join(LOCAL_TEMP, "subtitle_style_preview.jpg"),
             )
-            return preview_path, "✅ Preview de subtítulos actualizado"
+            return preview_path, " Preview de subtítulos actualizado"
         except Exception as exc:
-            return None, f"❌ Error actualizando preview: {exc}"
+            return None, f" Error actualizando preview: {exc}"
     
     def update_subs_video_dropdown():
         media_files = _get_user_videos() + _get_user_audios()
@@ -2892,13 +3042,13 @@ with gr.Blocks(
 
     def handle_extract_frame(video_input, second):
         if extract_frame is None:
-            return None, None, "❌ Módulo frame_editor no disponible"
+            return None, None, " Módulo frame_editor no disponible"
         if not video_input:
-            return None, None, "❌ Selecciona un video primero"
+            return None, None, " Selecciona un video primero"
         try:
             video_path = _parse_dropdown_choice(video_input, NETWORK_USER_INPUT)
             if not video_path or not os.path.isfile(video_path):
-                return None, None, f"❌ Video no encontrado: {video_path}"
+                return None, None, f" Video no encontrado: {video_path}"
 
             frame_path = extract_frame(video_path, LOCAL_TEMP, float(second))
             adjusted_path = apply_frame_adjustments(
@@ -2909,15 +3059,15 @@ with gr.Blocks(
                 sharpness=1.0,
                 output_dir=LOCAL_TEMP,
             )
-            return frame_path, adjusted_path, f"✅ Frame extraído en t={int(second)}s"
+            return frame_path, adjusted_path, f" Frame extraído en t={int(second)}s"
         except Exception as e:
-            return None, None, f"❌ Error al extraer frame: {e}"
+            return None, None, f" Error al extraer frame: {e}"
 
     def handle_apply_frame(frame_input, brightness, contrast, color, sharpness):
         if apply_frame_adjustments is None:
-            return None, "❌ Módulo frame_editor no disponible"
+            return None, " Módulo frame_editor no disponible"
         if not frame_input:
-            return None, "❌ Extrae un frame primero"
+            return None, " Extrae un frame primero"
         try:
             out = apply_frame_adjustments(
                 frame_input,
@@ -2927,9 +3077,9 @@ with gr.Blocks(
                 sharpness=sharpness,
                 output_dir=LOCAL_TEMP,
             )
-            return out, "✅ Preview actualizado"
+            return out, " Preview actualizado"
         except Exception as e:
-            return None, f"❌ Error aplicando ajustes: {e}"
+            return None, f" Error aplicando ajustes: {e}"
     
     # Conectar events
     def update_file_dropdowns():
@@ -2961,12 +3111,13 @@ with gr.Blocks(
 
     def handle_reel_video_upload(filepath):
         if not filepath:
-            return "", "❌ No se subió video"
+            return "", " No se subió video"
         if not os.path.exists(filepath):
-            return "", "❌ Video no encontrado"
-        return filepath, f"✅ Video para reels cargado: {Path(filepath).name}"
+            return "", " Video no encontrado"
+        return filepath, f" Video para reels cargado: {Path(filepath).name}"
 
     up_video.upload(handle_video_upload, inputs=[up_video], outputs=[dd_video])
+    dd_video.change(_phase_badges_html, inputs=[dd_video], outputs=[ui_phase_badges])
 
     btn_refresh_files.click(update_file_dropdowns, inputs=None, outputs=[dd_video])
     btn_refresh_json_reels.click(update_json_dropdown, inputs=None, outputs=[dd_json_reels])
@@ -2996,6 +3147,10 @@ with gr.Blocks(
         run_phase1,
         inputs=[dd_video, cb_test_mode],
         outputs=_p1_outputs,
+    ).then(
+        _phase_badges_html,
+        inputs=[dd_video],
+        outputs=[ui_phase_badges],
     )
 
     # ── Phase 2: Doblar con voces asignadas ──────────────────────────────────
@@ -3011,7 +3166,13 @@ with gr.Blocks(
             slider_brightness, slider_contrast, slider_color, slider_sharpness,
         ],
         outputs=_p2_outputs,
+    ).then(
+        _phase_badges_html,
+        inputs=[dd_video],
+        outputs=[ui_phase_badges],
     )
+
+    demo.load(_phase_badges_html, inputs=[dd_video], outputs=[ui_phase_badges])
 
     # Tab 2: Subtítulos
     up_video_subs.upload(handle_subs_video_upload, inputs=[up_video_subs], outputs=[dd_video_subs])
@@ -3082,7 +3243,7 @@ with gr.Blocks(
     def handle_json_upload(file_obj):
         """Handle JSON file upload for reels analysis."""
         if not file_obj:
-            return "", "❌ No file uploaded"
+            return "", " No file uploaded"
         
         try:
             # file_obj is a NamedTemporaryFile
@@ -3090,9 +3251,9 @@ with gr.Blocks(
             ui_log.info(f"JSON uploaded: {uploaded_path}")
             
             # Store path for later use
-            return uploaded_path, f"✅ JSON cargado: {Path(file_obj.name).name}"
+            return uploaded_path, f" JSON cargado: {Path(file_obj.name).name}"
         except Exception as e:
-            return "", f"❌ Error al cargar JSON: {str(e)}"
+            return "", f" Error al cargar JSON: {str(e)}"
 
     def _resolve_reels_video_path(uploaded_video_path, selected_video_choice):
         if uploaded_video_path and os.path.exists(uploaded_video_path):
@@ -3131,16 +3292,16 @@ with gr.Blocks(
             final_json = _parse_dropdown_choice(json_choice, LOCAL_TEMP)
 
         if not final_json:
-            return "❌ Selecciona o sube un JSON", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
+            return " Selecciona o sube un JSON", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
         if not os.path.exists(final_json):
-            return "❌ Archivo JSON no existe", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
+            return " Archivo JSON no existe", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
 
         try:
             data = json.loads(Path(final_json).read_text(encoding='utf-8'))
             if isinstance(data, dict) and 'reels' in data:
                 reels = data.get('reels', [])
                 labels = _build_reel_labels(reels)
-                summary = f"✅ JSON de reels cargado ({len(labels)} reels)"
+                summary = f" JSON de reels cargado ({len(labels)} reels)"
                 return summary, gr.update(choices=labels, value=labels, visible=True), final_json, final_json, gr.update(visible=True)
 
             ui_log.info(f"Analizando con Gemini: {final_json}")
@@ -3150,29 +3311,29 @@ with gr.Blocks(
 
             status, specs_path, reel_list = ui_analyze_reels(final_json, progress_callback)
             if status == "Error":
-                return f"❌ {specs_path}", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
+                return f" {specs_path}", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
 
             specs_data = json.loads(Path(specs_path).read_text(encoding='utf-8'))
             labels = _build_reel_labels(specs_data.get('reels', []))
-            summary = f"✅ {len(labels)} reels detectados\n\n{specs_data['metadata'].get('gemini_analysis', '')}"
+            summary = f" {len(labels)} reels detectados\n\n{specs_data['metadata'].get('gemini_analysis', '')}"
             return summary, gr.update(choices=labels, value=labels, visible=True), specs_path, specs_path, gr.update(visible=True)
         except Exception as e:
             ui_log.error(f"Error en análisis/carga de reels: {e}")
-            return f"❌ {str(e)}", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
+            return f" {str(e)}", gr.update(choices=[], value=[], visible=False), None, None, gr.update(visible=False)
 
     def handle_render_selected_reels(specs_json_path, selected_reels, uploaded_video_path, selected_video_choice):
         if not specs_json_path or not os.path.exists(specs_json_path):
-            return "❌ Carga o genera primero un JSON de reels válido", None, []
+            return " Carga o genera primero un JSON de reels válido", None, []
         if not selected_reels:
-            return "❌ Marca al menos un reel para generar", None, []
+            return " Marca al menos un reel para generar", None, []
 
         video_path = _resolve_reels_video_path(uploaded_video_path, selected_video_choice)
         if not video_path:
-            return "❌ Selecciona o sube el video doblado final", None, []
+            return " Selecciona o sube el video doblado final", None, []
 
         subtitle_path = _find_subtitle_for_video(video_path)
         if not subtitle_path:
-            return "❌ No se encontró archivo SRT para ese video", None, []
+            return " No se encontró archivo SRT para ese video", None, []
 
         reels_output_dir = os.path.join(NETWORK_OUTPUT, "reels")
         os.makedirs(reels_output_dir, exist_ok=True)
@@ -3190,13 +3351,13 @@ with gr.Blocks(
                 lambda msg: ui_log.info(msg),
             )
             if status == "Error":
-                logs.append(f"❌ {reel_label}: {output_video}")
+                logs.append(f" {reel_label}: {output_video}")
                 continue
-            logs.append(f"✅ {reel_label}: {Path(output_video).name}")
+            logs.append(f" {reel_label}: {Path(output_video).name}")
             rendered.append(output_video)
 
         if not rendered:
-            return "\n".join(logs) if logs else "❌ No se pudo generar ningún reel", None, []
+            return "\n".join(logs) if logs else " No se pudo generar ningún reel", None, []
         return "\n".join(logs), rendered[0], rendered
     
     # Tab 3 Event Handlers

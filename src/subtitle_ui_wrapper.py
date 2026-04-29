@@ -12,6 +12,17 @@ import threading
 import time
 
 
+def _infer_subtitle_format(subtitle_path: str, declared: str = "srt") -> str:
+    ext = Path(subtitle_path or "").suffix.lower()
+    if ext == ".json":
+        return "json"
+    if ext == ".vtt":
+        return "vtt"
+    if ext == ".srt":
+        return "srt"
+    return (declared or "srt").lower()
+
+
 def generate_subtitles_worker(
     video_path: str,
     language: str = 'es',
@@ -27,9 +38,7 @@ def generate_subtitles_worker(
             return "", "", f"❌ Video no encontrado: {video_path}"
         
         # Import here to avoid issues if subtitle_generator not in path
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from subtitle_generator import generate_subtitles_from_video
+        from src.subtitle_generator import generate_subtitles_from_video
         
         if progress_callback:
             progress_callback("🎬 Extrayendo audio del video...")
@@ -80,9 +89,7 @@ def render_subtitles_worker(
         if not os.path.exists(subtitle_path):
             return "", f"❌ Archivo de subtítulos no encontrado: {subtitle_path}"
         
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from subtitle_renderer import add_subtitles_to_video_ffmpeg
+        from src.subtitle_renderer import add_subtitles_to_video_ffmpeg
         
         if progress_callback:
             progress_callback("🎨 Agregando subtítulos al video...")
@@ -94,11 +101,13 @@ def render_subtitles_worker(
         suffix = "_subtitled_preview.mp4" if preview_duration_sec else "_subtitled.mp4"
         output_video = str(output_dir / f"{base_name}{suffix}")
 
+        resolved_format = _infer_subtitle_format(subtitle_path, subtitle_format)
+
         result = add_subtitles_to_video_ffmpeg(
             video_path,
             subtitle_path,
             output_path=output_video,
-            subtitle_format=subtitle_format,
+            subtitle_format=resolved_format,
             fontsize=60,
             style_config=style_config,
             preview_duration_sec=preview_duration_sec,

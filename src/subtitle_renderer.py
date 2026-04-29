@@ -128,7 +128,72 @@ def parse_srt(srt_path: str) -> List[Dict]:
 
 def parse_json(json_path: str) -> List[Dict]:
     with open(json_path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+        payload = json.load(handle)
+
+    if isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = payload.get("segments") or payload.get("sentences") or payload.get("paragraphs") or []
+    else:
+        rows = []
+
+    normalized: List[Dict] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        start_raw = item.get("start") if item.get("start") is not None else item.get("start_ms")
+        end_raw = item.get("end") if item.get("end") is not None else item.get("end_ms")
+        try:
+            start = float(start_raw)
+            end = float(end_raw)
+        except Exception:
+            continue
+        # Accept ms-shaped values transparently.
+        if start > 86400:
+            start = start / 1000.0
+        if end > 86400:
+            end = end / 1000.0
+        if end <= start:
+            continue
+        text = str(item.get("text") or item.get("text_es") or item.get("text_en") or "").strip()
+        normalized.append({"start": start, "end": end, "text": text})
+    return normalized
+
+
+def parse_vtt(vtt_path: str) -> List[Dict]:
+    content = Path(vtt_path).read_text(encoding="utf-8")
+    segments = []
+    blocks = re.split(r"\n\s*\n", content.strip())
+    for block in blocks:
+        lines = block.strip().split("\n")
+        if not lines:
+            continue
+        ts_line = None
+        for ln in lines:
+            if " --> " in ln:
+                ts_line = ln
+                break
+        if not ts_line:
+            continue
+        try:
+            start_raw, end_raw = [x.strip() for x in ts_line.split(" --> ", 1)]
+            start = _srt_time_to_seconds(start_raw.replace(".", ","))
+            end = _srt_time_to_seconds(end_raw.replace(".", ","))
+        except Exception:
+            continue
+        text_lines = []
+        ts_found = False
+        for ln in lines:
+            if ln == ts_line:
+                ts_found = True
+                continue
+            if not ts_found:
+                continue
+            text_lines.append(ln)
+        text = "\n".join(text_lines).strip()
+        if end > start:
+            segments.append({"start": start, "end": end, "text": text})
+    return segments
 
 
 def _probe_dimensions(media_path: str) -> Tuple[int, int]:
@@ -347,7 +412,13 @@ def add_subtitles_to_video_ffmpeg(
         output_path = f"{Path(video_path).stem}_subtitled.mp4"
 
     print(f"[Subtitle] Parsing {subtitle_format} file...")
-    segments = parse_json(subtitle_path) if subtitle_format.lower() == "json" else parse_srt(subtitle_path)
+    fmt = subtitle_format.lower()
+    if fmt == "json":
+        segments = parse_json(subtitle_path)
+    elif fmt == "vtt":
+        segments = parse_vtt(subtitle_path)
+    else:
+        segments = parse_srt(subtitle_path)
     if not segments:
         raise ValueError(f"No subtitles found in {subtitle_path}")
 

@@ -1038,8 +1038,10 @@ def run(*, translate_type=0,
         from videotrans.translator._minimax import MiniMax
         return MiniMax(**kwargs).run()
     if translate_type == M2M100_INDEX:
-        from videotrans.translator._nllb200 import NLLB200Trans
-        return NLLB200Trans(**kwargs).run()
+        raise RuntimeError(
+            "Legacy local NLLB/M2M100 translation was removed from the active workflow. "
+            "Use Gemini or another online translator instead."
+        )
     if translate_type == CAMB_INDEX:
         from videotrans.translator._camb import CambTranslator
         return CambTranslator(**kwargs).run()

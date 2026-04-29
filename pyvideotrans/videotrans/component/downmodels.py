@@ -465,13 +465,6 @@ class DownmodelsWindow(QWidget):
                 "dir": MODEL_DIR,
                 "check": f"{MODEL_DIR}m2m100_12b/model.bin"
             },
-            {
-                "name": TRANS.get("task_realtime"),
-                "zip_folder":"onnx",                
-                "url": "https://modelscope.cn/models/himyworld/videotrans/resolve/master/realtimestt.zip",
-                "dir": f"{MODEL_DIR}",
-                "check": f"{MODEL_DIR}onnx/encoder.onnx"
-            }
         ]
         
         # 2. OpenAI Whisper (单文件 PT)

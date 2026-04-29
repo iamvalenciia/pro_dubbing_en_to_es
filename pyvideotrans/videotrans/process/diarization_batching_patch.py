@@ -68,155 +68,108 @@ def apply_diarization_batching(pipeline, batch_size=16, num_speakers=-1):
     
     # Store original forward
     _original_forward = pipeline.forward
-    _stats = {'segments': 0, 'batches': 0, 'time_extract': 0, 'time_sv': 0, 'time_cluster': 0}
+    _stats = {'segments': 0, 'batches': 0, 'time_sv': 0}
     
     def _batched_forward(inputs):
-        """Batched forward pass for diarization."""
+        """Batched embedding extraction for precomputed diarization segments.
+
+        IMPORTANT: `inputs` here is the list returned by ModelScope `chunk()` where each
+        item is `[start_time_sec, end_time_sec, audio_chunk_np]`.
+        We only batch SV embedding calls and keep the exact segment ordering/semantics.
+        """
         import time
         
         try:
-            # Step 1: Extract audio segments
-            t0 = time.time()
-            
-            # Load waveform
-            try:
-                from modelscope.utils.audio.audio_utils import read_wav_file
-                if isinstance(inputs, str):
-                    waveform, sr = read_wav_file(inputs)
-                else:
-                    waveform = inputs
-                    sr = 16000
-            except ImportError:
-                # Fallback: use soundfile
-                import soundfile as sf
-                waveform, sr = sf.read(inputs) if isinstance(inputs, str) else (inputs, 16000)
-            
-            # Apply VAD to get speech segments
-            try:
-                vad_segments = pipeline.vad_pipeline(inputs)
-            except:
-                # Fallback: assume entire audio is speech
-                vad_segments = [[0, len(waveform) / sr]]
-            
-            # Get segmentation parameters
-            seg_dur = pipeline.config.get('seg_dur', 1.5)
-            seg_shift = pipeline.config.get('seg_shift', 0.75)
-            
-            # Extract sliding windows
-            extracted_segments = []
-            seg_dur_samples = int(seg_dur * sr)
-            seg_shift_samples = int(seg_shift * sr)
-            
-            for vad_start, vad_end in vad_segments:
-                start_sample = int(vad_start * sr)
-                end_sample = int(vad_end * sr)
-                
-                pos = start_sample
-                while pos + seg_dur_samples <= end_sample:
-                    chunk = waveform[pos:pos + seg_dur_samples]
-                    extracted_segments.append(chunk)
-                    pos += seg_shift_samples
-            
-            t_extract = time.time() - t0
-            _stats['segments'] = len(extracted_segments)
-            _stats['time_extract'] = t_extract
-            
-            if debug:
-                logger.debug(f'[DIAR-BATCH] Extracted {len(extracted_segments)} segments in {t_extract:.2f}s')
-            
-            # Step 2: Process segments in batches with SV pipeline
+            if not isinstance(inputs, list) or len(inputs) == 0:
+                return _original_forward(inputs)
+
+            # Verify expected segment format [start, end, chunk]
+            if not (isinstance(inputs[0], (list, tuple)) and len(inputs[0]) >= 3):
+                return _original_forward(inputs)
+
+            # Process segments in batches with SV pipeline
             t0 = time.time()
             embeddings = []
-            
-            for batch_idx in range(0, len(extracted_segments), batch_size):
-                batch_end = min(batch_idx + batch_size, len(extracted_segments))
-                batch_segments = extracted_segments[batch_idx:batch_end]
-                _stats['batches'] += 1
+            stats_segments = len(inputs)
+            stats_batches = 0
+
+            for batch_idx in range(0, len(inputs), batch_size):
+                batch_end = min(batch_idx + batch_size, len(inputs))
+                batch_segments = inputs[batch_idx:batch_end]
+                batch_chunks = [seg[2] for seg in batch_segments]
+                stats_batches += 1
                 
                 if debug:
-                    logger.debug(f'[DIAR-BATCH] Processing batch {_stats["batches"]}: segments {batch_idx}-{batch_end-1}')
+                    logger.debug(f'[DIAR-BATCH] Processing batch {stats_batches}: segments {batch_idx}-{batch_end - 1}')
                 
                 try:
-                    # Try batch processing
-                    batch_result = pipeline.sv_pipeline(batch_segments, output_emb=True)
-                    
+                    batch_result = pipeline.sv_pipeline(batch_chunks, output_emb=True)
+
                     if isinstance(batch_result, dict) and 'embs' in batch_result:
-                        embs = batch_result['embs']
-                        if embs.size > 0:
+                        embs = np.asarray(batch_result['embs'])
+                        if embs.ndim == 1:
+                            embs = embs.reshape(1, -1)
+
+                        # Keep strict 1:1 mapping between segments and embeddings
+                        if embs.shape[0] == len(batch_chunks):
                             embeddings.append(embs)
+                        else:
+                            raise RuntimeError(
+                                f'Batch embeddings shape mismatch: got {embs.shape}, expected ({len(batch_chunks)}, d)'
+                            )
                     else:
-                        # Fallback: process individually
-                        for seg in batch_segments:
-                            try:
-                                result = pipeline.sv_pipeline([seg], output_emb=True)
-                                if result and 'embs' in result:
-                                    embeddings.append(result['embs'])
-                            except Exception as e:
-                                if debug:
-                                    logger.debug(f'[DIAR-BATCH] SV extraction failed for segment: {e}')
-                
+                        raise RuntimeError('SV batch result missing embs')
+
                 except Exception as batch_err:
                     if debug:
                         logger.debug(f'[DIAR-BATCH] Batch processing failed, falling back to individual: {batch_err}')
-                    
-                    # Fallback: individual processing
+
+                    # Fallback for this batch: preserve exact order
+                    per_batch_embs = []
                     for seg in batch_segments:
                         try:
-                            result = pipeline.sv_pipeline([seg], output_emb=True)
-                            if result and 'embs' in result:
-                                embeddings.append(result['embs'])
+                            result = pipeline.sv_pipeline([seg[2]], output_emb=True)
+                            emb = np.asarray(result['embs'])
+                            if emb.ndim == 1:
+                                emb = emb.reshape(1, -1)
+                            if emb.shape[0] != 1:
+                                raise RuntimeError(f'Expected (1,d) embedding, got {emb.shape}')
+                            per_batch_embs.append(emb)
                         except Exception as e:
-                            if debug:
-                                logger.debug(f'[DIAR-BATCH] SV extraction failed: {e}')
-            
+                            raise RuntimeError(f'SV extraction failed for one segment: {e}')
+
+                    embeddings.append(np.concatenate(per_batch_embs, axis=0))
+
             t_sv = time.time() - t0
+            _stats['segments'] = stats_segments
+            _stats['batches'] = stats_batches
             _stats['time_sv'] = t_sv
             
             if debug:
-                logger.debug(f'[DIAR-BATCH] SV extraction: {_stats["batches"]} batches in {t_sv:.2f}s')
-            
-            # Step 3: Concatenate embeddings
+                logger.debug(f'[DIAR-BATCH] SV extraction: {stats_batches} batches in {t_sv:.2f}s')
+
+            # Concatenate embeddings and return to original pipeline flow.
+            # Clustering + postprocess remain untouched in ModelScope.
             if embeddings:
-                embeddings = np.concatenate(embeddings)
+                embeddings = np.concatenate(embeddings, axis=0)
             else:
-                embeddings = np.zeros((0, 192))
-            
-            # Step 4: Clustering
-            t0 = time.time()
-            spk_labels = pipeline.cluster_backend(
-                embeddings, 
-                oracle_num=num_speakers if num_speakers > 0 else None
-            )
-            t_cluster = time.time() - t0
-            _stats['time_cluster'] = t_cluster
-            
-            if debug:
-                logger.debug(f'[DIAR-BATCH] Clustering: {t_cluster:.2f}s, labels={len(spk_labels)}')
-            
-            # Step 5: Format output
-            result_text = []
-            for idx in range(len(extracted_segments)):
-                if idx < len(spk_labels):
-                    # Calculate time bounds based on segment index
-                    seg_start_sample = idx * seg_shift_samples
-                    seg_end_sample = seg_start_sample + seg_dur_samples
-                    start_time = seg_start_sample / sr
-                    end_time = seg_end_sample / sr
-                    speaker_label = spk_labels[idx]
-                    result_text.append([start_time, end_time, speaker_label])
-            
-            # Log summary
-            total_time = _stats['time_extract'] + _stats['time_sv'] + _stats['time_cluster']
+                raise RuntimeError('No embeddings were produced in batched forward')
+
+            if embeddings.shape[0] != len(inputs):
+                raise RuntimeError(
+                    f'Embedding count mismatch: got {embeddings.shape[0]}, expected {len(inputs)}'
+                )
+
             reduction = _stats['segments'] / max(1, _stats['batches'])
+            seg_dur = float(pipeline.config.get('seg_dur', 1.5))
             rtf = (_stats['segments'] * seg_dur) / max(0.1, _stats['time_sv'])
             
             logger.info(
                 f'[DIAR-BATCH] Summary: segments={_stats["segments"]} → {_stats["batches"]} batches '
-                f'({reduction:.1f}x reduction), RTF={rtf:.2f}x, '
-                f'extract={_stats["time_extract"]:.2f}s sv={_stats["time_sv"]:.2f}s cluster={_stats["time_cluster"]:.2f}s'
+                f'({reduction:.1f}x reduction), RTF={rtf:.2f}x, sv={_stats["time_sv"]:.2f}s'
             )
             
-            return np.array(result_text) if result_text else np.array([])
+            return embeddings
         
         except Exception as e:
             logger.exception(f'[DIAR-BATCH] Batched forward failed, falling back to original: {e}')

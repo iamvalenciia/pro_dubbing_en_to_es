@@ -61,18 +61,22 @@ class Gemini(BaseTrans):
                     ],
                 ),
             ]
-            think_cfg=types.ThinkingConfig(
-                    thinking_budget=int(params.get('gemini_thinking_budget',24576)),
-                )
-            if model.startswith('gemini-3') or model.startswith('gemma-'):
-                think_cfg=types.ThinkingConfig(
-                        thinking_level="HIGH",
-                )
-                
-            generate_content_config = types.GenerateContentConfig(
-                temperature=float(settings.get('aitrans_temperature',0.2)),
-                max_output_tokens=int(params.get("gemini_maxtoken",65530)),
-                safety_settings=[
+            think_cfg = None
+            if not (model.startswith('gemini-1.') or model.startswith('gemini-2.0')):
+                budget = int(params.get('gemini_thinking_budget', 24576))
+                if model.startswith('gemini-3') or model.startswith('gemma-'):
+                    try:
+                        think_cfg = types.ThinkingConfig(thinking_level="HIGH")
+                    except Exception as e:
+                        logger.warning(f"[gemini] thinking_level unsupported by SDK, fallback to budget: {e}")
+                        think_cfg = types.ThinkingConfig(thinking_budget=budget)
+                else:
+                    think_cfg = types.ThinkingConfig(thinking_budget=budget)
+
+            cfg_kwargs = {
+                "temperature": float(settings.get('aitrans_temperature',0.2)),
+                "max_output_tokens": int(params.get("gemini_maxtoken",65530)),
+                "safety_settings": [
                     types.SafetySetting(
                         category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
                         threshold=types.HarmBlockThreshold.BLOCK_NONE,
@@ -90,11 +94,15 @@ class Gemini(BaseTrans):
                         threshold=types.HarmBlockThreshold.BLOCK_NONE,
                     )
                   ],
-
-                thinking_config = think_cfg,
-                system_instruction=[
+                "system_instruction": [
                     types.Part.from_text(text='You are a top-tier Subtitle Translation Engine.'),
                 ],
+            }
+            if think_cfg is not None:
+                cfg_kwargs["thinking_config"] = think_cfg
+
+            generate_content_config = types.GenerateContentConfig(
+                **cfg_kwargs,
             )
             if model.startswith('gemini-1.') or model.startswith('gemini-2.0'):            
                 generate_content_config = types.GenerateContentConfig()

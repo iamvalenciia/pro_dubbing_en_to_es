@@ -1,185 +1,223 @@
-# Quantum Dubbing Pipeline - Production SPEC (RunPod First)
+# Quantum Dubbing Pipeline - SPEC Operativo Actual
 
-## 1. Objetivo del Sistema
-Aplicacion web Gradio para:
-- Doblaje EN -> ES con pyvideotrans como motor principal.
-- Ajustes visuales globales del video final (brillo/contraste/color/nitidez).
-- Subtitulado (SRT/JSON) desde video o audio.
-- Generacion de reels virales 9:16 con Gemini + render por seleccion (checkboxes).
+## 1. Objetivo del sistema
+Aplicación web Gradio para producción de doblaje EN -> ES con foco en RunPod GPU y paridad funcional local.
 
-Este documento define el flujo oficial del proyecto y reemplaza flujos antiguos.
+Capacidades oficiales:
+- Doblaje en 2 fases con asignación manual de voz por speaker.
+- Diarización obligatoria en Fase 1 (si falla, se aborta el run).
+- Render final con ajustes de video y mezcla de audio configurable.
+- Generación y render de subtítulos (SRT/JSON y video subtitulado).
+- Generación de reels verticales por selección desde JSON.
 
-## 2. Arquitectura de Ejecucion
-Soporte dual:
-- Local (Windows/Linux): mismo flujo funcional que produccion.
-- Produccion (RunPod Docker): despliegue headless con GPU.
+Este documento reemplaza versiones anteriores y describe el estado real actual del proyecto.
 
-Entrypoint de app:
+## 2. Política de entorno Python (obligatoria)
+
+### 2.1 Regla principal
+No usar entornos virtuales locales (`.venv`) en este repositorio.
+
+### 2.2 Ejecución permitida
+- Usar siempre Python global del sistema en local.
+- En Docker/RunPod, usar el Python global de la imagen (`/usr/bin/python` o `python`).
+
+### 2.3 Operación diaria
+- Instalar dependencias con `pip` global (`pip install -r requirements.txt`).
+- Ejecutar la app con `python main_ui.py`.
+- No activar ni crear `.venv` para correr el flujo de trabajo.
+
+## 3. Arquitectura de ejecución
+
+### 3.1 Entrypoint
 - `main_ui.py`
 
-Motor pesado:
-- `pyvideotrans/` (ASR, traduccion, TTS, sincronizacion temporal)
+### 3.2 Motor principal
+- `pyvideotrans/` (ASR, diarización, traducción, TTS, alineación y ensamblado)
 
-Modulos de soporte:
+### 3.3 Módulos de soporte
 - `subtitle_generator.py`
 - `subtitle_renderer.py`
 - `reel_generator.py`
 - `frame_editor.py`
+- `src/paths.py` (resolución de rutas y contrato de storage)
 
-## 3. Storage y Rutas (Contrato Estricto)
-Rutas centrales se resuelven en `src/paths.py`.
+## 4. Storage y rutas (contrato vigente)
 
-### 3.1 Volumen de Red Persistente
-`QDP_NETWORK_DIR=/runpod-volume`
+Rutas base resueltas por `src/paths.py`.
 
-Subcarpetas:
-- `user_input/`: videos originales subidos por usuario.
-- `output_final/`: artefactos finales descargables.
-- `models/`: modelos persistentes.
+### 4.1 RunPod / Linux (modo volumen de red + NVMe)
+- `QDP_NETWORK_DIR=/runpod-volume`
+- `QDP_LOCAL_DIR=/workspace/qdp_data`
 
-### 3.2 Disco Local NVMe Rapido (50GB)
-`QDP_LOCAL_DIR=/workspace/qdp_data`
+Subrutas efectivas:
+- Red: `/runpod-volume/user_input`, `/runpod-volume/output_final`, `/runpod-volume/models`
+- Local: `/workspace/qdp_data/temp_processing`, `/workspace/qdp_data/logs`, `/workspace/qdp_data/torch_cache`
 
-Subcarpetas:
-- `temp_processing/`: ffmpeg intermedio, chunks y trabajo temporal.
-- `logs/`: logs operativos.
-- `torch_cache/`: cache de torch/huggingface.
+### 4.2 Windows local (fallback actual)
+Si no se define `QDP_NETWORK_DIR`:
+- Input de red lógico: carpeta `input/` del repo
+- Output de red lógico: carpeta `output/` del repo
+- Models de red lógico: carpeta `models/` del repo
+- Local temporal: `temp_workspace/qdp_data/`
 
-### 3.3 Regla Operativa
-- Input de usuario entra por red (`/runpod-volume/user_input`).
-- Procesamiento intensivo ocurre en local NVMe (`/workspace/qdp_data`).
-- Salida final vuelve a red (`/runpod-volume/output_final`).
+### 4.3 Regla operativa
+- Inputs entran por carpeta de red lógica.
+- Proceso pesado ocurre en almacenamiento local rápido.
+- Artefactos finales se publican en carpeta de salida de red lógica.
 
-## 4. UI Oficial (3 Pestañas)
+## 5. UI oficial (3 pestañas)
 
-### 4.1 Pestaña 1 - Doblaje Master
-Objetivo:
-- Generar video doblado final sin subtitulos quemados.
+## 5.1 Pestaña 1 - Doblaje Master (flujo en 2 fases)
 
-Entradas:
-- Video original (upload o dropdown desde `user_input`).
-- Flags:
-  - Modo prueba (30s)
-  - Speaker-aware clone
-- Ajustes visuales:
-  - Brillo
-  - Contraste
-  - Color
-  - Nitidez
-  - Checkbox: aplicar ajustes al video final
+### Artifact-first AssemblyAI (nuevo flujo oficial)
+El sistema prioriza artifacts AssemblyAI reutilizables para evitar reruns costosos.
 
-Proceso:
-1. pyvideotrans ejecuta pipeline EN->ES.
-2. Se copia MP4 final a `output_final`.
-3. Si checkbox activo, se aplica postproceso visual al MP4 final completo.
-4. Se extrae WAV final.
-5. Se genera `timestamps.json` desde SRT adaptado.
-
-Salidas:
-- Video doblado final (`*_dubbed.mp4`)
-- Audio WAV (`*_dubbed.wav`)
-- SRT (`*_subtitles.srt`)
-- JSON timestamps (`*_timestamps.json`)
-
-### 4.2 Pestaña 2 - Subtitulos
-Objetivo:
-- Generar subtitulos desde video o audio.
-- Renderizar subtitulos sobre video cuando la fuente es video.
-
-Entradas:
-- Upload o seleccion de media (video/audio).
-- Idioma de transcripcion.
+Prioridad canónica de bootstrap:
+1. `timestamps.json`
+2. `sentences.json`
+3. `paragraphs.json`
+4. `transcript.srt`
+5. `transcript.vtt`
 
 Reglas:
-- Si entrada es audio (.wav/.mp3/...):
-  - SI: generar SRT/JSON.
-  - NO: renderizar video subtitulado (requiere video).
+- `transcript.txt` se persiste, pero no habilita fases por sí solo.
+- El rescate manual siempre va ligado al video seleccionado en Tab 1.
+- Si existe `speaker_segments.json` válido para ese video, Fase 1 se reutiliza sin relanzar analyze.
+- Si existe `translated_segments.json` válido, Fase 2 se reutiliza y Fase 3 queda habilitada.
+- Si faltan artifacts opcionales (sentences/paragraphs), el sistema degrada con fallback automático.
 
-Salidas:
-- SRT
-- JSON
-- Video subtitulado (solo si entrada base es video)
-
-### 4.3 Pestaña 3 - Viral Shorts
+### Fase 1 - Analizar video
 Objetivo:
-- Crear reels verticales 9:16 desde video doblado + JSON.
+- Detectar speakers reales y preparar artefactos de asignación.
 
-Entradas:
-- Video doblado final:
-  - upload o dropdown desde `output_final`.
-- JSON:
-  - JSON de timestamps para analizar con Gemini, o
-  - JSON de reels ya editado por humano (re-upload).
+Secuencia real:
+1. `prepare`
+2. `recogn`
+3. `diariz`
+4. Validación estricta de `speaker.json` (obligatoria)
+5. `trans`
+6. `run_speaker_analysis`
+7. Emisión de `ANALYZE_DONE`
 
-Flujo:
-1. Analizar/cargar JSON de reels.
-2. Mostrar lista de reels en checkbox group.
-3. Usuario marca reels a generar.
-4. Renderizar solo seleccionados.
-5. Descargar JSON de reels y archivos MP4 generados.
+Regla crítica:
+- Si diarización no produce speakers válidos, Fase 1 falla y no debe continuar.
+- No se debe avanzar a traducción útil de negocio cuando no hay diarización válida.
 
-Subtitulos en reels:
-- Dinamicos.
-- Posicion centrada (medio del frame).
+Salida funcional de Fase 1:
+- Lista dinámica de speakers en UI (máximo configurable por `PYVIDEOTRANS_MAX_SPEAKERS`, default 50, rango efectivo 12-100).
+- Segmentos auditables por speaker.
+- Preparación de mapeo speaker -> voz de referencia.
+- Persistencia en `phase_state/<video>/` de exports AssemblyAI reutilizables.
 
-Salidas:
-- Preview de primer reel generado.
-- Descarga multiarchivo de reels (`gr.Files`).
-- JSON de reels descargable/editable/reutilizable.
+### Fase 2 - Doblar con voces asignadas
+Objetivo:
+- Ejecutar pipeline completo de doblaje con mapeo manual por speaker.
 
-## 5. Contrato de JSON
+Operación:
+- Escribe `input/voice_refs/speaker_voice_map.json` con las asignaciones.
+- Ejecuta tarea `vtv` de `pyvideotrans` con diarización activada y separación de audio (`--is_separate`).
 
-### 5.1 timestamps.json (Pestaña 1 -> 3)
-Campos esperados por segmento:
+Audio mix:
+- Calidad (recomendado): usa pista instrumental para minimizar ghost voice.
+- Overlay rápido (solo pruebas): superposición sobre original completo.
+
+Salidas esperadas en red:
+- Video final doblado (`*_dubbed.mp4`).
+- Audio final (`*_dubbed.wav`).
+- Subtítulos (`*_subtitles.srt`).
+- Contrato temporal (`*_timestamps.json`).
+- Artefactos de speaker (`*_speaker_profile.json`, `*_speaker_identity.json`) cuando aplica.
+
+## 5.2 Pestaña 2 - Agregar subtítulos
+Objetivo:
+- Generar subtítulos desde video o audio.
+- Renderizar subtítulos sobre video cuando la fuente base es video.
+
+Reglas vigentes:
+- Audio permite generar SRT/JSON.
+- Audio no permite render visual de video subtitulado.
+- Incluye preview de estilo con extracción de frame y presets.
+- Permite import manual de subtítulos para render: `SRT`, `VTT` y `JSON` AssemblyAI normalizado.
+
+## 5.3 Pestaña 3 - Viral Shorts
+Objetivo:
+- Generar reels verticales desde video final + JSON.
+
+Flujo vigente:
+1. Cargar/analizar JSON de reels.
+2. Mostrar selección múltiple (checkboxes).
+3. Renderizar solo reels seleccionados.
+4. Exponer preview, JSON y descarga múltiple de MP4.
+
+Compatibilidad de entrada para análisis/reels:
+- `timestamps.json`
+- `sentences.json`
+- `paragraphs.json`
+- JSON de reels ya curado (`reels`)
+
+## 6. Contrato JSON
+
+## 6.1 `timestamps.json`
+Campos aceptados por segmento:
 - `start` o `start_ms`
 - `end` o `end_ms`
 - `text_es`
+- `speaker` o `speaker_id` opcional
 
-### 5.2 reels.json (Gemini o edicion humana)
+Nota de origen:
+- El backend de AssemblyAI persiste automáticamente: `timestamps.json`, `sentences.json`, `paragraphs.json`, `transcript.srt`, `transcript.vtt`, `transcript.txt`.
+- `timestamps.json` se mantiene como fuente granular de verdad para reels/captions.
+
+## 6.2 `reels.json`
 Estructura:
-- `reels`: lista de objetos con:
-  - `reel_num`
-  - `start_ms`
-  - `end_ms`
-  - `title`
-  - `caption_style`
-  - `priority` (opcional)
-- `metadata` (opcional)
+- `reels`: lista de objetos con `reel_num`, `start_ms`, `end_ms`, `title`, `caption_style`, `priority` opcional
+- `metadata` opcional
 
 Regla:
-- Si el JSON subido ya contiene `reels`, se usa directo (sin reanalizar).
+- Si el JSON de entrada ya contiene `reels`, se usa directo (sin reanálisis).
 
-## 6. Docker y RunPod
+## 7. Stack tecnológico vigente
 
-### 6.1 Build
-Dockerfile actual esta preparado para:
-- CUDA 12.4 + cuDNN.
-- Torch 2.5.1 cu124.
-- qwen-tts + qwen-asr.
-- ffmpeg/sox/libsndfile.
-- variables de ruta para RunPod.
+## 7.1 Docker base (producción)
+- Imagen base: `nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04`
+- Python global del contenedor: 3.10
+- PyTorch: `2.8.0` con CUDA 12.8 (`cu128`)
 
-Variables clave en imagen:
-- `QDP_NETWORK_DIR=/runpod-volume`
-- `QDP_LOCAL_DIR=/workspace/qdp_data`
-- `HF_HOME=/workspace/qdp_data/torch_cache`
-- `TORCH_HOME=/workspace/qdp_data/torch_cache`
+## 7.2 ML/IA principal
+- `transformers==4.57.3`
+- `qwen-asr==0.0.6`
+- `qwen-tts==0.1.1`
+- `faster-whisper==1.1.1`
+- `modelscope>=1.34.0`
+- `funasr>=1.3.1`
+- `sherpa-onnx>=1.12.15`
 
-### 6.2 Comando de arranque
-- `python /app/main_ui.py`
+## 7.3 Diarización y clustering
+- Dependencias obligatorias en runtime/build: `hdbscan`, `umap-learn`, `datasets`, `simplejson`, `sortedcontainers`, `addict`.
+- Modelos ONNX y submodelos de ModelScope predescargados en build de Docker para reducir cold-start.
 
-### 6.3 Flash Attention
-- Es opcional por build arg (`INSTALL_FLASH_ATTN=1`).
-- Si no se instala, la app funciona igual; solo reduce velocidad de inferencia.
+## 7.4 App y API
+- `gradio>=5`
+- `fastapi>=0.115`
+- `uvicorn>=0.32`
 
-## 7. Limpieza y No-Objetivos
-No forman parte del workflow oficial:
-- Flujos antiguos de reels (selector unico, tab duplicada).
-- Artefactos visuales/caches locales (capturas y `__pycache__`).
+## 8. Variables de entorno operativas relevantes
+- `QDP_NETWORK_DIR`
+- `QDP_LOCAL_DIR`
+- `QDP_TRANSLATE_MODEL` (default funcional: `nllb_local`)
+- `QDP_ASR_MODEL` (default funcional: `large-v3-turbo`)
+- `PYVIDEOTRANS_MAX_SPEAKERS`
+- `API_GOOGLE_STUDIO`
+- `GEMINI_MODEL`
 
-## 8. Checklist de Release
-Antes de desplegar:
-1. `python -m py_compile main_ui.py reel_generator.py subtitle_generator.py subtitle_ui_wrapper.py`
-2. Verificar dropdowns de red en `user_input` y `output_final`.
-3. Verificar escritura de temporales en `/workspace/qdp_data/temp_processing`.
-4. Validar que reels se renderizan por seleccion (checkbox) y se descargan en lote.
+## 9. Checklist de release (actual)
+1. Validar arranque con Python global: `python main_ui.py`.
+2. Verificar Fase 1: detectar speakers y poblar UI de asignación.
+3. Verificar fail-fast de diarización: sin `speaker.json` válido debe fallar Fase 1.
+4. Verificar Fase 2: salida MP4 + WAV + SRT + `timestamps.json` en carpeta de salida.
+5. Verificar Pestaña 2 con video y audio (render solo para video).
+6. Verificar Pestaña 3 con selección múltiple de reels y descarga en lote.
+
+## 10. No objetivos
+- Mantener flujos legacy duplicados de reels o variantes fuera del flujo en 3 pestañas.
+- Reintroducir `.venv` como entorno de ejecución principal.

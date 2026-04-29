@@ -226,68 +226,11 @@ class SpeechToText(BaseTask):
     def diariz(self):
         if self._exit()  or not self.cfg.enable_diariz or Path(self.cfg.cache_folder + "/speaker.json").exists():
             return
-            
-        # built pyannote reverb ali_CAM
-        speaker_type=settings.get('speaker_type','built')
-        hf_token= settings.get('hf_token')
-        if speaker_type=='built' and self.cfg.detect_language[:2] not in ['zh','en']:
-            logger.error(f'当前选择 built 说话人分离模型，但不支持当前语言:{self.cfg.detect_language}')
-            return
-        if speaker_type in ['pyannote','reverb'] and not hf_token:
-            logger.error(f'当前选择 pyannote 说话人分离模型，但未设置 huggingface.co 的token: {self.cfg.detect_language}')
-            return
-        if speaker_type in ['pyannote','reverb']:
-            # 判断是否可访问 huggingface.co
-            # 先测试能否连接 huggingface.co, 中国大陆地区不可访问，除非使用VPN
-            try:
-                import requests
-                requests.head('https://huggingface.co',timeout=5)
-            except Exception:
-                logger.error(f'当前选择 {speaker_type} 说话人分离模型，但无法连接到 https://huggingface.co,可能会失败')
 
-        self.precent += 3
-        title=tr(f'Begin separating the speakers')+f':{speaker_type}'
-        spk_list=None
-        kw={
-                "input_file":self.cfg.shibie_audio,
-                "subtitles":[ [it['start_time'],it['end_time']] for it in self.source_srt_list],
-                "num_speakers":self.max_speakers,
-                "is_cuda":self.cfg.is_cuda
-        }
-        if speaker_type=='built':
-            tools.down_file_from_ms(f'{ROOT_DIR}/models/onnx',[
-                "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/seg_model.onnx",
-                "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/nemo_en_titanet_small.onnx",
-                "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/3dspeaker_speech_eres2net_large_sv_zh-cn_3dspeaker_16k.onnx"                
-            ],callback=self._process_callback)
-            from videotrans.process.prepare_audio import built_speakers as _run_speakers
-            del kw['is_cuda']
-            kw['num_speakers']=-1 if self.max_speakers<1 else self.max_speakers
-            kw['language']=self.cfg.detect_language
-        elif speaker_type=='ali_CAM':
-            tools.check_and_down_ms(model_id='iic/speech_campplus_speaker-diarization_common',callback=self._process_callback)
-            from videotrans.process.prepare_audio import cam_speakers as _run_speakers
-        elif speaker_type=='pyannote':
-            from videotrans.process.prepare_audio import pyannote_speakers as _run_speakers
-        elif speaker_type=='reverb':
-            from videotrans.process.prepare_audio import reverb_speakers as _run_speakers
-        else:
-            logger.error(f'当前所选说话人分离模型不支持:{speaker_type=}')
-            return
-        try:
-            if speaker_type in ['pyannote','reverb']:
-                self._signal(text='Downloading speakers models')
-                from huggingface_hub import snapshot_download
-                print(f'下载 token: {speaker_type},{hf_token=}')
-                snapshot_download(
-                    repo_id="pyannote/speaker-diarization-3.1" if speaker_type == 'pyannote' else "Revai/reverb-diarization-v1",
-                    token=hf_token
-                )
-            spk_list=self._new_process(callback=_run_speakers,title=title,is_cuda=self.cfg.is_cuda and speaker_type!='built',kwargs=kw)
-            if spk_list:
-                Path(self.cfg.cache_folder+"/speaker.json").write_text(json.dumps(spk_list),encoding='utf-8')
-        except Exception as e:
-            logger.exception(e,exc_info=True)
+        logger.warning(
+            'Legacy local speaker diarization was removed from pyvideotrans. '
+            'Use the AssemblyAI workflow for speaker separation.'
+        )
         self._signal(text=tr('separating speakers end'))
 
 

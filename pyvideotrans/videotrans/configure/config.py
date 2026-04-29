@@ -81,7 +81,6 @@ def _set_logs():
 
     logging.getLogger("transformers").setLevel(logging.DEBUG)
     logging.getLogger("filelock").setLevel(logging.DEBUG)
-    logging.getLogger("faster_whisper").setLevel(logging.DEBUG)
     return logger
 
 
@@ -274,6 +273,7 @@ class AppSettings:
 
         # 更新到 self
         default.update(merged_settings) # 这里 default 是 python 属性字典
+        default["speaker_type"] = "assemblyai"
         
         self.WHISPER_MODEL_LIST = re.split(r'[,，]', default.get('model_list', ''))
         self.ChatTTS_voicelist = re.split(r'[,，]', str(default.get('chattts_voice', '')))
@@ -391,7 +391,7 @@ class AppSettings:
             "qwentts_role": '',
             "qwentts_models": Qwentts_Models,
             "show_more_settings": False,
-            "speaker_type": "built",
+            "speaker_type": "assemblyai",
             "hf_token": "",
             "cjk_len": 22,
             "other_len": 46,

@@ -2,12 +2,12 @@
 setlocal
 
 set "ROOT_DIR=%~dp0"
-set "PYVIDEOTRANS_PYTHON=%ROOT_DIR%.venv-py310\Scripts\python.exe"
+set "PYVIDEOTRANS_PYTHON=%LOCALAPPDATA%\Programs\Python\Python310\python.exe"
 
 if not exist "%PYVIDEOTRANS_PYTHON%" (
-  echo [ERROR] No se encontro Python del engine en:
+  echo [ERROR] No se encontro Python global 3.10 en:
   echo         %PYVIDEOTRANS_PYTHON%
-  echo Ejecuta primero la preparacion del entorno .venv-py310.
+  echo Instala Python 3.10 global o ajusta PYVIDEOTRANS_PYTHON manualmente.
   exit /b 1
 )
 
@@ -32,4 +32,4 @@ echo [INFO] PYVIDEOTRANS_QWEN_TTS_TORCH_THREADS=%PYVIDEOTRANS_QWEN_TTS_TORCH_THR
 echo [INFO] PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA=%PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA%
 echo [INFO] PYVIDEOTRANS_AUTO_PROCESS_MAX_GPU=%PYVIDEOTRANS_AUTO_PROCESS_MAX_GPU%
 echo [INFO] PYVIDEOTRANS_PROCESS_MAX_GPU=%PYVIDEOTRANS_PROCESS_MAX_GPU%
-python "%ROOT_DIR%main_ui.py"
+"%PYVIDEOTRANS_PYTHON%" "%ROOT_DIR%main_ui.py"

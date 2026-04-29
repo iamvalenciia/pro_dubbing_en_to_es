@@ -60,6 +60,76 @@ def _resolve_dubbed_audio_volume(default_value=1.25):
     return result
 
 
+def _env_truthy(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_diarization_backend(default_backend: str = 'assemblyai'):
+    env_backend = str(os.environ.get("PYVIDEOTRANS_DIARIZ_BACKEND", "")).strip()
+    if env_backend:
+        normalized = env_backend.lower()
+        aliases = {
+            "assemblyai": "assemblyai",
+            "assembly": "assemblyai",
+            "aai": "assemblyai",
+        }
+        resolved = aliases.get(normalized)
+        if resolved:
+            return resolved, "env"
+        raise RuntimeError(
+            "Legacy diarization backends are disabled. "
+            f"Requested backend={env_backend}. Use assemblyai/aai."
+        )
+
+    cfg_backend = str(settings.get('speaker_type', default_backend)).strip()
+    if cfg_backend:
+        normalized_cfg = cfg_backend.lower()
+        if normalized_cfg in ("assemblyai", "assembly", "aai"):
+            return "assemblyai", "settings"
+        logger.warning(
+            "Legacy diarization backend from settings ignored: %s. Forcing AssemblyAI.",
+            cfg_backend,
+        )
+    return "assemblyai", "default"
+
+
+def _resolve_hf_token() -> str:
+    token = str(settings.get('hf_token') or '').strip()
+    if token:
+        return token
+    token = str(os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN') or '').strip()
+    if token:
+        return token
+    return ''
+
+
+def _validate_hf_repo_access(repo_id: str, hf_token: str, timeout: int = 10):
+    import requests
+
+    if not hf_token:
+        return False, "HF token missing"
+    headers = {"Authorization": f"Bearer {hf_token}", "User-Agent": "qdp-diarization-check/1.0"}
+    url = f"https://huggingface.co/api/models/{repo_id}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+    except Exception as exc:
+        return False, f"Network error while contacting Hugging Face: {exc}"
+
+    if resp.status_code == 200:
+        return True, "ok"
+    if resp.status_code in (401, 403):
+        return False, (
+            f"Access denied to {repo_id} (HTTP {resp.status_code}). "
+            "Check that HF_TOKEN is valid and the account accepted model terms."
+        )
+    if resp.status_code == 404:
+        return False, f"Model repo not found: {repo_id}"
+    return False, f"Unexpected Hugging Face response {resp.status_code} for {repo_id}"
+
+
 def _get_mean_volume_db(audio_file: str):
     if not audio_file or not tools.vail_file(audio_file):
         return None
@@ -341,14 +411,43 @@ class TransCreate(BaseTask):
     def recogn(self) -> None:
         if self._exit(): return
         if not self.shoud_recogn: return
+        is_analyze_mode = str(getattr(self.cfg, 'app_mode', '')).lower() == 'analyze'
         self.precent += 3
         self._signal(text=tr("kaishishibie"))
         if tools.vail_file(self.cfg.source_sub):
             self.source_srt_list = tools.get_subtitle_from_srt(self.cfg.source_sub, is_file=True)
-            if Path(self.cfg.target_dir + "/speaker.json").exists():
+            if not is_analyze_mode and Path(self.cfg.target_dir + "/speaker.json").exists():
                 shutil.copy2(self.cfg.target_dir + "/speaker.json", self.cfg.cache_folder + "/speaker.json")
             self._recogn_succeed()
             return
+
+        # Artifact-first fallback: if transcript exports already exist, reuse them.
+        if not is_analyze_mode:
+            transcript_srt = Path(self.cfg.target_dir) / "transcript.srt"
+            transcript_vtt = Path(self.cfg.target_dir) / "transcript.vtt"
+            try:
+                if transcript_srt.exists():
+                    shutil.copy2(str(transcript_srt), self.cfg.source_sub)
+                    self.source_srt_list = tools.get_subtitle_from_srt(self.cfg.source_sub, is_file=True)
+                    if self.source_srt_list:
+                        logger.info("recogn() reused transcript.srt from target_dir")
+                        self._recogn_succeed()
+                        return
+                elif transcript_vtt.exists():
+                    # Use ffmpeg to convert VTT to SRT for compatibility with the rest of the pipeline.
+                    tools.runffmpeg([
+                        "-y",
+                        "-i",
+                        str(transcript_vtt),
+                        self.cfg.source_sub,
+                    ])
+                    self.source_srt_list = tools.get_subtitle_from_srt(self.cfg.source_sub, is_file=True)
+                    if self.source_srt_list:
+                        logger.info("recogn() reused transcript.vtt from target_dir")
+                        self._recogn_succeed()
+                        return
+            except Exception:
+                pass
 
         if not tools.vail_file(self.cfg.source_wav):
             error = tr("Failed to separate audio, please check the log or retry")
@@ -653,11 +752,15 @@ class TransCreate(BaseTask):
         return True
 
     def diariz(self):
+        is_analyze_mode = str(getattr(self.cfg, 'app_mode', '')).lower() == 'analyze'
         # 说话人设为1，不进行分离
         # Check if speaker.json exists AND is valid (not empty)
         # Also check target_dir fallback so Phase 2 always skips when Phase 1 already ran diarization.
         speaker_json_path = Path(self.cfg.cache_folder + "/speaker.json")
-        if not speaker_json_path.exists():
+        if is_analyze_mode and speaker_json_path.exists():
+            # Analyze must use fresh diarization from this run only.
+            speaker_json_path.unlink(missing_ok=True)
+        if (not is_analyze_mode) and (not speaker_json_path.exists()):
             _td_speaker = Path(self.cfg.target_dir + "/speaker.json")
             if _td_speaker.exists():
                 try:
@@ -675,30 +778,28 @@ class TransCreate(BaseTask):
                 pass
         print(f"[DIARIZ-DEBUG] ENTRY: enable_diariz={self.cfg.enable_diariz}, max_speakers={self.max_speakers}, cache_exists={speaker_json_path.exists()}, existing_valid={existing_valid}", flush=True)
         
-        if self._exit() or not self.cfg.enable_diariz or self.max_speakers == 1 or existing_valid:
+        skip_existing_valid = existing_valid and not is_analyze_mode
+        if self._exit() or not self.cfg.enable_diariz or self.max_speakers == 1 or skip_existing_valid:
             skip_reason = "already_valid" if existing_valid else ("_exit" if self._exit() else ("diariz_disabled" if not self.cfg.enable_diariz else "single_speaker"))
             print(f"[DIARIZ-DEBUG] SKIP: reason={skip_reason}", flush=True)
+            if is_analyze_mode and (not self.cfg.enable_diariz or self.max_speakers == 1):
+                raise RuntimeError(
+                    "Analyze mode requires diarization enabled with multi-speaker mode before translation. "
+                    f"skip_reason={skip_reason}"
+                )
             return
-        # built pyannote reverb ali_CAM
-        speaker_type = settings.get('speaker_type', 'built')
-        hf_token = settings.get('hf_token')
-        print(f"[DIARIZ-DEBUG] speaker_type={speaker_type}, language={self.cfg.detect_language[:2]}", flush=True)
-        if speaker_type == 'built' and self.cfg.detect_language[:2] not in ['zh', 'en']:
-            logger.error(f'当前选择 built 说话人分离模型，但不支持当前语言:{self.cfg.detect_language}')
-            print(f"[DIARIZ-ERROR] built 模型不支持语言: {self.cfg.detect_language}", flush=True)
-            return
-        if speaker_type in ['pyannote', 'reverb'] and not hf_token:
-            logger.error(f'当前选择 pyannote 说话人分离模型，但未设置 huggingface.co 的token: {self.cfg.detect_language}')
-            print(f"[DIARIZ-ERROR] 需要 huggingface token", flush=True)
-            return
-        if speaker_type in ['pyannote', 'reverb']:
-            # 判断是否可访问 huggingface.co
-            # 先测试能否连接 huggingface.co, 中国大陆地区不可访问，除非使用VPN
-            try:
-                import requests
-                requests.head('https://huggingface.co', timeout=5)
-            except Exception:
-                logger.error(f'当前选择 {speaker_type} 说话人分离模型，但无法连接到 https://huggingface.co,可能会失败')
+        speaker_type, speaker_type_source = _resolve_diarization_backend('assemblyai')
+        strict_gpu = _env_truthy("PYVIDEOTRANS_DIARIZ_STRICT_GPU", default=True)
+        print(
+            f"[DIARIZ-DEBUG] speaker_type={speaker_type}, source={speaker_type_source}, "
+            f"strict_gpu={strict_gpu}, is_cuda={self.cfg.is_cuda}, language={self.cfg.detect_language[:2]}",
+            flush=True,
+        )
+        if speaker_type != 'assemblyai':
+            raise RuntimeError(
+                f"Unsupported diarization backend in production path: {speaker_type}. "
+                "Only AssemblyAI is allowed."
+            )
 
         try:
             self.precent += 3
@@ -710,35 +811,10 @@ class TransCreate(BaseTask):
                 "num_speakers": self.max_speakers,
                 "is_cuda": self.cfg.is_cuda
             }
-            if speaker_type == 'built':
-                tools.down_file_from_ms(f'{ROOT_DIR}/models/onnx', [
-                    "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/seg_model.onnx",
-                    "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/nemo_en_titanet_small.onnx",
-                    "https://www.modelscope.cn/models/himyworld/videotrans/resolve/master/onnx/3dspeaker_speech_eres2net_large_sv_zh-cn_3dspeaker_16k.onnx"
-                ], callback=self._process_callback)
-                from videotrans.process.prepare_audio import built_speakers as _run_speakers
-                # built_speakers handles its own is_cuda/num_threads logic
-                kw['num_speakers'] = -1 if self.max_speakers < 1 else self.max_speakers
-                kw['language'] = self.cfg.detect_language
-            elif speaker_type == 'ali_CAM':
-                tools.check_and_down_ms(model_id='iic/speech_campplus_speaker-diarization_common',
-                                        callback=self._process_callback)
-                from videotrans.process.prepare_audio import cam_speakers as _run_speakers
-            elif speaker_type == 'pyannote':
-                from videotrans.process.prepare_audio import pyannote_speakers as _run_speakers
-            elif speaker_type == 'reverb':
-                from videotrans.process.prepare_audio import reverb_speakers as _run_speakers
-            else:
-                logger.error(f'当前所选说话人分离模型不支持:{speaker_type=}')
-                return
-            if speaker_type in ['pyannote', 'reverb']:
-                self._signal(text='Downloading speakers models')
-                from huggingface_hub import snapshot_download
-                print(f'下载 token: {speaker_type},{hf_token=}')
-                snapshot_download(
-                    repo_id="pyannote/speaker-diarization-3.1" if speaker_type == 'pyannote' else "Revai/reverb-diarization-v1",
-                    token=hf_token
-                )
+            from videotrans.process.assemblyai_diarization import assemblyai_speakers as _run_speakers
+            kw['cache_folder'] = self.cfg.cache_folder
+            kw['target_dir'] = self.cfg.target_dir
+            self._signal(text='Diarization: using AssemblyAI diarization + transcript...')
 
             spk_list = self._new_process(callback=_run_speakers, title=title,
                                          is_cuda=self.cfg.is_cuda, kwargs=kw)
@@ -751,13 +827,18 @@ class TransCreate(BaseTask):
                 shutil.copy2(self.cfg.cache_folder + "/speaker.json", self.cfg.target_dir + "/speaker.json")
             else:
                 print(f"[DIARIZ-WARNING] _new_process returned empty/None result", flush=True)
+                if self.cfg.enable_diariz:
+                    raise RuntimeError(
+                        "Diarization enabled but returned no speakers. Hard-gate prevents translation."
+                    )
             self._signal(text=tr('separating speakers end'))
         except Exception as exc:
             import traceback
             print(f"[DIARIZ-EXCEPTION] diariz() failed: {exc}", flush=True)
             print(f"[DIARIZ-TRACEBACK] {traceback.format_exc()}", flush=True)
             logger.error(f'diariz() exception: {exc}\n{traceback.format_exc()}')
-            pass
+            if is_analyze_mode:
+                raise
 
     # 翻译字幕文件
     def trans(self) -> None:
@@ -1326,9 +1407,9 @@ class TransCreate(BaseTask):
                 speaker_marks = []
 
         if not speaker_marks:
-            print(f"[ANALYZE] No speaker marks found — diarization may not have run.", flush=True)
-            print(f"ANALYZE_DONE:{self.cfg.target_dir}", flush=True)
-            return
+            raise RuntimeError(
+                "Speaker diarization is required for Phase 1, but speaker.json is missing or empty."
+            )
 
         try:
             self._write_speaker_profile(subs=subs, source_subs=source_subs, speaker_marks=speaker_marks)

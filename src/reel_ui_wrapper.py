@@ -8,7 +8,7 @@ import json
 import threading
 from pathlib import Path
 from typing import Optional, Tuple, List
-from reel_generator import generate_reel_specifications, add_captions_to_reel
+from src.reel_generator import generate_reel_specifications, add_captions_to_reel
 
 
 def analyze_reels_worker(
@@ -82,7 +82,7 @@ def render_reel_worker(
             on_progress(f"Extrayendo segmento Reel {reel_num}...")
         
         # Extract segment
-        from reel_generator import extract_reel_segment
+        from src.reel_generator import extract_reel_segment
         seg_video, seg_audio = extract_reel_segment(
             video_path,
             audio_path,
