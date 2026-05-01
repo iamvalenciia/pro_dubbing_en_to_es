@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,26 @@ from videotrans.configure._except import StopRetry
 from videotrans.configure.config import logger
 from videotrans.recognition._base import BaseRecogn
 from videotrans.util import tools
+
+
+def _default_prompt() -> str:
+    """Verbatim + entity-accuracy prompt for Universal-3 Pro dubbing pipelines."""
+    return (
+        "Required: Preserve the original language(s) and script as spoken, "
+        "including code-switching and mixed-language phrases.\n\n"
+        "Mandatory: Preserve linguistic speech patterns including disfluencies, "
+        "filler words (um, uh, mhm, hmm), hesitations, repetitions, stutters, "
+        "false starts, and colloquialisms exactly as spoken.\n\n"
+        "Always: Transcribe speech with your best guess based on context in "
+        "all possible scenarios where speech is present in the audio.\n\n"
+        "Accuracy: Accurately transcribe proper nouns, person names, place names, "
+        "organization names, brands, and technical terminology exactly as spoken, "
+        "preserving correct spelling and capitalization.\n\n"
+        "Formatting: Use standard punctuation. Capitalize proper nouns and the "
+        "first word of each sentence. Write numbers as numerals for measurements, "
+        "statistics, and counts. Format percentages, dates, and currencies in "
+        "standard written form."
+    )
 
 
 def _resolve_models() -> list[str]:
@@ -38,9 +59,16 @@ def _speaker_from_utterance(row: dict[str, Any], idx: int) -> str:
     return f"SPK_{idx:02d}"
 
 
-def _to_raw_subtitles(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _to_raw_subtitles(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert AAI rows (utterances or sentences) into pyvideotrans raw subtitle entries.
+
+    Both utterances and sentences expose `start`, `end` (ms) and `text` fields, so
+    the same conversion logic works. Sentences yield much finer-grained segments,
+    which is critical for accurate TTS dubbing alignment.
+    """
     raws: list[dict[str, Any]] = []
-    for idx, row in enumerate(utterances or [], start=1):
+    line_no = 0
+    for row in rows or []:
         if not isinstance(row, dict):
             continue
         try:
@@ -54,11 +82,12 @@ def _to_raw_subtitles(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not text:
             continue
 
+        line_no += 1
         startraw = tools.ms_to_time_string(ms=start_ms)
         endraw = tools.ms_to_time_string(ms=end_ms)
         raws.append(
             {
-                "line": idx,
+                "line": line_no,
                 "start_time": start_ms,
                 "end_time": end_ms,
                 "startraw": startraw,
@@ -68,6 +97,78 @@ def _to_raw_subtitles(utterances: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return raws
+
+
+def _fetch_sentences(
+    *,
+    base_url: str,
+    transcript_id: str,
+    api_key: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """Fetch sentence-level breakdown from AAI for a completed transcript.
+
+    Returns an empty list on failure; the caller should fall back to utterances.
+    """
+    try:
+        resp = requests.get(
+            f"{base_url}/transcript/{transcript_id}/sentences",
+            headers={"authorization": api_key},
+            timeout=timeout,
+        )
+        if resp.status_code >= 400:
+            logger.warning(f"[AAI-ASR] sentences fetch HTTP {resp.status_code}")
+            return []
+        payload = resp.json() or {}
+        sentences = payload.get("sentences") if isinstance(payload, dict) else None
+        if isinstance(sentences, list):
+            return [s for s in sentences if isinstance(s, dict)]
+    except Exception as exc:
+        logger.warning(f"[AAI-ASR] sentences fetch error: {exc}")
+    return []
+
+
+def _propagate_speaker_from_utterances(
+    sentences: list[dict[str, Any]],
+    utterances: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ensure each sentence has a speaker label by overlap with utterances.
+
+    The AAI /sentences endpoint already includes a `speaker` field, but for
+    safety we fill it from the overlapping utterance when missing.
+    """
+    if not sentences:
+        return sentences
+    utt_ranges: list[tuple[int, int, str]] = []
+    for u in utterances or []:
+        try:
+            us = int(float(u.get("start", 0)))
+            ue = int(float(u.get("end", 0)))
+            sp = str(u.get("speaker") or "").strip()
+        except Exception:
+            continue
+        if ue > us and sp:
+            utt_ranges.append((us, ue, sp))
+
+    out: list[dict[str, Any]] = []
+    for s in sentences:
+        sp = str(s.get("speaker") or "").strip()
+        if not sp and utt_ranges:
+            try:
+                ss = int(float(s.get("start", 0)))
+                se = int(float(s.get("end", 0)))
+                mid = (ss + se) // 2
+            except Exception:
+                mid = -1
+            for us, ue, usp in utt_ranges:
+                if us <= mid <= ue:
+                    sp = usp
+                    break
+        merged = dict(s)
+        if sp:
+            merged["speaker"] = sp
+        out.append(merged)
+    return out
 
 
 def _write_json(path: str, payload: Any) -> None:
@@ -80,6 +181,165 @@ def _write_text(path: str, text: str) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text or "", encoding="utf-8")
+
+
+def _raws_to_srt(raws: list[dict[str, Any]]) -> str:
+    blocks: list[str] = []
+    for idx, row in enumerate(raws or [], start=1):
+        start = str(row.get("startraw") or "00:00:00,000")
+        end = str(row.get("endraw") or "00:00:00,000")
+        text = str(row.get("text") or "").strip()
+        blocks.append(f"{idx}\n{start} --> {end}\n{text}\n")
+    return "\n".join(blocks).strip() + "\n"
+
+
+def _resolve_fw_runtime() -> tuple[str, str]:
+    device = str(os.environ.get("QDP_FW_DEVICE") or "cuda").strip().lower() or "cuda"
+    compute = str(os.environ.get("QDP_FW_COMPUTE_TYPE") or "float16").strip().lower() or "float16"
+    return device, compute
+
+
+def _faster_whisper_sentences(audio_file: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as exc:
+        raise StopRetry(
+            "faster-whisper is required for Phase 1 transcription. Install faster-whisper in runtime env."
+        ) from exc
+
+    model_name = str(os.environ.get("QDP_FW_MODEL") or "large-v3").strip() or "large-v3"
+    beam_size = int(os.environ.get("QDP_FW_BEAM_SIZE", "5"))
+    use_vad = str(os.environ.get("QDP_FW_VAD_FILTER", "1")).strip().lower() not in {"0", "false", "no"}
+    gap_ms = int(os.environ.get("QDP_FW_SENTENCE_GAP_MS", "900"))
+
+    device, compute = _resolve_fw_runtime()
+    runtime = {"device": device, "compute_type": compute}
+    try:
+        model = WhisperModel(model_name, device=device, compute_type=compute)
+    except Exception:
+        model = WhisperModel(model_name, device="cpu", compute_type="int8")
+        runtime = {"device": "cpu", "compute_type": "int8"}
+
+    segments, info = model.transcribe(
+        audio_file,
+        language="en",
+        vad_filter=use_vad,
+        word_timestamps=True,
+        beam_size=beam_size,
+        temperature=0.0,
+    )
+
+    words: list[dict[str, Any]] = []
+    for seg in segments:
+        for w in (seg.words or []):
+            if w.start is None or w.end is None:
+                continue
+            txt = str(w.word or "").strip()
+            if not txt:
+                continue
+            words.append(
+                {
+                    "text": txt,
+                    "start": int(float(w.start) * 1000),
+                    "end": int(float(w.end) * 1000),
+                    "confidence": float(getattr(w, "probability", 0.0) or 0.0),
+                    "speaker": "UNK",
+                }
+            )
+
+    sentences: list[dict[str, Any]] = []
+    buf: list[dict[str, Any]] = []
+    for idx, row in enumerate(words):
+        buf.append(row)
+        token = str(row.get("text") or "")
+        has_terminal = token.endswith(".") or token.endswith("!") or token.endswith("?")
+        next_gap = 0
+        if idx + 1 < len(words):
+            next_gap = int(words[idx + 1]["start"]) - int(row["end"])
+
+        if has_terminal or next_gap > gap_ms:
+            text = " ".join(str(x.get("text") or "").strip() for x in buf).strip()
+            text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+            conf = sum(float(x.get("confidence") or 0.0) for x in buf) / max(1, len(buf))
+            sentences.append(
+                {
+                    "text": text,
+                    "start": int(buf[0]["start"]),
+                    "end": int(buf[-1]["end"]),
+                    "words": list(buf),
+                    "confidence": conf,
+                    "speaker": "UNK",
+                }
+            )
+            buf = []
+
+    if buf:
+        text = " ".join(str(x.get("text") or "").strip() for x in buf).strip()
+        text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+        conf = sum(float(x.get("confidence") or 0.0) for x in buf) / max(1, len(buf))
+        sentences.append(
+            {
+                "text": text,
+                "start": int(buf[0]["start"]),
+                "end": int(buf[-1]["end"]),
+                "words": list(buf),
+                "confidence": conf,
+                "speaker": "UNK",
+            }
+        )
+
+    meta = {
+        "engine": "faster-whisper",
+        "model": model_name,
+        "runtime": runtime,
+        "language": getattr(info, "language", None),
+        "language_probability": float(getattr(info, "language_probability", 0.0) or 0.0),
+    }
+    return sentences, meta
+
+
+def _persist_faster_whisper_exports(
+    *,
+    raws: list[dict[str, Any]],
+    sentences: list[dict[str, Any]],
+    meta: dict[str, Any],
+    cache_folder: str,
+    target_dir: str,
+) -> None:
+    roots = [cache_folder]
+    if target_dir and target_dir != cache_folder:
+        roots.append(target_dir)
+
+    transcript_text = "\n".join(str(it.get("text") or "").strip() for it in sentences if isinstance(it, dict))
+    fw_sentences_payload = {
+        "id": None,
+        "confidence": None,
+        "audio_duration": None,
+        "meta": meta,
+        "sentences": sentences,
+    }
+    # Placeholder timestamps; real speaker mapping is produced by diarization step.
+    timestamps = {
+        "segments": [
+            {
+                "start": round(int(it.get("start_time", 0)) / 1000.0, 3),
+                "end": round(int(it.get("end_time", 0)) / 1000.0, 3),
+                "start_ms": int(it.get("start_time", 0)),
+                "end_ms": int(it.get("end_time", 0)),
+                "text_es": str(it.get("text") or "").strip(),
+                "speaker": "UNK",
+                "speaker_id": "UNK",
+            }
+            for it in raws
+            if isinstance(it, dict)
+        ]
+    }
+
+    for root in roots:
+        _write_json(os.path.join(root, "sentences.json"), fw_sentences_payload)
+        _write_text(os.path.join(root, "transcript.srt"), _raws_to_srt(raws))
+        _write_text(os.path.join(root, "transcript.txt"), transcript_text)
+        _write_json(os.path.join(root, "timestamps.json"), timestamps)
 
 
 def _persist_exports(
@@ -154,91 +414,31 @@ class AssemblyAIRecogn(BaseRecogn):
         if self._exit():
             return
 
-        api_key = str(
-            os.environ.get("ASSEMBLY_AI_KEY")
-            or os.environ.get("ASSEMBLYAI_API_KEY")
-            or ""
-        ).strip()
-        if not api_key:
-            raise StopRetry("AssemblyAI requires ASSEMBLY_AI_KEY in environment.")
-
-        base_url = os.environ.get("ASSEMBLYAI_BASE_URL", "https://api.assemblyai.com/v2").rstrip("/")
-        timeout_seconds = int(os.environ.get("ASSEMBLYAI_TIMEOUT_SECONDS", "1800"))
-        poll_interval = float(os.environ.get("ASSEMBLYAI_POLL_SECONDS", "2.0"))
-        request_timeout = float(os.environ.get("ASSEMBLYAI_REQUEST_TIMEOUT", "60"))
-
-        self._signal(text="AssemblyAI ASR: uploading audio...")
+        self._signal(text="Faster-Whisper ASR: transcribing local audio...")
         started = time.time()
-
-        with open(self.audio_file, "rb") as f:
-            upload_resp = requests.post(
-                f"{base_url}/upload",
-                headers={"authorization": api_key},
-                data=f,
-                timeout=request_timeout,
-            )
-        upload_resp.raise_for_status()
-        upload_url = str((upload_resp.json() or {}).get("upload_url") or "").strip()
-        if not upload_url:
-            raise StopRetry("AssemblyAI upload failed: missing upload_url")
-
-        payload = {
-            "audio_url": upload_url,
-            "speech_models": _resolve_models(),
-            "speaker_labels": True,
-            "language_detection": True,
-            "format_text": True,
-        }
-        if isinstance(self.max_speakers, int) and self.max_speakers > 1:
-            payload["speakers_expected"] = int(self.max_speakers)
-
-        self._signal(text="AssemblyAI ASR: transcribing...")
-        create_resp = requests.post(
-            f"{base_url}/transcript",
-            headers={"authorization": api_key, "content-type": "application/json"},
-            json=payload,
-            timeout=request_timeout,
-        )
-        create_resp.raise_for_status()
-        transcript_id = str((create_resp.json() or {}).get("id") or "").strip()
-        if not transcript_id:
-            raise StopRetry("AssemblyAI transcript creation failed: missing transcript id")
-
-        status_url = f"{base_url}/transcript/{transcript_id}"
-        body: dict[str, Any] = {}
-        while True:
-            if (time.time() - started) > timeout_seconds:
-                raise StopRetry(f"AssemblyAI ASR timeout after {timeout_seconds}s")
-            status_resp = requests.get(status_url, headers={"authorization": api_key}, timeout=request_timeout)
-            status_resp.raise_for_status()
-            body = status_resp.json() or {}
-            status = str(body.get("status") or "").strip().lower()
-            if status == "completed":
-                break
-            if status == "error":
-                raise StopRetry(f"AssemblyAI ASR failed: {body.get('error') or 'status=error'}")
-            time.sleep(max(0.5, poll_interval))
-
-        utterances = body.get("utterances") or []
-        raws = _to_raw_subtitles(utterances)
+        fw_sentences, fw_meta = _faster_whisper_sentences(self.audio_file)
+        raws = _to_raw_subtitles(fw_sentences)
         if not raws:
-            raise StopRetry("AssemblyAI ASR returned no usable utterances")
-
-        speakers = [_speaker_from_utterance(it, idx) for idx, it in enumerate(utterances, start=1) if isinstance(it, dict)]
-        if speakers:
-            Path(f"{self.cache_folder}/speaker.json").write_text(json.dumps(speakers), encoding="utf-8")
+            raise StopRetry("Faster-Whisper returned no usable sentence segments")
 
         try:
-            _persist_exports(
-                base_url=base_url,
-                transcript_id=transcript_id,
-                api_key=api_key,
-                body=body,
+            _persist_faster_whisper_exports(
+                raws=raws,
+                sentences=fw_sentences,
+                meta=fw_meta,
                 cache_folder=self.cache_folder,
-                target_dir=self.cache_folder,
-                timeout=request_timeout,
+                target_dir=self.target_dir,
             )
         except Exception as exc:
-            logger.warning(f"[AAI-ASR] export persist warning: {exc}")
+            logger.warning(f"[FW-ASR] export persist warning: {exc}")
+
+        logger.info(
+            "[FW-ASR] completed segments=%s elapsed=%ss model=%s runtime=%s/%s",
+            len(raws),
+            int(time.time() - started),
+            fw_meta.get("model"),
+            (fw_meta.get("runtime") or {}).get("device"),
+            (fw_meta.get("runtime") or {}).get("compute_type"),
+        )
 
         return raws

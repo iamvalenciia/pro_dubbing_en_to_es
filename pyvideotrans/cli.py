@@ -330,7 +330,7 @@ def main():
         trk.assembling()
         trk.task_done()
 
-    # Fase 1: análisis de speakers (ASR + diarización + traducción, sin TTS)
+    # Fase 1: análisis de speakers (ASR + diarización, sin traducción ni TTS)
     def analyze_fun(params):
         app_cfg.current_status = 'ing'
         print(f"\n[Task] Speaker Analysis (Phase 1)")
@@ -343,7 +343,6 @@ def main():
             trk.diariz()
             speaker_json = _require_phase1_speaker_marks(trk, min_mtime=run_started_at)
             print(f"[ANALYZE] Speaker diarization OK: {speaker_json}", flush=True)
-            trk.trans()
             trk.run_speaker_analysis()
             # ANALYZE_DONE ya fue emitido por run_speaker_analysis()
             # Salir sin hacer task_done() para evitar errores post-análisis

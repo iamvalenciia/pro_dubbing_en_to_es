@@ -23,6 +23,8 @@ class BaseRecogn(BaseCon):
     audio_file: Optional[str] = None
     # 临时目录
     cache_folder: Optional[str] = None
+    # 最终输出目录（用于持久化识别产物）
+    target_dir: Optional[str] = None
 
     # 任务id
     uuid: Optional[str] = None

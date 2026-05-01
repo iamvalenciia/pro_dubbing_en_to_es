@@ -552,6 +552,7 @@ class TransCreate(BaseTask):
                 audio_file=self.cfg.source_wav,
                 detect_language=self.cfg.detect_language,
                 cache_folder=self.cfg.cache_folder,
+                target_dir=self.cfg.target_dir,
                 is_cuda=self.cfg.is_cuda,
                 subtitle_type=self.cfg.subtitle_type,
                 max_speakers=self.max_speakers,
@@ -757,9 +758,6 @@ class TransCreate(BaseTask):
         # Check if speaker.json exists AND is valid (not empty)
         # Also check target_dir fallback so Phase 2 always skips when Phase 1 already ran diarization.
         speaker_json_path = Path(self.cfg.cache_folder + "/speaker.json")
-        if is_analyze_mode and speaker_json_path.exists():
-            # Analyze must use fresh diarization from this run only.
-            speaker_json_path.unlink(missing_ok=True)
         if (not is_analyze_mode) and (not speaker_json_path.exists()):
             _td_speaker = Path(self.cfg.target_dir + "/speaker.json")
             if _td_speaker.exists():
@@ -769,6 +767,7 @@ class TransCreate(BaseTask):
                 except Exception:
                     pass
         existing_valid = False
+        existing_data = None
         if speaker_json_path.exists():
             try:
                 existing_data = json.loads(speaker_json_path.read_text(encoding='utf-8'))
@@ -776,9 +775,21 @@ class TransCreate(BaseTask):
                     existing_valid = True
             except Exception:
                 pass
-        print(f"[DIARIZ-DEBUG] ENTRY: enable_diariz={self.cfg.enable_diariz}, max_speakers={self.max_speakers}, cache_exists={speaker_json_path.exists()}, existing_valid={existing_valid}", flush=True)
+        expected_segments = len(self.source_srt_list or [])
+        aligned_with_subs = existing_valid and (
+            expected_segments <= 0 or len(existing_data) == expected_segments
+        )
+        print(
+            f"[DIARIZ-DEBUG] ENTRY: enable_diariz={self.cfg.enable_diariz}, "
+            f"max_speakers={self.max_speakers}, cache_exists={speaker_json_path.exists()}, "
+            f"existing_valid={existing_valid}, aligned_with_subs={aligned_with_subs}, "
+            f"expected_segments={expected_segments}",
+            flush=True,
+        )
         
-        skip_existing_valid = existing_valid and not is_analyze_mode
+        # Reuse labels generated during recogn() to avoid a second AssemblyAI transcript request.
+        # Safety: only skip when speaker count aligns with current subtitle segments.
+        skip_existing_valid = aligned_with_subs
         if self._exit() or not self.cfg.enable_diariz or self.max_speakers == 1 or skip_existing_valid:
             skip_reason = "already_valid" if existing_valid else ("_exit" if self._exit() else ("diariz_disabled" if not self.cfg.enable_diariz else "single_speaker"))
             print(f"[DIARIZ-DEBUG] SKIP: reason={skip_reason}", flush=True)
@@ -787,6 +798,8 @@ class TransCreate(BaseTask):
                     "Analyze mode requires diarization enabled with multi-speaker mode before translation. "
                     f"skip_reason={skip_reason}"
                 )
+            if skip_existing_valid:
+                self._signal(text='Diarization: reusing speaker labels from recognition (no second AssemblyAI request).')
             return
         speaker_type, speaker_type_source = _resolve_diarization_backend('assemblyai')
         strict_gpu = _env_truthy("PYVIDEOTRANS_DIARIZ_STRICT_GPU", default=True)
@@ -1392,11 +1405,16 @@ class TransCreate(BaseTask):
     def run_speaker_analysis(self) -> None:
         """Phase 1 analysis: build speaker profile + AI identity without dubbing.
 
-        Reads the translated SRTs and speaker.json from the cache, writes
+        Reads Phase 1 SRT + speaker.json and writes
         speaker_profile.json and speaker_identity.json to both cache and target_dir,
         then prints a sentinel line so the UI can detect completion.
         """
-        subs = tools.get_subtitle_from_srt(self.cfg.target_sub)
+        # Phase 1 does not generate target_sub (es.srt). Use source_sub, and only
+        # fall back to target_sub when it already exists for compatibility.
+        subtitle_path = self.cfg.source_sub
+        if self.cfg.target_sub and Path(self.cfg.target_sub).exists():
+            subtitle_path = self.cfg.target_sub
+        subs = tools.get_subtitle_from_srt(subtitle_path)
         source_subs = tools.get_subtitle_from_srt(self.cfg.source_sub)
         speaker_marks = []
         speaker_json = Path(f"{self.cfg.cache_folder}/speaker.json")
@@ -1421,6 +1439,73 @@ class TransCreate(BaseTask):
         except Exception as exc:
             logger.warning(f'Gemini speaker classification skipped: {exc}')
             print(f"[GEMINI-ERROR] {exc}", flush=True)
+
+        # Build a canonical Phase 1 artifact and refresh timestamps.json with
+        # diarization labels so Phase 2 can map speaker -> translated segment.
+        try:
+            rows = source_subs if source_subs else subs
+            segments: List[Dict[str, Any]] = []
+            speaker_stats: Dict[str, int] = {}
+            for idx, row in enumerate(rows):
+                line = int(row.get('line', idx + 1))
+                start_ms = int(row.get('start_time') or 0)
+                end_ms = int(row.get('end_time') or 0)
+                spk = str(speaker_marks[idx] if idx < len(speaker_marks) else 'default').strip() or 'default'
+                text = str(row.get('text') or '').strip()
+                segments.append({
+                    'line': line,
+                    'speaker': spk,
+                    'speaker_id': spk,
+                    'start_ms': start_ms,
+                    'end_ms': end_ms,
+                    'start': round(start_ms / 1000.0, 3),
+                    'end': round(end_ms / 1000.0, 3),
+                    'startraw': row.get('startraw'),
+                    'endraw': row.get('endraw'),
+                    'text_en': text,
+                    'text': text,
+                })
+                speaker_stats[spk] = speaker_stats.get(spk, 0) + 1
+
+            phase1_payload = {
+                'phase': 1,
+                'schema': 'phase1_transcript_diarization_v1',
+                'created_at': datetime.utcnow().isoformat() + 'Z',
+                'language': 'en',
+                'transcription_engine': 'faster-whisper',
+                'diarization_engine': 'assemblyai',
+                'speaker_count': len(speaker_stats),
+                'speakers': [{'speaker_id': k, 'segment_count': v} for k, v in sorted(speaker_stats.items())],
+                'segments': segments,
+            }
+
+            ts_payload = {
+                'phase': 1,
+                'schema': 'timestamps_phase1_v1',
+                'generated_from': 'phase1_transcript_diarization.json',
+                'segments': [
+                    {
+                        'line': seg['line'],
+                        'speaker': seg['speaker'],
+                        'speaker_id': seg['speaker_id'],
+                        'start': seg['start'],
+                        'end': seg['end'],
+                        'start_ms': seg['start_ms'],
+                        'end_ms': seg['end_ms'],
+                        'text_en': seg['text_en'],
+                        'text_es': seg['text_en'],
+                    }
+                    for seg in segments
+                ],
+            }
+
+            phase1_name = 'phase1_transcript_diarization.json'
+            for root in [Path(self.cfg.cache_folder), Path(self.cfg.target_dir)]:
+                root.mkdir(parents=True, exist_ok=True)
+                (root / phase1_name).write_text(json.dumps(phase1_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+                (root / 'timestamps.json').write_text(json.dumps(ts_payload, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as exc:
+            logger.warning(f'phase1 canonical artifact build failed: {exc}')
 
         print(f"ANALYZE_DONE:{self.cfg.target_dir}", flush=True)
 
