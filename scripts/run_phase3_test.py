@@ -31,6 +31,11 @@ os.environ.setdefault(
 )
 os.environ["PYTHONUTF8"] = "1"
 os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ.setdefault("PYVIDEOTRANS_FAST_NOVOICE_COPY", "1")
+os.environ.setdefault("PYVIDEOTRANS_DUCKING_PURE", "1")
+os.environ.setdefault("PYVIDEOTRANS_REMOVE_DUBB_SILENCE", "0")
+os.environ.setdefault("PYVIDEOTRANS_DUBBING_THREAD", "4")
+os.environ.setdefault("PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA", "1")
 
 # ── import main_ui ────────────────────────────────────────────────────────────
 import main_ui  # noqa: E402

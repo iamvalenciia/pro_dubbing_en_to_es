@@ -28,6 +28,7 @@ def generate_subtitles_worker(
     language: str = 'es',
     progress_callback=None,
     preview_duration_sec: Optional[float] = None,
+    max_chars_per_line: int = 35,
 ) -> Tuple[str, str, str]:
     """
     Background worker for subtitle generation.
@@ -51,7 +52,7 @@ def generate_subtitles_worker(
         json_file = str(output_dir / f"{base_name}{suffix}.json")
         
         if progress_callback:
-            progress_callback(f"📝 Transcribiendo con {language}...")
+            progress_callback(f"📝 Transcribiendo local (faster-whisper) con {language}...")
         
         srt_result, json_result = generate_subtitles_from_video(
             video_path,
@@ -59,6 +60,7 @@ def generate_subtitles_worker(
             language=language,
             output_json=json_file,
             preview_duration_sec=preview_duration_sec,
+            max_chars_per_line=max_chars_per_line,
         )
         
         if progress_callback:
@@ -127,6 +129,7 @@ def ui_generate_subtitles(
     language: str = 'es',
     ui_log_update=None,
     preview_duration_sec: Optional[float] = None,
+    max_chars_per_line: int = 35,
 ):
     """
     UI wrapper for subtitle generation - runs in background.
@@ -143,6 +146,7 @@ def ui_generate_subtitles(
         language,
         progress,
         preview_duration_sec=preview_duration_sec,
+        max_chars_per_line=max_chars_per_line,
     )
     
     # Return file objects for Gradio outputs

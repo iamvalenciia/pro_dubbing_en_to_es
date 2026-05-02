@@ -1,4 +1,4 @@
-import subtitle_renderer as sr
+from src import subtitle_renderer as sr
 
 
 def test_build_style_config_uses_named_preset():
@@ -53,3 +53,67 @@ def test_generate_drawtext_filter_includes_box_and_preview_clamp():
     assert "box=1" in filter_str
     assert "boxcolor=0x000000@0.75" in filter_str
     assert "between(t,0.000,3.000)" in filter_str
+
+
+def test_box_enabled_and_opacity_cases_are_mapped_to_filter():
+    segment = [{"start": 0.0, "end": 2.0, "text": "Linea de prueba"}]
+
+    case_a = sr.generate_ffmpeg_drawtext_filter(
+        segment,
+        video_width=1920,
+        video_height=1080,
+        style_config={
+            "preset": "documental_limpio",
+            "box_enabled": False,
+            "box_opacity": 1.0,
+            "box_color": "#000000",
+        },
+        preview_duration_sec=2.0,
+    )
+    assert "box=1" not in case_a
+    assert "boxcolor=" not in case_a
+
+    case_b = sr.generate_ffmpeg_drawtext_filter(
+        segment,
+        video_width=1920,
+        video_height=1080,
+        style_config={
+            "preset": "documental_limpio",
+            "box_enabled": True,
+            "box_opacity": 0.0,
+            "box_color": "#000000",
+        },
+        preview_duration_sec=2.0,
+    )
+    assert "box=1" in case_b
+    assert "boxcolor=0x000000@0.00" in case_b
+
+    case_c = sr.generate_ffmpeg_drawtext_filter(
+        segment,
+        video_width=1920,
+        video_height=1080,
+        style_config={
+            "preset": "documental_limpio",
+            "box_enabled": True,
+            "box_opacity": 0.5,
+            "box_color": "#000000",
+        },
+        preview_duration_sec=2.0,
+    )
+    assert "box=1" in case_c
+    assert "boxcolor=0x000000@0.50" in case_c
+
+    case_d = sr.generate_ffmpeg_drawtext_filter(
+        segment,
+        video_width=1920,
+        video_height=1080,
+        style_config={
+            "preset": "documental_limpio",
+            "box_enabled": True,
+            "box_opacity": 1.0,
+            "box_color": "#000000",
+        },
+        preview_duration_sec=2.0,
+    )
+    assert "box=1" in case_d
+    assert "boxcolor=0x000000@1.00" in case_d

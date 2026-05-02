@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import inspect
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,7 +54,7 @@ class BaseTTS(BaseCon):
     # 每次任务后暂停时间
     wait_sec: float = float(settings.get('dubbing_wait', 0))
     # 并发线程数量
-    dub_nums: int = int(float(settings.get('dubbing_thread', 1)))
+    dub_nums: int = int(float(os.environ.get('PYVIDEOTRANS_DUBBING_THREAD') or settings.get('dubbing_thread', 1)))
     # 存放消息
     error: Optional[Any] = None
     # 配音api地址

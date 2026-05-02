@@ -11,7 +11,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "[2/3] Running dependency checks (pip check + import smoke)"
-$knownPipMismatch = "qwen-tts 0.1.1 has requirement transformers==4.57.3, but you have transformers 4.57.6."
+$knownPipMismatch = "qwen-tts 0.1.1 requires onnxruntime, which is not installed."
 $pipCheckOutput = docker run --rm $ImageTag python -m pip check 2>&1 | Out-String
 $pipCheckExit = $LASTEXITCODE
 Write-Host $pipCheckOutput
@@ -28,14 +28,14 @@ if ($pipCheckExit -ne 0) {
     )
 
     if ($unexpectedLines.Count -eq 0 -and $pipCheckOutput.Contains($knownPipMismatch)) {
-        Write-Warning "pip check reported only the known qwen-tts/transformers pin mismatch; continuing preflight."
+        Write-Warning "pip check reported only the known qwen-tts/onnxruntime metadata mismatch; continuing preflight."
     }
     else {
         throw "pip check failed with unexpected dependency issues"
     }
 }
 
-docker run --rm $ImageTag python -c "import tenacity, ten_vad, gradio, fastapi, uvicorn, librosa, soundfile, faster_whisper, qwen_tts, qwen_asr, zhconv; print('imports_ok')"
+docker run --rm $ImageTag python -c "import tenacity, ten_vad, gradio, fastapi, uvicorn, librosa, soundfile, faster_whisper, qwen_tts, zhconv; print('imports_ok')"
 if ($LASTEXITCODE -ne 0) {
     throw "import smoke failed"
 }

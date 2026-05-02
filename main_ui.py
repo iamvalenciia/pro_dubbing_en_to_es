@@ -1,6 +1,6 @@
 import copy
 import json
-import importlib
+import logging
 import os
 import re
 import shutil
@@ -92,25 +92,34 @@ if PYVIDEOTRANS_ROOT not in sys.path:
     sys.path.insert(0, PYVIDEOTRANS_ROOT)
 
 try:
-    from subtitle_ui_wrapper import ui_generate_subtitles, ui_render_subtitles
+    from src.subtitle_ui_wrapper import ui_generate_subtitles, ui_render_subtitles
 except ImportError:
-    print("Warning: subtitle_ui_wrapper not available")
-    ui_generate_subtitles = None
-    ui_render_subtitles = None
+    try:
+        from subtitle_ui_wrapper import ui_generate_subtitles, ui_render_subtitles
+    except ImportError:
+        print("Warning: subtitle_ui_wrapper not available")
+        ui_generate_subtitles = None
+        ui_render_subtitles = None
 
 try:
-    from subtitle_renderer import build_style_config, render_subtitle_preview_on_frame
+    from src.subtitle_renderer import build_style_config, render_subtitle_preview_on_frame
 except ImportError:
-    print("Warning: subtitle_renderer helpers not available")
-    build_style_config = None
-    render_subtitle_preview_on_frame = None
+    try:
+        from subtitle_renderer import build_style_config, render_subtitle_preview_on_frame
+    except ImportError:
+        print("Warning: subtitle_renderer helpers not available")
+        build_style_config = None
+        render_subtitle_preview_on_frame = None
 
 try:
-    from reel_ui_wrapper import ui_analyze_reels, ui_render_reel
+    from src.reel_ui_wrapper import ui_analyze_reels, ui_render_reel
 except ImportError:
-    print("Warning: reel_ui_wrapper not available")
-    ui_analyze_reels = None
-    ui_render_reel = None
+    try:
+        from reel_ui_wrapper import ui_analyze_reels, ui_render_reel
+    except ImportError:
+        print("Warning: reel_ui_wrapper not available")
+        ui_analyze_reels = None
+        ui_render_reel = None
 
 load_dotenv()  # Carga GEMINI_MODEL, HF_TOKEN, API_GOOGLE_STUDIO desde tu .env local
 
@@ -718,6 +727,263 @@ def _ensure_dirs():
     os.makedirs(VOICE_REFS_PREVIEWS, exist_ok=True)
 
 
+def _phase1_json_to_source_subs(phase1_json_path: str) -> list[dict]:
+    if not os.path.isfile(phase1_json_path):
+        return []
+
+    def _ms_to_srt(ms: int) -> str:
+        total_ms = max(int(ms), 0)
+        hours, rem = divmod(total_ms, 3600000)
+        minutes, rem = divmod(rem, 60000)
+        seconds, millis = divmod(rem, 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+    try:
+        payload = json.loads(Path(phase1_json_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        ui_log.warning(f"P2: no se pudo leer phase1_transcript_diarization.json: {exc}")
+        return []
+
+    segments = _extract_phase1_segments(payload)
+    if not segments:
+        return []
+
+    source_subs = []
+    for idx, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            continue
+        text = str(seg.get("text_en") or seg.get("text") or "").strip()
+        if not text:
+            continue
+        start_ms = int(seg.get("start_ms") or round(float(seg.get("start") or 0) * 1000.0))
+        end_ms = int(seg.get("end_ms") or round(float(seg.get("end") or 0) * 1000.0))
+        source_subs.append({
+            "line": int(seg.get("line") or (idx + 1)),
+            "startraw": seg.get("startraw") or _ms_to_srt(start_ms),
+            "endraw": seg.get("endraw") or _ms_to_srt(end_ms),
+            "time": f"{seg.get('startraw') or _ms_to_srt(start_ms)} --> {seg.get('endraw') or _ms_to_srt(end_ms)}",
+            "start_time": start_ms,
+            "end_time": end_ms,
+            "text": text,
+        })
+    return source_subs
+
+
+def _extract_phase1_segments(payload) -> list[dict]:
+    """Normalize phase1 payload into segment list.
+
+    Supports:
+    - {"segments": [...]} (segment-level)
+    - [...] word/token list with text/start/end/speaker (legacy export)
+    """
+    if isinstance(payload, dict):
+        segments = payload.get("segments")
+        if isinstance(segments, list) and segments:
+            return [seg for seg in segments if isinstance(seg, dict)]
+
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        # Legacy format: word-level items, start/end in ms.
+        words = [w for w in payload if isinstance(w, dict)]
+        normalized_words = []
+        for w in words:
+            text = str(w.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                start_ms = int(float(w.get("start") or 0))
+                end_ms = int(float(w.get("end") or 0))
+            except Exception:
+                continue
+            if end_ms <= start_ms:
+                continue
+            sid = str(w.get("speaker") or w.get("speaker_id") or "SPEAKER_00").strip() or "SPEAKER_00"
+            normalized_words.append({
+                "text": text,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "speaker": sid,
+            })
+
+        if not normalized_words:
+            return []
+
+        segments = []
+        cur = {
+            "speaker": normalized_words[0]["speaker"],
+            "start_ms": normalized_words[0]["start_ms"],
+            "end_ms": normalized_words[0]["end_ms"],
+            "words": [normalized_words[0]["text"]],
+        }
+
+        max_gap_ms = 900
+        max_seg_ms = 9000
+        for w in normalized_words[1:]:
+            gap = max(0, w["start_ms"] - cur["end_ms"])
+            cur_dur = max(0, cur["end_ms"] - cur["start_ms"])
+            same_speaker = (w["speaker"] == cur["speaker"])
+            if same_speaker and gap <= max_gap_ms and cur_dur <= max_seg_ms:
+                cur["words"].append(w["text"])
+                cur["end_ms"] = max(cur["end_ms"], w["end_ms"])
+                continue
+
+            segments.append({
+                "speaker": cur["speaker"],
+                "speaker_id": cur["speaker"],
+                "start_ms": cur["start_ms"],
+                "end_ms": cur["end_ms"],
+                "start": round(cur["start_ms"] / 1000.0, 3),
+                "end": round(cur["end_ms"] / 1000.0, 3),
+                "text_en": " ".join(cur["words"]).strip(),
+                "text": " ".join(cur["words"]).strip(),
+            })
+            cur = {
+                "speaker": w["speaker"],
+                "start_ms": w["start_ms"],
+                "end_ms": w["end_ms"],
+                "words": [w["text"]],
+            }
+
+        segments.append({
+            "speaker": cur["speaker"],
+            "speaker_id": cur["speaker"],
+            "start_ms": cur["start_ms"],
+            "end_ms": cur["end_ms"],
+            "start": round(cur["start_ms"] / 1000.0, 3),
+            "end": round(cur["end_ms"] / 1000.0, 3),
+            "text_en": " ".join(cur["words"]).strip(),
+            "text": " ".join(cur["words"]).strip(),
+        })
+        return segments
+
+    return []
+
+
+def _is_default_speaker_id(value: str) -> bool:
+    token = str(value or "").strip().lower()
+    return token in {"", "default", "unknown", "unk", "none", "null", "n/a", "na"}
+
+
+def _load_phase1_speaker_reference(phase1_json_path: str, *, test_mode: bool) -> list[dict]:
+    """Load normalized phase1 speaker timeline for fallback mapping."""
+    if not phase1_json_path or not os.path.isfile(phase1_json_path):
+        return []
+    try:
+        payload = json.loads(Path(phase1_json_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        ui_log.warning(f"No se pudo leer phase1 para speaker fallback: {exc}")
+        return []
+
+    refs = []
+    for idx, seg in enumerate(_extract_phase1_segments(payload)):
+        if not isinstance(seg, dict):
+            continue
+        start_ms = int(seg.get("start_ms") or round(float(seg.get("start") or 0.0) * 1000.0))
+        end_ms = int(seg.get("end_ms") or round(float(seg.get("end") or 0.0) * 1000.0))
+        if end_ms <= start_ms:
+            continue
+        if test_mode and start_ms >= 30000:
+            continue
+        sid = str(seg.get("speaker") or seg.get("speaker_id") or "default").strip() or "default"
+        refs.append({
+            "idx": idx,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "speaker_id": sid,
+        })
+    return refs
+
+
+def _resolve_speaker_from_phase1(
+    idx: int,
+    start_ms: int,
+    end_ms: int,
+    phase1_refs: list[dict],
+    *,
+    current_speaker: str = "",
+) -> str:
+    """Resolve speaker id using phase1 when current speaker is missing/default."""
+    current = str(current_speaker or "").strip()
+    if not _is_default_speaker_id(current):
+        return current
+    if not phase1_refs:
+        return current or "default"
+
+    # 1) Fast path: index-aligned mapping.
+    if 0 <= idx < len(phase1_refs):
+        sid = str(phase1_refs[idx].get("speaker_id") or "").strip()
+        if sid and not _is_default_speaker_id(sid):
+            return sid
+
+    # 2) Time-overlap best match.
+    best_sid = ""
+    best_overlap = -1
+    for ref in phase1_refs:
+        rs = int(ref.get("start_ms") or 0)
+        re = int(ref.get("end_ms") or 0)
+        overlap = min(end_ms, re) - max(start_ms, rs)
+        if overlap > best_overlap:
+            sid = str(ref.get("speaker_id") or "").strip()
+            if sid and not _is_default_speaker_id(sid):
+                best_overlap = overlap
+                best_sid = sid
+    if best_sid:
+        return best_sid
+
+    # 3) Last resort: first non-default phase1 speaker.
+    for ref in phase1_refs:
+        sid = str(ref.get("speaker_id") or "").strip()
+        if sid and not _is_default_speaker_id(sid):
+            return sid
+
+    return current or "default"
+
+
+def _bridge_videotrans_logger_to_pipeline(vt_config) -> None:
+    try:
+        pipeline_logger = logging.getLogger("qdp")
+        vt_logger = getattr(vt_config, "logger", logging.getLogger("VideoTrans"))
+        if not pipeline_logger.handlers:
+            return
+        vt_logger.handlers.clear()
+        for handler in pipeline_logger.handlers:
+            vt_logger.addHandler(handler)
+        vt_logger.setLevel(logging.INFO)
+        vt_logger.propagate = False
+    except Exception as exc:
+        ui_log.warning(f"P2: no se pudo puentear logger VideoTrans -> pipeline: {exc}")
+
+
+def _install_phase2_progress_bridge(result: dict):
+    vt_tools = __import__("videotrans.util.tools", fromlist=["set_process"])
+    vt_help_misc = __import__("videotrans.util.help_misc", fromlist=["set_process"])
+    original_tools_set_process = vt_tools.set_process
+    original_help_misc_set_process = vt_help_misc.set_process
+    progress_re = re.compile(r"\[translate-progress\]\s+(\d+)/(\d+)\s+lines", re.I)
+
+    def _wrapped_set_process(*, text="", type="logs", uuid=None, **kwargs):
+        message = str(text or "").strip()
+        if type == "logs" and message:
+            progress_match = progress_re.search(message)
+            if progress_match:
+                done = int(progress_match.group(1))
+                total = int(progress_match.group(2))
+                pct = (done / max(total, 1)) * 100.0
+                result["phase"] = f"P2 · Traduciendo con Gemini... {done}/{total} segmentos ({pct:.1f}%)"
+                ui_log.info(f"[P2] {message}")
+            elif message.startswith("[gemini") or "starttrans" in message.lower() or "translate" in message.lower():
+                ui_log.info(f"[P2] {message}")
+        return original_help_misc_set_process(text=text, type=type, uuid=uuid, **kwargs)
+
+    vt_tools.set_process = _wrapped_set_process
+    vt_help_misc.set_process = _wrapped_set_process
+
+    def _restore():
+        vt_tools.set_process = original_tools_set_process
+        vt_help_misc.set_process = original_help_misc_set_process
+
+    return _restore
+
+
 def _voice_ref_audio_files(root_dir: str) -> list[str]:
     if not os.path.isdir(root_dir):
         return []
@@ -912,107 +1178,13 @@ def _save_speaker_map_from_json(mapping_text: str) -> str:
     return f"Mapping guardado en {VOICE_SPEAKER_MAP} con {len(saved)} speaker(s)"
 
 
-def _warmup_nllb200():
-    if os.environ.get("QDP_WARMUP_NLLB", "1").lower() in {"0", "false", "no"}:
-        ui_log.info("NLLB warm-up deshabilitado por QDP_WARMUP_NLLB")
-        return
-
-    try:
-        ui_log.info("Iniciando warm-up de NLLB-200(Local)...")
-        NLLB200Trans = None
-        for mod_name in ("videotrans.translator._nllb200", "pyvideotrans.videotrans.translator._nllb200"):
-            try:
-                NLLB200Trans = importlib.import_module(mod_name).NLLB200Trans
-                break
-            except Exception:
-                continue
-        if NLLB200Trans is None:
-            raise RuntimeError("No se pudo importar NLLB200Trans desde videotrans")
-
-        warmup = NLLB200Trans(
-            translate_type=2,
-            text_list=[],
-            source_code="en",
-            target_code="es",
-            target_language_name="Spanish",
-            is_test=True,
-        )
-        warmup._download()
-        warmup._unload()
-        ui_log.info("Warm-up de NLLB-200(Local) completado")
-    except Exception as exc:
-        ui_log.warning(f"Warm-up de NLLB-200(Local) falló: {exc}")
-
-
 def _start_background_warmups():
-    # Warm-ups legacy desactivados en el workflow actual.
+    # No background warmups are required in the active Gemini-only workflow.
     return
 
 
 def _phase_badges_html(video_file: str | None) -> str:
-    def _badge(title: str, state: str, note: str) -> str:
-        return (
-            f"<div class='qdp-phase-badge state-{state}'>"
-            f"<div class='qdp-phase-title'>{title}</div>"
-            f"<div class='qdp-phase-state'>{state}</div>"
-            f"<div class='qdp-phase-note'>{note}</div>"
-            "</div>"
-        )
-
-    _STATE_LABELS = {"done": "Completado", "ready": "Pendiente", "blocked": "Bloqueado"}
-
-    if not video_file:
-        phase1_state, phase1_note = "blocked", "Input no definido"
-        phase2_state, phase2_note = "blocked", "Requiere artifact P1"
-    else:
-        video_path = _parse_dropdown_choice(video_file, NETWORK_USER_INPUT)
-        valid_video = bool(video_path and os.path.isfile(video_path))
-        if not valid_video:
-            phase1_state, phase1_note = "blocked", "Archivo de entrada no válido"
-            phase2_state, phase2_note = "blocked", "Requiere artifact P1"
-        else:
-            source_name = os.path.splitext(os.path.basename(video_path))[0]
-            safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
-            vt_output_root = os.path.join(PYVIDEOTRANS_ROOT, "output")
-            done_phase1 = False
-            if os.path.isdir(vt_output_root):
-                for folder in os.listdir(vt_output_root):
-                    folder_path = os.path.join(vt_output_root, folder)
-                    if not os.path.isdir(folder_path):
-                        continue
-                    if safe_name in folder and os.path.isfile(os.path.join(folder_path, "speaker_profile.json")):
-                        done_phase1 = True
-                        break
-            done_phase2 = os.path.isfile(os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed.mp4"))
-
-            phase1_state = "done" if done_phase1 else "ready"
-            phase1_note = "Speaker profile disponible" if done_phase1 else "Pendiente de ejecución"
-
-            if done_phase2:
-                phase2_state, phase2_note = "done", "Output generado en /output"
-            elif done_phase1:
-                phase2_state, phase2_note = "ready", "Artifact P1 validado"
-            else:
-                phase2_state, phase2_note = "blocked", "Requiere artifact P1"
-
-    def _state_label(s: str) -> str:
-        return _STATE_LABELS.get(s, s)
-
-    def _badge_labeled(title: str, state: str, note: str) -> str:
-        return (
-            f"<div class='qdp-phase-badge state-{state}'>"
-            f"<div class='qdp-phase-title'>{title}</div>"
-            f"<div class='qdp-phase-state'>{_state_label(state)}</div>"
-            f"<div class='qdp-phase-note'>{note}</div>"
-            "</div>"
-        )
-
-    return (
-        "<div class='qdp-phase-badges'>"
-        + _badge_labeled("P1 · ASR / Diarización", phase1_state, phase1_note)
-        + _badge_labeled("P2 · Síntesis TTS", phase2_state, phase2_note)
-        + "</div>"
-    )
+    return ""
 
 _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v")
 _AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm", ".aac", ".opus")
@@ -1067,6 +1239,27 @@ def _parse_dropdown_choice(choice: str, base_dir: str) -> str | None:
     return os.path.join(base_dir, name)
 
 
+def _probe_stream_counts(path: str) -> tuple[int, int]:
+    """Return (video_streams, audio_streams) using ffprobe. Falls back to (0, 0)."""
+    if not path or not os.path.isfile(path):
+        return 0, 0
+    try:
+        out = subprocess.check_output([
+            "ffprobe",
+            "-v", "error",
+            "-print_format", "json",
+            "-show_streams",
+            path,
+        ], text=True, encoding="utf-8", errors="replace")
+        payload = json.loads(out or "{}")
+        streams = payload.get("streams") or []
+        v = sum(1 for s in streams if str(s.get("codec_type", "")).lower() == "video")
+        a = sum(1 for s in streams if str(s.get("codec_type", "")).lower() == "audio")
+        return int(v), int(a)
+    except Exception:
+        return 0, 0
+
+
 def _srt_time_to_seconds(value) -> float:
     """Parse 'HH:MM:SS,ms' (or with '.' separator) into seconds."""
     token = str(value or "").strip().replace(".", ",")
@@ -1081,6 +1274,143 @@ def _srt_time_to_seconds(value) -> float:
         return int(h) * 3600 + int(m) * 60 + int(s) + (int(ms) / 1000.0)
     except Exception:
         return 0.0
+
+
+def _seconds_to_srt_time(seconds: float) -> str:
+    total_ms = max(int(round(float(seconds or 0.0) * 1000.0)), 0)
+    hours, rem = divmod(total_ms, 3600000)
+    minutes, rem = divmod(rem, 60000)
+    secs, millis = divmod(rem, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _write_srt_from_items(items: list[dict], srt_path: str) -> int:
+    """Write SRT from normalized items (line/startraw/endraw/text). Returns count."""
+    rows = []
+    for idx, it in enumerate(items or [], start=1):
+        text = str(it.get("text") or "").strip()
+        if not text:
+            continue
+        start_raw = str(it.get("startraw") or "").strip()
+        end_raw = str(it.get("endraw") or "").strip()
+        if not start_raw or not end_raw:
+            continue
+        rows.append(f"{idx}\n{start_raw} --> {end_raw}\n{text}\n")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(rows).strip() + ("\n" if rows else ""))
+    return len(rows)
+
+
+def _materialize_phase3_subtitles(pyvt_target_dir: str, phase1_json_path: str, ts_translate_path: str, *, test_mode: bool) -> tuple[str | None, str | None, int]:
+    """Create en.srt/es.srt in pyvideotrans target dir from recovered artifacts.
+
+    Returns (source_srt_path, target_srt_path, segment_count).
+    """
+    if not pyvt_target_dir:
+        return None, None, 0
+    os.makedirs(pyvt_target_dir, exist_ok=True)
+
+    source_srt = os.path.join(pyvt_target_dir, "en.srt")
+    target_srt = os.path.join(pyvt_target_dir, "es.srt")
+
+    source_items = _phase1_json_to_source_subs(phase1_json_path) if os.path.isfile(phase1_json_path) else []
+    if test_mode:
+        source_items = [it for it in source_items if int(it.get("start_time") or 0) < 30000]
+    source_count = _write_srt_from_items(source_items, source_srt) if source_items else 0
+
+    target_items = []
+    if os.path.isfile(ts_translate_path):
+        try:
+            payload = json.loads(Path(ts_translate_path).read_text(encoding="utf-8"))
+            segments = payload.get("segments") if isinstance(payload, dict) else payload
+            if isinstance(segments, list):
+                for idx, seg in enumerate(segments, start=1):
+                    if not isinstance(seg, dict):
+                        continue
+                    start = float(seg.get("start") or 0.0)
+                    end = float(seg.get("end") or 0.0)
+                    if test_mode and start >= 30.0:
+                        continue
+                    text_es = str(seg.get("text_es") or seg.get("text") or "").strip()
+                    if not text_es or end <= start:
+                        continue
+                    target_items.append({
+                        "line": idx,
+                        "startraw": _seconds_to_srt_time(start),
+                        "endraw": _seconds_to_srt_time(end),
+                        "text": text_es,
+                    })
+        except Exception as exc:
+            ui_log.warning(f"P3: no se pudo leer timestamps_translate.json para materializar es.srt: {exc}")
+
+    target_count = _write_srt_from_items(target_items, target_srt) if target_items else 0
+    if source_count <= 0:
+        source_srt = None
+    if target_count <= 0:
+        target_srt = None
+    return source_srt, target_srt, min(source_count, target_count) if source_count and target_count else max(source_count, target_count)
+
+
+def _materialize_phase3_speaker_marks(pyvt_target_dir: str, phase1_json_path: str, ts_translate_path: str, *, test_mode: bool) -> tuple[str | None, int]:
+    """Create speaker.json marks for Phase 3 to avoid re-running diarization.
+
+    Returns (speaker_json_path, count).
+    """
+    if not pyvt_target_dir:
+        return None, 0
+    os.makedirs(pyvt_target_dir, exist_ok=True)
+
+    phase1_refs = _load_phase1_speaker_reference(phase1_json_path, test_mode=test_mode)
+    marks: list[str] = []
+    fallback_hits = 0
+    if ts_translate_path and os.path.isfile(ts_translate_path):
+        try:
+            payload = json.loads(Path(ts_translate_path).read_text(encoding="utf-8"))
+            segments = payload.get("segments") if isinstance(payload, dict) else payload
+            if isinstance(segments, list):
+                for idx, seg in enumerate(segments):
+                    if not isinstance(seg, dict):
+                        continue
+                    start = float(seg.get("start") or 0.0)
+                    if test_mode and start >= 30.0:
+                        continue
+                    end = float(seg.get("end") or start)
+                    sid_raw = str(seg.get("speaker_id") or seg.get("speaker") or "default").strip() or "default"
+                    sid = _resolve_speaker_from_phase1(
+                        idx,
+                        int(round(start * 1000.0)),
+                        int(round(end * 1000.0)),
+                        phase1_refs,
+                        current_speaker=sid_raw,
+                    )
+                    if _is_default_speaker_id(sid_raw) and not _is_default_speaker_id(sid):
+                        fallback_hits += 1
+                    marks.append(sid)
+        except Exception as exc:
+            ui_log.warning(f"P3: no se pudo leer timestamps_translate.json para speaker.json: {exc}")
+
+    if not marks and phase1_json_path and os.path.isfile(phase1_json_path):
+        try:
+            payload = json.loads(Path(phase1_json_path).read_text(encoding="utf-8"))
+            segments = _extract_phase1_segments(payload)
+            for seg in segments:
+                start = float(seg.get("start") or (int(seg.get("start_ms") or 0) / 1000.0))
+                if test_mode and start >= 30.0:
+                    continue
+                sid = str(seg.get("speaker") or seg.get("speaker_id") or "default").strip() or "default"
+                marks.append(sid)
+        except Exception as exc:
+            ui_log.warning(f"P3: no se pudo leer phase1_transcript_diarization.json para speaker.json: {exc}")
+
+    if not marks:
+        return None, 0
+
+    out_path = os.path.join(pyvt_target_dir, "speaker.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(marks, f, ensure_ascii=False)
+    if fallback_hits > 0:
+        ui_log.info(f"[P3] speaker fallback F1 aplicado en {fallback_hits}/{len(marks)} marcas")
+    return out_path, len(marks)
 
 
 def _extract_speaker_preview_clips(
@@ -1287,13 +1617,79 @@ def _get_user_audios():
     return _list_network_files(_AUDIO_EXTS)
 
 
-def _resolve_subtitle_media_path(video_input) -> str | None:
+def _list_subtitle_reference_media() -> list[str]:
+    """Lista medios ya existentes en salidas/local temp para Tab 2.
+
+    Formato de choice: '<absolute_path>  (12.3 MB)'
+    """
+    roots = [
+        NETWORK_OUTPUT,
+        LOCAL_OUTPUT,
+        os.path.join(LOCAL_TEMP, "temp_processing"),
+        LOCAL_TEMP,
+        os.path.join(PYVIDEOTRANS_ROOT, "output"),
+    ]
+    exts = set(_VIDEO_EXTS + _AUDIO_EXTS)
+    seen: set[str] = set()
+    rows: list[str] = []
+
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for cur_root, _, files in os.walk(root):
+                for name in files:
+                    if not str(name).lower().endswith(tuple(exts)):
+                        continue
+                    abs_path = os.path.join(cur_root, name)
+                    norm = os.path.normcase(os.path.abspath(abs_path))
+                    if norm in seen:
+                        continue
+                    seen.add(norm)
+                    try:
+                        size = os.path.getsize(abs_path)
+                    except OSError:
+                        continue
+                    if size >= 1024 ** 3:
+                        size_str = f"{size/1024**3:.2f} GB"
+                    else:
+                        size_str = f"{size/1024**2:.1f} MB"
+                    rows.append(f"{abs_path}  ({size_str})")
+        except OSError:
+            continue
+
+    rows.sort(key=str.lower)
+    return rows
+
+
+def _parse_path_choice(choice: str) -> str | None:
+    if not choice or not isinstance(choice, str):
+        return None
+    candidate = choice.rsplit("  (", 1)[0].strip()
+    if candidate and os.path.isfile(candidate):
+        return candidate
+    if os.path.isfile(choice):
+        return choice
+    return None
+
+
+def _resolve_subtitle_media_path(video_input, local_media_input=None) -> str | None:
+    if isinstance(local_media_input, str) and local_media_input.strip():
+        local_path = _parse_path_choice(local_media_input)
+        if local_path:
+            return local_path
     if not video_input:
         return None
     if isinstance(video_input, str) and os.path.isfile(video_input):
         return video_input
     if isinstance(video_input, str):
-        return _parse_dropdown_choice(video_input, NETWORK_USER_INPUT)
+        parsed = _parse_dropdown_choice(video_input, NETWORK_USER_INPUT)
+        if parsed and os.path.isfile(parsed):
+            return parsed
+        # Allow direct absolute-path style labels too.
+        direct = _parse_path_choice(video_input)
+        if direct:
+            return direct
     return None
 
 
@@ -1429,8 +1825,6 @@ ASR_TYPE_MAP = {
 }
 
 TRANSLATE_TYPE_MAP = {
-    "nllb_local": 2,
-    "m2m100_local": 2,
     "google": 0,
     "microsoft": 1,
     "chatgpt": 3,
@@ -1588,6 +1982,7 @@ def clear_cache_artifacts() -> str:
     ]
     deleted_count = 0
     errors = []
+    skipped_locked = []
     for d in targets:
         if not os.path.isdir(d):
             continue
@@ -1600,8 +1995,17 @@ def clear_cache_artifacts() -> str:
                     shutil.rmtree(p)
                 deleted_count += 1
             except Exception as exc:
-                errors.append(f"{name}: {exc}")
+                is_locked_log = (
+                    str(name).lower() == "pipeline.log"
+                    and getattr(exc, "winerror", None) == 32
+                )
+                if is_locked_log:
+                    skipped_locked.append(name)
+                else:
+                    errors.append(f"{name}: {exc}")
     msg = f"✅ Caché limpiado — {deleted_count} elemento(s) eliminados."
+    if skipped_locked:
+        msg += f"\nℹ️ Omitidos por uso activo: {', '.join(skipped_locked)}"
     if errors:
         msg += "\n⚠️ Errores (" + str(len(errors)) + "): " + "; ".join(errors[:3])
     return msg
@@ -1653,6 +2057,7 @@ def load_recovery_artifacts(
         "phase1_transcript_diarization.json": phase1_src,
         "timestamps_translate.json": _path(file_ts_translate),
     }
+    imported_ts_translate = bool(artifact_map["timestamps_translate.json"] and os.path.isfile(artifact_map["timestamps_translate.json"]))
     recovery_artifact_dir = _resolve_phase1_artifact_dir(
         "",
         uploaded_paths=[
@@ -1676,7 +2081,7 @@ def load_recovery_artifacts(
     except Exception as exc:
         return _empty(f"Recovery ERROR · No se pudo leer phase1_transcript_diarization.json: {exc}")
 
-    segments = phase1_payload.get("segments") if isinstance(phase1_payload, dict) else []
+    segments = _extract_phase1_segments(phase1_payload)
     if not isinstance(segments, list) or not segments:
         return _empty("Recovery ERROR · phase1_transcript_diarization.json no trae segmentos válidos.")
 
@@ -1756,7 +2161,7 @@ def load_recovery_artifacts(
                 gr.update(value=None, visible=False),
             ]
 
-    has_ts_translate = os.path.isfile(os.path.join(NETWORK_OUTPUT, "timestamps_translate.json"))
+    has_ts_translate = imported_ts_translate
     if has_ts_translate:
         status_msg = (
             f"✅ Recovery OK · {len(copied)} artefactos importados · {len(speakers)} speaker(s) detectados. "
@@ -1802,7 +2207,7 @@ def run_phase1(
         for _ in range(N):
             empty_rows += [gr.update(visible=False), gr.update(value=""), gr.update(value=""), gr.update(value=None), gr.update(value=None, visible=False)]
         yield (msg, "", gr.update(visible=False), *empty_rows,
-               gr.update(interactive=False, value="P2 · Pendiente artifact P1"), [],
+               gr.update(interactive=False, visible=True, value="P2 · Pendiente artifact P1"), [],
                gr.update(value=None),
                gr.update(interactive=True, value="Ejecutar P1 · ASR + Diarización"))
 
@@ -1832,11 +2237,39 @@ def run_phase1(
                 ui_log.info(result["phase"])
                 source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
                 safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
-                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}{source_ext or '.mp4'}")
+                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}_{int(time.time())}{source_ext or '.mp4'}")
                 subprocess.run([
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-                    "-i", current_video_path, "-t", "30", "-c", "copy", test_video_path
+                    "-i", current_video_path,
+                    "-map", "0:v:0",
+                    "-map", "0:a?",
+                    "-t", "30",
+                    "-c", "copy",
+                    test_video_path
                 ], check=True)
+                src_v, src_a = _probe_stream_counts(current_video_path)
+                out_v, out_a = _probe_stream_counts(test_video_path)
+                if src_a > 0 and out_a == 0:
+                    ui_log.warning(
+                        "TEST trim lost audio stream after stream-copy; retrying with AAC audio encode fallback"
+                    )
+                    subprocess.run([
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                        "-i", current_video_path,
+                        "-map", "0:v:0",
+                        "-map", "0:a:0?",
+                        "-t", "30",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        test_video_path,
+                    ], check=True)
+                    out_v, out_a = _probe_stream_counts(test_video_path)
+                    if out_a == 0:
+                        raise RuntimeError(
+                            "TEST trim produced video without audio stream although source has audio"
+                        )
+                ui_log.info(f"[TEST-TRIM] source_streams(v={src_v}, a={src_a}) output_streams(v={out_v}, a={out_a})")
                 current_video_path = test_video_path
 
             cmd = [
@@ -1880,6 +2313,7 @@ def run_phase1(
             )
             analyze_re = re.compile(r"^ANALYZE_DONE:(.+)$")
             analyze_done_seen = False
+            terminated_after_analyze_done = False
             for line in iter(process.stdout.readline, ""):
                 if line:
                     line_clean = line.strip()
@@ -1897,6 +2331,7 @@ def run_phase1(
                     ui_log.warning(
                         "Fase 1 recibió ANALYZE_DONE pero el proceso siguió abierto; la UI continúa con los artefactos ya generados."
                     )
+                    terminated_after_analyze_done = True
                     process.terminate()
                     try:
                         process.wait(timeout=5)
@@ -1907,7 +2342,20 @@ def run_phase1(
             if process.poll() is None:
                 process.wait()
             if process.returncode != 0:
-                raise RuntimeError(f"Fase 1 falló con código {process.returncode}")
+                # If ANALYZE_DONE was already emitted, artifacts are considered valid.
+                # Some runtimes keep the child alive and we terminate it intentionally.
+                if analyze_done_seen and (
+                    terminated_after_analyze_done or process.returncode in (-15, -9, 143, 137)
+                ):
+                    ui_log.warning(
+                        f"Fase 1 finalizó con código {process.returncode} después de ANALYZE_DONE; se considera éxito."
+                    )
+                elif analyze_done_seen:
+                    ui_log.warning(
+                        f"Fase 1 retornó código {process.returncode} después de ANALYZE_DONE; se conserva éxito por artefactos ya generados."
+                    )
+                else:
+                    raise RuntimeError(f"Fase 1 falló con código {process.returncode}")
 
             result["done"] = True
             result["phase"] = "P1 · Completado. Configura speakers e inicia P2."
@@ -1929,7 +2377,7 @@ def run_phase1(
     while t.is_alive():
         time.sleep(1.0)
         yield (result["phase"], read_log_tail(800), gr.update(visible=False), *empty_rows,
-               gr.update(interactive=False, value="P2 · Pendiente artifact P1"), [],
+               gr.update(interactive=False, visible=True, value="P2 · Pendiente artifact P1"), [],
                gr.update(value=None),
                gr.update(interactive=False, value="P1 · Ejecutando..."))
 
@@ -2050,7 +2498,7 @@ def run_phase1(
         read_log_tail(800),
         gr.update(visible=True),   # spk_section
         *row_updates,              # N_SPK_MAX × 5 items
-        gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+        gr.update(interactive=True, visible=True, value="Ejecutar P2 · Traducción EN→ES"),
         speakers,                  # state_speakers
         gr.update(value=phase1_json_download),
         gr.update(interactive=True, value="Ejecutar P1 · ASR + Diarización"),  # btn_phase1
@@ -2074,7 +2522,7 @@ def run_phase2(
     if not video_file:
         yield (
             "Error", "P2 ERROR · Selecciona un video.", None, None, None, None, None, None,
-            gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+            gr.update(interactive=True, visible=True, value="Ejecutar P2 · Traducción EN→ES"),
             gr.update(visible=False, interactive=False),
         )
         return
@@ -2083,18 +2531,18 @@ def run_phase2(
     if not video_path or not os.path.isfile(video_path):
         yield (
             "Error", f"P2 ERROR · Ruta inválida: {video_path}", None, None, None, None, None, None,
-            gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+            gr.update(interactive=True, visible=True, value="Ejecutar P2 · Traducción EN→ES"),
             gr.update(visible=False, interactive=False),
         )
         return
 
     target_dir = _resolve_phase1_artifact_dir(video_path, state_speakers)
-    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
+    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "gemini").strip().lower()
     translate_type = TRANSLATE_TYPE_MAP.get(llm_model)
     if translate_type is None:
         yield (
             "Error", f"P2 ERROR · Modelo de traducción no reconocido: {llm_model}", None, None, None, None, None, None,
-            gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+            gr.update(interactive=True, visible=True, value="Ejecutar P2 · Traducción EN→ES"),
             gr.update(visible=False, interactive=False),
         )
         return
@@ -2104,7 +2552,7 @@ def run_phase2(
             "Error",
             "P2 ERROR · No se encontró el directorio real de artefactos de Fase 1 para este video.",
             None, None, None, None, None, None,
-            gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+            gr.update(interactive=True, visible=True, value="Ejecutar P2 · Traducción EN→ES"),
             gr.update(visible=False, interactive=False),
         )
         return
@@ -2123,15 +2571,7 @@ def run_phase2(
         os.path.join(NETWORK_OUTPUT, "transcript.srt"),
     ]
     source_srt = next((p for p in source_srt_candidates if os.path.isfile(p)), None)
-    if not source_srt:
-        yield (
-            "Error",
-            f"P2 ERROR · No se encontró transcript.srt/en.srt en {target_dir}. Fase 1 debe generar el SRT inglés primero.",
-            None, None, None, None, None, None,
-            gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
-            gr.update(visible=False, interactive=False),
-        )
-        return
+    phase1_json_path = os.path.join(target_dir, "phase1_transcript_diarization.json")
 
     effective_video_path = video_path
     if test_mode:
@@ -2151,6 +2591,7 @@ def run_phase2(
     }
 
     def worker():
+        restore_phase2_progress = None
         try:
             vt_config = __import__("videotrans.configure.config", fromlist=["params"])
             vt_translator = __import__("videotrans.translator", fromlist=["run"])
@@ -2160,11 +2601,19 @@ def run_phase2(
             get_srt_from_list = vt_help_srt.get_srt_from_list
             get_subtitle_from_srt = vt_help_srt.get_subtitle_from_srt
 
-            source_subs = get_subtitle_from_srt(source_srt, is_file=True)
+            _bridge_videotrans_logger_to_pipeline(vt_config)
+            restore_phase2_progress = _install_phase2_progress_bridge(result)
+
+            if source_srt:
+                source_subs = get_subtitle_from_srt(source_srt, is_file=True)
+            else:
+                source_subs = _phase1_json_to_source_subs(phase1_json_path)
+                if source_subs:
+                    ui_log.info(f"[P2] source_subs reconstruido desde phase1_transcript_diarization.json: {phase1_json_path}")
             if test_mode:
                 source_subs = [it for it in source_subs if int(it.get("start_time") or 0) < 30000]
             if not source_subs:
-                raise RuntimeError("El SRT inglés está vacío.")
+                raise RuntimeError("No se encontró transcript.srt/en.srt y tampoco se pudieron reconstruir segmentos válidos desde phase1_transcript_diarization.json.")
 
             child_env = _inject_ai_env_to_child(os.environ.copy())
             gemini_key = str(child_env.get("API_GOOGLE_STUDIO") or "").strip().strip('"').strip("'")
@@ -2177,7 +2626,8 @@ def run_phase2(
             vt_params["translate_type"] = translate_type
 
             ui_log.info(f"[ENV-PHASE2] gemini_api_set={bool(gemini_key)} gemini_model={gemini_model}")
-            ui_log.info(f"[P2] source_srt={source_srt}")
+            ui_log.info(f"[P2] translation_backend=gemini_api translate_type={translate_type} local_model=disabled")
+            ui_log.info(f"[P2] source_srt={source_srt or phase1_json_path}")
             ui_log.info(f"[P2] pyvt_target_dir={pyvt_target_dir}")
             result["phase"] = f"P2 · Traduciendo {len(source_subs)} segmentos EN→ES con Gemini..."
 
@@ -2204,15 +2654,31 @@ def run_phase2(
                     ui_log.warning(f"P2: no se pudo leer timestamps.json para speaker mapping: {exc}")
                     timestamp_segments = []
 
+            phase1_speaker_refs = _load_phase1_speaker_reference(phase1_json_path, test_mode=bool(test_mode))
+            if phase1_speaker_refs:
+                ui_log.info(f"[P2] referencia de speaker desde F1 cargada: {len(phase1_speaker_refs)} segmentos")
+            else:
+                ui_log.warning("[P2] sin referencia de speaker en F1; se usará speaker de timestamps.json o default")
+
             normalized_translated = []
             translated_segments = []
+            speaker_fallback_hits = 0
             for idx, source_item in enumerate(source_subs):
                 translated_item = translated_subs[idx] if idx < len(translated_subs) and isinstance(translated_subs[idx], dict) else {}
                 text_es = str(translated_item.get("text") or "").strip() or str(source_item.get("text") or "").strip()
                 start_ms = int(source_item.get("start_time") or 0)
                 end_ms = int(source_item.get("end_time") or 0)
                 meta = timestamp_segments[idx] if idx < len(timestamp_segments) and isinstance(timestamp_segments[idx], dict) else {}
-                speaker_id = str(meta.get("speaker") or meta.get("speaker_id") or "default").strip() or "default"
+                meta_speaker_id = str(meta.get("speaker") or meta.get("speaker_id") or "default").strip() or "default"
+                speaker_id = _resolve_speaker_from_phase1(
+                    idx,
+                    start_ms,
+                    end_ms,
+                    phase1_speaker_refs,
+                    current_speaker=meta_speaker_id,
+                )
+                if _is_default_speaker_id(meta_speaker_id) and not _is_default_speaker_id(speaker_id):
+                    speaker_fallback_hits += 1
                 normalized_translated.append({
                     "line": idx + 1,
                     "startraw": source_item.get("startraw"),
@@ -2234,6 +2700,9 @@ def run_phase2(
 
             if not translated_segments:
                 raise RuntimeError("No se generaron segmentos traducidos utilizables.")
+
+            if speaker_fallback_hits > 0:
+                ui_log.info(f"[P2] speaker fallback F1 aplicado en {speaker_fallback_hits}/{len(translated_segments)} segmentos")
 
             os.makedirs(pyvt_target_dir, exist_ok=True)
             with open(pyvt_source_srt, "w", encoding="utf-8") as f:
@@ -2297,6 +2766,9 @@ def run_phase2(
             result["error"] = str(exc)
             result["phase"] = f"P2 ERROR · {exc}"
             ui_log.error(f"Fase 2 error: {exc}\n{traceback.format_exc()}")
+        finally:
+            if restore_phase2_progress:
+                restore_phase2_progress()
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
@@ -2312,7 +2784,7 @@ def run_phase2(
             result.get("final_srt"),
             None,
             result.get("ts_translate_path"),
-            gr.update(interactive=False, value="P2 · Traduciendo con Gemini..."),
+            gr.update(interactive=False, visible=True, value="P2 · Traduciendo con Gemini..."),
             gr.update(visible=False, interactive=False, value="P3 · Pendiente Fase 2"),
         )
 
@@ -2327,7 +2799,7 @@ def run_phase2(
             result.get("final_srt"),
             None,
             result.get("ts_translate_path"),
-            gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+            gr.update(interactive=True, visible=True, value="Ejecutar P2 · Traducción EN→ES"),
             gr.update(visible=True, interactive=False, value="P3 · Pendiente Fase 2"),
         )
         return
@@ -2341,7 +2813,7 @@ def run_phase2(
         result.get("final_srt"),
         None,
         result.get("ts_translate_path"),
-        gr.update(interactive=True, value="Ejecutar P2 · Traducción EN→ES"),
+        gr.update(interactive=False, visible=False, value="P2 · Completado ✓"),
         gr.update(visible=True, interactive=True, value="Ejecutar P3 · Clonación + Ensamble"),
     )
 
@@ -2406,8 +2878,8 @@ def run_phase3(
         json.dump(speaker_map, f, indent=2, ensure_ascii=False)
     ui_log.info(f"Voice map escrito: {len(speaker_map)} speaker(s) → {VOICE_SPEAKER_MAP}")
 
-    # --- Now run the full pipeline (Fase 2) ---
-    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
+    # --- Fase 3: clonado + ensamble, reutilizando artefactos de Fase 1/2 ---
+    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "gemini").strip().lower()
     tts_model = "qwen_local_clone"
 
     asr_type = ASR_TYPE_MAP.get("faster")
@@ -2422,14 +2894,14 @@ def run_phase3(
     setup_pipeline_logger(LOCAL_LOGS)
 
     ui_log.info("=" * 80)
-    ui_log.info("INICIANDO MOTOR PYVIDEOTRANS — FASE 2 (DOBLAJE)")
+    ui_log.info("INICIANDO MOTOR PYVIDEOTRANS — FASE 3 (CLONACIÓN + ENSAMBLE)")
     ui_log.info(f"Video: {video_path}")
     ui_log.info(f"Speaker map: {len(speaker_map)} speaker(s) asignados")
     ui_log.info("=" * 80)
 
     result = {"audio": None, "video": None, "json_timestamps": None, "srt_file": None,
               "download_audio": None, "status": "running", "error": None,
-              "phase": "P2 · Inicializando pipeline TTS..."}
+              "phase": "P3 · Inicializando pipeline de clonación..."}
 
     def worker():
         try:
@@ -2440,12 +2912,79 @@ def run_phase3(
                 ui_log.info(result["phase"])
                 source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
                 safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
-                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}{source_ext or '.mp4'}")
+                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}_{int(time.time())}{source_ext or '.mp4'}")
                 subprocess.run([
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-                    "-i", current_video_path, "-t", "30", "-c", "copy", test_video_path
+                    "-i", current_video_path,
+                    "-map", "0:v:0",
+                    "-map", "0:a?",
+                    "-t", "30",
+                    "-c", "copy",
+                    test_video_path
                 ], check=True)
+                src_v, src_a = _probe_stream_counts(current_video_path)
+                out_v, out_a = _probe_stream_counts(test_video_path)
+                if src_a > 0 and out_a == 0:
+                    ui_log.warning(
+                        "TEST trim lost audio stream after stream-copy; retrying with AAC audio encode fallback"
+                    )
+                    subprocess.run([
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                        "-i", current_video_path,
+                        "-map", "0:v:0",
+                        "-map", "0:a:0?",
+                        "-t", "30",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        test_video_path,
+                    ], check=True)
+                    out_v, out_a = _probe_stream_counts(test_video_path)
+                    if out_a == 0:
+                        raise RuntimeError(
+                            "TEST trim produced video without audio stream although source has audio"
+                        )
+                ui_log.info(f"[TEST-TRIM] source_streams(v={src_v}, a={src_a}) output_streams(v={out_v}, a={out_a})")
                 current_video_path = test_video_path
+
+            pyvt_target_dir = _pyvideotrans_target_dir_for_video(current_video_path)
+            phase1_dir = _resolve_phase1_artifact_dir(video_path, state_speakers)
+            phase1_json_path = os.path.join(phase1_dir, "phase1_transcript_diarization.json") if phase1_dir else ""
+            if not phase1_json_path or not os.path.isfile(phase1_json_path):
+                fallback_phase1 = os.path.join(NETWORK_OUTPUT, "phase1_transcript_diarization.json")
+                if os.path.isfile(fallback_phase1):
+                    phase1_json_path = fallback_phase1
+            ts_translate_path = os.path.join(NETWORK_OUTPUT, "timestamps_translate.json")
+            p3_source_srt, p3_target_srt, p3_count = _materialize_phase3_subtitles(
+                pyvt_target_dir,
+                phase1_json_path,
+                ts_translate_path,
+                test_mode=bool(test_mode),
+            )
+            if p3_source_srt and p3_target_srt:
+                ui_log.info(
+                    f"[P3] artefactos reutilizados para evitar re-ASR/re-traducción: "
+                    f"en.srt={p3_source_srt}, es.srt={p3_target_srt}, segmentos={p3_count}"
+                )
+            else:
+                ui_log.warning(
+                    "[P3] no se pudieron materializar en.srt/es.srt desde artefactos; "
+                    "pyvideotrans puede relanzar reconocimiento/traducción."
+                )
+
+            p3_speaker_json, p3_speaker_count = _materialize_phase3_speaker_marks(
+                pyvt_target_dir,
+                phase1_json_path,
+                ts_translate_path,
+                test_mode=bool(test_mode),
+            )
+            if p3_speaker_json and p3_speaker_count > 0:
+                ui_log.info(
+                    f"[P3] speaker.json reutilizado para evitar re-diarización: "
+                    f"{p3_speaker_json} ({p3_speaker_count} marcas)"
+                )
+            else:
+                ui_log.warning("[P3] speaker.json no disponible; se habilitará diarización en pyvideotrans.")
 
             cmd = [
                 PYVIDEOTRANS_PYTHON, PYVIDEOTRANS_CLI,
@@ -2462,12 +3001,12 @@ def run_phase3(
                 "--subtitle_type", "0",
                 "--video_autorate",
                 "--voice_role", "clone",
-                "--enable_diariz",
-                "--nums_diariz", "0",
             ]
+            if not (p3_speaker_json and p3_speaker_count > 0):
+                cmd.extend(["--enable_diariz", "--nums_diariz", "0"])
 
-            result["phase"] = "P2 · Pipeline TTS/doblaje activo..."
-            ui_log.info(f"Ejecutando Fase 2: {' '.join(cmd)}")
+            result["phase"] = "P3 · Pipeline TTS/ensamble activo..."
+            ui_log.info(f"Ejecutando Fase 3: {' '.join(cmd)}")
             run_started_at = time.time()
 
             child_env = os.environ.copy()
@@ -2480,11 +3019,24 @@ def run_phase3(
             child_env = _inject_ai_env_to_child(child_env)
             child_env["QDP_BACKAUDIO_VOLUME"] = str(float(backaudio_volume))
             child_env.setdefault("QDP_BACKAUDIO_SOURCE", "original")
+            # Keep user's preferred "original bed" feel and reduce CPU-only post steps.
+            child_env.setdefault("PYVIDEOTRANS_KEEP_ORIGINAL_BED", "1")
+            child_env.setdefault("PYVIDEOTRANS_DUCKING_PURE", "1")
+            child_env.setdefault("PYVIDEOTRANS_FAST_NOVOICE_COPY", "1")
+            child_env.setdefault("PYVIDEOTRANS_REMOVE_DUBB_SILENCE", "0")
+            child_env.setdefault("PYVIDEOTRANS_DUBBING_THREAD", "4")
+            child_env.setdefault("PYVIDEOTRANS_FORCE_QWEN_TTS_CUDA", "1")
+            child_env["QDP_ORIGINAL_SOURCE_VIDEO"] = video_path
             ui_log.info(
-                f"[ENV-PHASE2] gemini_api_set={bool(child_env.get('API_GOOGLE_STUDIO'))} "
+                f"[ENV-PHASE3] gemini_api_set={bool(child_env.get('API_GOOGLE_STUDIO'))} "
                 f"gemini_model={child_env.get('GEMINI_MODEL', '')} "
                 f"backaudio_volume={child_env.get('QDP_BACKAUDIO_VOLUME', '')} "
-                f"backaudio_source={child_env.get('QDP_BACKAUDIO_SOURCE', '')}"
+                f"backaudio_source={child_env.get('QDP_BACKAUDIO_SOURCE', '')} "
+                f"ducking_pure={child_env.get('PYVIDEOTRANS_DUCKING_PURE', '')} "
+                f"fast_novoice_copy={child_env.get('PYVIDEOTRANS_FAST_NOVOICE_COPY', '')} "
+                f"remove_dubb_silence={child_env.get('PYVIDEOTRANS_REMOVE_DUBB_SILENCE', '')} "
+                f"dubbing_thread={child_env.get('PYVIDEOTRANS_DUBBING_THREAD', '')} "
+                f"original_source_video={child_env.get('QDP_ORIGINAL_SOURCE_VIDEO', '')}"
             )
             sox_candidates = [
                 os.path.join(PYVIDEOTRANS_ROOT, "ffmpeg", "sox"),
@@ -2509,11 +3061,12 @@ def run_phase3(
             qwen_re = re.compile(r"\[qwen3tts\]\s+(batch_start|batch_done)\s+([^\n]*)", re.IGNORECASE)
             qwen_generated_re = re.compile(r"generated=(\d+)/(\d+)", re.IGNORECASE)
             qwen_eta_re = re.compile(r"eta=(\d{2}:\d{2})", re.IGNORECASE)
+            qwen_convert_re = re.compile(r"\[qwen3tts\]\s+convert_wav\s+(\d+)/(\d+)", re.IGNORECASE)
 
             for line in iter(process.stdout.readline, ""):
                 if line:
                     line_clean = line.strip()
-                    ui_log.info(f"[VT-PHASE2] {line_clean}")
+                    ui_log.info(f"[VT-PHASE3] {line_clean}")
                     qwen_match = qwen_re.search(line_clean)
                     if qwen_match:
                         generated = qwen_generated_re.search(line_clean)
@@ -2525,7 +3078,14 @@ def run_phase3(
                             eta_txt = eta.group(1) if eta else "--:--"
                             result["phase"] = f"Qwen TTS: {done_n}/{total_n} ({pct:.1f}%) · ETA {eta_txt}"
                         else:
-                            result["phase"] = "P2 · Qwen TTS en curso..."
+                            result["phase"] = "P3 · Qwen TTS en curso..."
+                    else:
+                        convert_match = qwen_convert_re.search(line_clean)
+                        if convert_match:
+                            done_n = int(convert_match.group(1))
+                            total_n = int(convert_match.group(2))
+                            pct = (done_n / max(total_n, 1)) * 100.0
+                            result["phase"] = f"Qwen post-proceso WAV: {done_n}/{total_n} ({pct:.1f}%)"
                     vt_recent_lines.append(line_clean)
                     if len(vt_recent_lines) > 120:
                         vt_recent_lines.pop(0)
@@ -2537,7 +3097,7 @@ def run_phase3(
                 if "Kernel size can't be greater than actual input size" in joined:
                     hint = "Referencia de voz demasiado corta para Qwen clone. Usa refs ≥1.2s."
                 raise RuntimeError(
-                    f"Fase 2 falló con código {process.returncode}. {hint or ''}"
+                    f"Fase 3 falló con código {process.returncode}. {hint or ''}"
                 )
 
             joined = "\n".join(vt_recent_lines)
@@ -2551,7 +3111,7 @@ def run_phase3(
                         "Revisa las referencias de voz."
                     )
 
-            result["phase"] = "P2 · Recolectando artefactos de salida..."
+            result["phase"] = "P3 · Recolectando artefactos de salida..."
             ui_log.info(result["phase"])
 
             original_base = os.path.splitext(os.path.basename(video_path))[0]
@@ -2564,7 +3124,7 @@ def run_phase3(
                 min_mtime=run_started_at - 120,
             )
             if not vt_output_dir:
-                raise RuntimeError("P2 ERROR · Pipeline completó pero no se encontró carpeta de salida.")
+                raise RuntimeError("P3 ERROR · Pipeline completó pero no se encontró carpeta de salida.")
 
             safe_name = original_safe
             vt_mp4 = _pick_best_output_mp4(vt_output_dir, ui_log)
@@ -2572,7 +3132,7 @@ def run_phase3(
             shutil.copy2(vt_mp4, final_mp4)
 
             if apply_video_fx:
-                result["phase"] = "P2 · Aplicando filtros de video..."
+                result["phase"] = "P3 · Aplicando filtros de video..."
                 enhanced_tmp = os.path.join(NETWORK_OUTPUT, f"{safe_name}_dubbed_enhanced_tmp.mp4")
                 _apply_video_enhancements(final_mp4, enhanced_tmp, brightness, contrast, color, sharpness)
                 os.replace(enhanced_tmp, final_mp4)
@@ -2627,8 +3187,8 @@ def run_phase3(
         except Exception as e:
             result["status"] = "fail"
             result["error"] = str(e)
-            result["phase"] = f"P2 ERROR · {e}"
-            ui_log.error(f"Fase 2 falló: {e}\n{traceback.format_exc()}")
+            result["phase"] = f"P3 ERROR · {e}"
+            ui_log.error(f"Fase 3 falló: {e}\n{traceback.format_exc()}")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
@@ -2679,7 +3239,7 @@ def run_pyvideotrans_pipeline(
     asr_model = "faster"
     asr_model_name = os.environ.get("QDP_ASR_MODEL", "large-v3-turbo").strip() or "large-v3-turbo"
     target_lang = "es"
-    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "nllb_local").strip().lower()
+    llm_model = os.environ.get("QDP_TRANSLATE_MODEL", "gemini").strip().lower()
     tts_model = "edge"
 
     effective_tts_model = tts_model
@@ -2727,12 +3287,40 @@ def run_pyvideotrans_pipeline(
                 ui_log.info(result["phase"])
                 source_name, source_ext = os.path.splitext(os.path.basename(current_video_path))
                 safe_name = re.sub(r'[\s\. #*?!:"]', '-', source_name)
-                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}{source_ext or '.mp4'}")
+                test_video_path = os.path.join(LOCAL_TEMP, f"test30s_{safe_name}_{int(time.time())}{source_ext or '.mp4'}")
                 
                 subprocess.run([
                     "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-                    "-i", current_video_path, "-t", "30", "-c", "copy", test_video_path
+                    "-i", current_video_path,
+                    "-map", "0:v:0",
+                    "-map", "0:a?",
+                    "-t", "30",
+                    "-c", "copy",
+                    test_video_path
                 ], check=True)
+                src_v, src_a = _probe_stream_counts(current_video_path)
+                out_v, out_a = _probe_stream_counts(test_video_path)
+                if src_a > 0 and out_a == 0:
+                    ui_log.warning(
+                        "TEST trim lost audio stream after stream-copy; retrying with AAC audio encode fallback"
+                    )
+                    subprocess.run([
+                        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                        "-i", current_video_path,
+                        "-map", "0:v:0",
+                        "-map", "0:a:0?",
+                        "-t", "30",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        test_video_path,
+                    ], check=True)
+                    out_v, out_a = _probe_stream_counts(test_video_path)
+                    if out_a == 0:
+                        raise RuntimeError(
+                            "TEST trim produced video without audio stream although source has audio"
+                        )
+                ui_log.info(f"[TEST-TRIM] source_streams(v={src_v}, a={src_a}) output_streams(v={out_v}, a={out_a})")
                 current_video_path = test_video_path
 
             cmd = [
@@ -2848,9 +3436,6 @@ def run_pyvideotrans_pipeline(
                         "Qwen clone failed: reference audio is too short for voice prompt encoding. "
                         "Use longer clone refs (>=1.2s), or disable speaker clone for this run."
                     )
-                elif "Torch 2.5.1+cu121 es incompatible" in joined:
-                    hint = "NLLB warm-up failed due Torch version mismatch (requires torch>=2.6)."
-
                 if hint:
                     raise RuntimeError(
                         f"PyVideoTrans falló con código de salida {process.returncode}. {hint}"
@@ -3088,18 +3673,42 @@ with gr.Blocks(
                 interactive=False,
             )
 
-            # ── SPEAKER SECTION (oculto hasta completar Fase 1) ─────────────────
+            # State to pass detected speakers to Phase 2
+            state_speakers = gr.State([])
+
             # Configuración dinámica de speakers (máximo 50)
             N_SPK_MAX = int(os.environ.get("PYVIDEOTRANS_MAX_SPEAKERS", "50"))
             N_SPK_MAX = max(12, min(N_SPK_MAX, 100))  # Rango 12-100
             _initial_voice_choices = STATIC_VOICE_LABELS[:]
 
+            # ── FASE 2: Solo traducción EN→ES ─────────────────────────────────────
+            gr.Markdown("### Fase 2 · Traducir EN→ES con Gemini")
+            gr.Markdown(
+                "Toma el SRT inglés generado por Fase 1, lo traduce con Gemini y "
+                "deja `timestamps_translate.json` listo para habilitar la Fase 3."
+            )
+            btn_phase2 = gr.Button(
+                "P2 · Pendiente artifact P1", variant="primary", size="lg", interactive=False,
+            )
+            with gr.Row():
+                file_master_srt = gr.File(label="Descargar subtitulos SRT", interactive=False)
+                file_ts_translate_dl = gr.File(
+                    label="Descargar timestamps_translate.json (para reanudar P3 sin re-traducir)",
+                    interactive=False,
+                )
+
+            # ── FASE 3: Clonación de voz Qwen + ensamble final ───────────────────
+            gr.Markdown("### Fase 3 · Clonación de voz + ensamble final")
+            gr.Markdown(
+                "Sintetiza voz clonada con Qwen3-TTS por speaker, alinea audio y "
+                "ensambla el video final aplicando los ajustes de frame/calidad."
+            )
+
+            # ── SPEAKER SECTION (oculto hasta completar Fase 1) ─────────────────
             with gr.Column(visible=False) as spk_section:
                 gr.Markdown("### Speakers detectados — Asigna una voz a cada speaker")
                 gr.Markdown(f"*Máximo {N_SPK_MAX} speakers soportados. Usa `PYVIDEOTRANS_MAX_SPEAKERS` para personalizar.*")
 
-                # Pre-build N_SPK_MAX rows; Phase 1 callback makes them visible
-                # Contenedor con scroll para muchos speakers
                 with gr.Group(elem_id="spk-scroll-container"):
                     spk_groups = []
                     spk_id_boxes = []
@@ -3137,30 +3746,6 @@ with gr.Blocks(
                         spk_label_boxes.append(_label_box)
                         spk_voice_dds.append(_voice_dd)
                         spk_audio_previews.append(_audio_preview)
-
-            # State to pass detected speakers to Phase 2
-            state_speakers = gr.State([])
-
-            # ── FASE 2: Solo traducción EN→ES ─────────────────────────────────────
-            gr.Markdown("### Fase 2 · Traducir EN→ES con Gemini")
-            gr.Markdown(
-                "Toma el SRT inglés generado por Fase 1, lo traduce con Gemini y "
-                "deja `timestamps_translate.json` listo para habilitar la Fase 3."
-            )
-            btn_phase2 = gr.Button(
-                "P2 · Pendiente artifact P1", variant="primary", size="lg", interactive=False,
-            )
-
-            # ── FASE 3: Clonación de voz Qwen + ensamble final ───────────────────
-            gr.Markdown("### Fase 3 · Clonación de voz + ensamble final")
-            gr.Markdown(
-                "Sintetiza voz clonada con Qwen3-TTS por speaker, alinea audio y "
-                "ensambla el video final aplicando los ajustes de frame/calidad."
-            )
-            btn_phase3 = gr.Button(
-                "P3 · Pendiente Fase 2",
-                variant="primary", size="lg", interactive=False, visible=True,
-            )
 
             with gr.Column(elem_id="qdp-frame-editor"):
                 gr.Markdown("### Editor de Frame (Referencia de Color)")
@@ -3202,11 +3787,16 @@ with gr.Blocks(
                 slider_backaudio_volume = gr.Slider(
                     minimum=0.0,
                     maximum=1.0,
-                    value=0.28,
+                    value=0.02,
                     step=0.01,
                     label="Volumen de audio original de fondo",
                     interactive=True,
                 )
+
+            btn_phase3 = gr.Button(
+                "P3 · Pendiente Fase 2",
+                variant="primary", size="lg", interactive=False, visible=True,
+            )
 
             ui_active_phase = gr.Textbox(label="Estado del pipeline", value="Sin pipeline activo", interactive=False, lines=1)
             ui_terminal = gr.Textbox(label="Terminal de Logs", elem_id="qdp-log", interactive=False, lines=15, autoscroll=True)
@@ -3214,17 +3804,8 @@ with gr.Blocks(
             with gr.Row():
                 out_master_audio = gr.Audio(label="Audio Doblado", interactive=False)
                 out_master_video = gr.Video(label="Resultado: Video Master Final (MP4)", interactive=False)
-            
-            with gr.Row():
-                file_master_json = gr.File(label="Descargar JSON de timestamps", interactive=False)
-                file_master_srt = gr.File(label="Descargar subtitulos SRT", interactive=False)
-                file_master_audio = gr.File(label="Descargar audio WAV", interactive=False)
-
-            with gr.Row():
-                file_ts_translate_dl = gr.File(
-                    label="Descargar timestamps_translate.json (para reanudar P3 sin re-traducir)",
-                    interactive=False,
-                )
+            file_master_json = gr.File(label="Descargar JSON de timestamps", interactive=False, visible=False)
+            file_master_audio = gr.File(label="Descargar audio WAV", interactive=False, visible=False)
 
         # =================================================================
         # TAB 2: AGREGAR SUBTÍTULOS (Workflow 2)
@@ -3250,6 +3831,13 @@ with gr.Blocks(
                     label="O seleccionar de red",
                     interactive=True,
                     scale=2
+                )
+                dd_video_subs_local = gr.Dropdown(
+                    choices=_list_subtitle_reference_media(),
+                    value=None,
+                    label="O seleccionar local/temporales (sin subir)",
+                    interactive=True,
+                    scale=3,
                 )
                 btn_refresh_subs = gr.Button("Refrescar videos", scale=1, min_width=120)
 
@@ -3303,7 +3891,7 @@ with gr.Blocks(
                     )
 
                 with gr.Row():
-                    slider_subs_fontsize = gr.Slider(36, 96, value=60, step=2, label="Tamaño de fuente")
+                    slider_subs_fontsize = gr.Slider(36, 96, value=70, step=2, label="Tamaño de fuente")
                     dd_subs_font_color = gr.Dropdown(
                         choices=list(SUBTITLE_COLOR_OPTIONS.keys()),
                         value="Blanco",
@@ -3316,18 +3904,18 @@ with gr.Blocks(
                         label="Color de borde",
                         interactive=True,
                     )
-                    slider_subs_border_width = gr.Slider(0, 8, value=4, step=1, label="Grosor de borde")
+                    slider_subs_border_width = gr.Slider(0, 8, value=0, step=1, label="Grosor de borde")
 
                 with gr.Row():
-                    cb_subs_box_enabled = gr.Checkbox(label="Caja de fondo", value=False, interactive=True)
+                    cb_subs_box_enabled = gr.Checkbox(label="Caja de fondo", value=True, interactive=True)
                     dd_subs_box_color = gr.Dropdown(
                         choices=list(SUBTITLE_BOX_OPTIONS.keys()),
                         value="Negro",
                         label="Color de caja",
                         interactive=True,
                     )
-                    slider_subs_box_opacity = gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Opacidad de caja")
-                    slider_subs_max_chars = gr.Slider(18, 52, value=34, step=1, label="Máx. caracteres por línea")
+                    slider_subs_box_opacity = gr.Slider(0.0, 1.0, value=0.8, step=0.05, label="Opacidad de caja")
+                    slider_subs_max_chars = gr.Slider(18, 52, value=35, step=1, label="Máx. caracteres por línea")
 
                 with gr.Row():
                     dd_subs_max_lines = gr.Dropdown(
@@ -3348,7 +3936,7 @@ with gr.Blocks(
                         label="Posición vertical",
                         interactive=True,
                     )
-                    slider_subs_bottom_margin = gr.Slider(20, 180, value=72, step=2, label="Margen inferior")
+                    slider_subs_bottom_margin = gr.Slider(0, 180, value=20, step=2, label="Margen inferior")
                     slider_subs_line_spacing = gr.Slider(0, 24, value=10, step=1, label="Espaciado entre líneas")
 
                 with gr.Row():
@@ -3485,18 +4073,22 @@ with gr.Blocks(
     # =====================================================================
     
     # Helpers para subtítulos
-    def handle_subtitle_generation(video_input, lang, preview_mode):
+    def handle_subtitle_generation(video_input, local_video_input, lang, preview_mode, max_chars_per_line):
         """Generar subtítulos del video doblado."""
-        if not video_input:
-            return "", "", " Selecciona un video primero"
+        action = "[Tab2] Generar subtítulos"
+        ui_log.info(f"{action} solicitado")
         
         try:
             if ui_generate_subtitles is None:
-                return "", "", " Módulo de subtítulos no disponible"
+                msg = " Módulo de subtítulos no disponible"
+                ui_log.error(f"{action}: {msg.strip()}")
+                return "", "", f"{action}: {msg.strip()}"
 
-            video_path = _resolve_subtitle_media_path(video_input)
+            video_path = _resolve_subtitle_media_path(video_input, local_video_input)
             if not video_path or not os.path.exists(video_path):
-                return "", "", " Video no encontrado"
+                msg = " Selecciona un video primero"
+                ui_log.error(f"{action}: {msg.strip()} input_red={video_input} input_local={local_video_input}")
+                return "", "", f"{action}: {msg.strip()}"
 
             # Ejecutar en background
             def update_log(msg):
@@ -3507,19 +4099,24 @@ with gr.Blocks(
                 lang,
                 update_log,
                 preview_duration_sec=30.0 if preview_mode else None,
+                max_chars_per_line=int(max_chars_per_line or 35),
             )
             
-            # Preparar archivos para descarga
-            srt_obj = (srt, Path(srt).name) if os.path.exists(srt) else None
-            json_obj = (json_file, Path(json_file).name) if os.path.exists(json_file) else None
+            # Gradio File expects path-like values (not tuple(path, name)).
+            srt_obj = srt if os.path.exists(srt) else None
+            json_obj = json_file if os.path.exists(json_file) else None
             
-            return srt_obj, json_obj, msg
+            final_msg = f"{action}: {msg}"
+            ui_log.info(f"{action}: OK video={video_path} srt={srt} json={json_file}")
+            return srt_obj, json_obj, final_msg
         
         except Exception as e:
-            return "", "", f" Error: {str(e)}"
+            ui_log.exception(f"{action}: {e}")
+            return "", "", f"{action}: Error: {str(e)}"
     
     def handle_subtitle_rendering(
         video_input,
+        local_video_input,
         srt_path,
         preview_mode,
         preset_label,
@@ -3539,27 +4136,41 @@ with gr.Blocks(
         sample_text,
     ):
         """Renderizar video con subtítulos."""
+        action = "[Tab2] Renderizar subtítulos"
+        ui_log.info(f"{action} solicitado")
         if not video_input:
-            return "", " Selecciona un video primero"
+            msg = " Selecciona un video primero"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return "", f"{action}: {msg.strip()}"
         
         if not srt_path:
-            return "", " Carga un archivo SRT primero"
+            msg = " Carga un archivo SRT primero"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return "", f"{action}: {msg.strip()}"
         
         try:
             if ui_render_subtitles is None:
-                return "", " Módulo de subtítulos no disponible"
+                msg = " Módulo de subtítulos no disponible"
+                ui_log.error(f"{action}: {msg.strip()}")
+                return "", f"{action}: {msg.strip()}"
 
-            video_path = _resolve_subtitle_media_path(video_input)
+            video_path = _resolve_subtitle_media_path(video_input, local_video_input)
             if not video_path or not os.path.exists(video_path):
-                return "", " Video no encontrado"
+                msg = " Video no encontrado"
+                ui_log.error(f"{action}: {msg.strip()} input_red={video_input} input_local={local_video_input}")
+                return "", f"{action}: {msg.strip()}"
 
             subtitle_file_path = _resolve_file_component_path(srt_path)
             if not subtitle_file_path:
-                return "", " No se pudo resolver el archivo SRT para renderizar"
+                msg = " No se pudo resolver el archivo SRT para renderizar"
+                ui_log.error(f"{action}: {msg.strip()}")
+                return "", f"{action}: {msg.strip()}"
 
             # Render requiere fuente de video. Si es audio, sugerir usar un video.
             if Path(video_path).suffix.lower() in {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}:
-                return "", " Para renderizar subtítulos sobre imagen, selecciona un archivo de video. El audio sí sirve para generar SRT/JSON."
+                msg = " Para renderizar subtítulos sobre imagen, selecciona un archivo de video. El audio sí sirve para generar SRT/JSON."
+                ui_log.error(f"{action}: {msg.strip()} path={video_path}")
+                return "", f"{action}: {msg.strip()}"
 
             style_config = _subtitle_style_payload(
                 preset_label,
@@ -3592,13 +4203,17 @@ with gr.Blocks(
                 preview_duration_sec=30.0 if preview_mode else None,
             )
             
-            return output_video, msg
+            final_msg = f"{action}: {msg}"
+            ui_log.info(f"{action}: OK video={video_path} srt={subtitle_file_path} output={output_video}")
+            return output_video, final_msg
         
         except Exception as e:
-            return "", f" Error: {str(e)}"
+            ui_log.exception(f"{action}: {e}")
+            return "", f"{action}: Error: {str(e)}"
 
     def handle_extract_subtitle_frame(
         video_input,
+        local_video_input,
         second,
         preset_label,
         fontsize,
@@ -3616,13 +4231,21 @@ with gr.Blocks(
         line_spacing,
         sample_text,
     ):
+        action = "[Tab2][Preview] Extraer frame base"
+        ui_log.info(f"{action} solicitado")
         if extract_frame is None or render_subtitle_preview_on_frame is None:
-            return None, None, " Preview de subtítulos no disponible"
-        video_path = _resolve_subtitle_media_path(video_input)
+            msg = " Preview de subtítulos no disponible"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return None, None, msg, f"{action}: {msg.strip()}"
+        video_path = _resolve_subtitle_media_path(video_input, local_video_input)
         if not video_path or not os.path.isfile(video_path):
-            return None, None, " Selecciona un video válido primero"
+            msg = " Selecciona un video válido primero"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return None, None, msg, f"{action}: {msg.strip()}"
         if Path(video_path).suffix.lower() in {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}:
-            return None, None, " El preview visual necesita un video, no solo audio"
+            msg = " El preview visual necesita un video, no solo audio"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return None, None, msg, f"{action}: {msg.strip()}"
         try:
             frame_path = extract_frame(video_path, LOCAL_TEMP, float(second))
             style_config = _subtitle_style_payload(
@@ -3648,9 +4271,13 @@ with gr.Blocks(
                 sample_text=style_config.get("sample_text"),
                 output_path=os.path.join(LOCAL_TEMP, "subtitle_style_preview.jpg"),
             )
-            return frame_path, preview_path, f" Frame y preview generados en t={int(second)}s"
+            msg = f" Frame y preview generados en t={int(second)}s"
+            ui_log.info(f"{action}: OK video={video_path} segundo={int(second)} frame={frame_path} preview={preview_path}")
+            return frame_path, preview_path, msg, f"{action}: {msg.strip()}"
         except Exception as exc:
-            return None, None, f" Error generando preview: {exc}"
+            msg = f" Error generando preview: {exc}"
+            ui_log.exception(f"{action}: {exc}")
+            return None, None, msg, f"{action}: {msg.strip()}"
 
     def handle_update_subtitle_style_preview(
         frame_input,
@@ -3670,10 +4297,16 @@ with gr.Blocks(
         line_spacing,
         sample_text,
     ):
+        action = "[Tab2][Preview] Actualizar preview de subtítulos"
+        ui_log.info(f"{action} solicitado")
         if render_subtitle_preview_on_frame is None:
-            return None, " Preview de subtítulos no disponible"
+            msg = " Preview de subtítulos no disponible"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return None, msg, f"{action}: {msg.strip()}"
         if not frame_input:
-            return None, " Extrae un frame base primero"
+            msg = " Extrae un frame base primero"
+            ui_log.error(f"{action}: {msg.strip()}")
+            return None, msg, f"{action}: {msg.strip()}"
         try:
             style_config = _subtitle_style_payload(
                 preset_label,
@@ -3698,25 +4331,31 @@ with gr.Blocks(
                 sample_text=style_config.get("sample_text"),
                 output_path=os.path.join(LOCAL_TEMP, "subtitle_style_preview.jpg"),
             )
-            return preview_path, " Preview de subtítulos actualizado"
+            msg = " Preview de subtítulos actualizado"
+            ui_log.info(f"{action}: OK frame={frame_input} preview={preview_path}")
+            return preview_path, msg, f"{action}: {msg.strip()}"
         except Exception as exc:
-            return None, f" Error actualizando preview: {exc}"
+            msg = f" Error actualizando preview: {exc}"
+            ui_log.exception(f"{action}: {exc}")
+            return None, msg, f"{action}: {msg.strip()}"
     
     def update_subs_video_dropdown():
         media_files = _get_user_videos() + _get_user_audios()
-        return gr.update(choices=media_files)
+        local_media_files = _list_subtitle_reference_media()
+        return gr.update(choices=media_files), gr.update(choices=local_media_files)
     
     def handle_subs_video_upload(filepath):
         if not filepath:
-            return gr.update()
+            return gr.update(), gr.update()
         _ensure_dirs()
         filename = os.path.basename(filepath)
         dest = os.path.join(NETWORK_USER_INPUT, filename)
         shutil.copy2(filepath, dest)
         ui_log.info(f"Video de subtítulos subido: {dest}")
         media_files = _get_user_videos() + _get_user_audios()
+        local_media_files = _list_subtitle_reference_media()
         new_val = next((v for v in media_files if v.startswith(filename)), None)
-        return gr.update(choices=media_files, value=new_val)
+        return gr.update(choices=media_files, value=new_val), gr.update(choices=local_media_files)
 
     def handle_extract_frame(video_input, second):
         if extract_frame is None:
@@ -3898,8 +4537,8 @@ with gr.Blocks(
     demo.load(_phase_badges_html, inputs=[dd_video], outputs=[ui_phase_badges])
 
     # Tab 2: Subtítulos
-    up_video_subs.upload(handle_subs_video_upload, inputs=[up_video_subs], outputs=[dd_video_subs])
-    btn_refresh_subs.click(update_subs_video_dropdown, inputs=None, outputs=[dd_video_subs])
+    up_video_subs.upload(handle_subs_video_upload, inputs=[up_video_subs], outputs=[dd_video_subs, dd_video_subs_local])
+    btn_refresh_subs.click(update_subs_video_dropdown, inputs=None, outputs=[dd_video_subs, dd_video_subs_local])
     dd_subs_preset.change(
         _subtitle_preset_updates,
         inputs=[dd_subs_preset],
@@ -3940,25 +4579,25 @@ with gr.Blocks(
 
     btn_extract_subs_frame.click(
         handle_extract_subtitle_frame,
-        inputs=[dd_video_subs, subs_frame_second, *_subs_style_inputs],
-        outputs=[frame_original_subs, frame_preview_subs, ui_subs_style_log],
+        inputs=[dd_video_subs, dd_video_subs_local, subs_frame_second, *_subs_style_inputs],
+        outputs=[frame_original_subs, frame_preview_subs, ui_subs_style_log, ui_subs_log],
     )
 
     btn_apply_subs_style_preview.click(
         handle_update_subtitle_style_preview,
         inputs=[frame_original_subs, *_subs_style_inputs],
-        outputs=[frame_preview_subs, ui_subs_style_log],
+        outputs=[frame_preview_subs, ui_subs_style_log, ui_subs_log],
     )
     
     btn_gen_subs.click(
         handle_subtitle_generation,
-        inputs=[dd_video_subs, dd_subs_lang, cb_subs_preview_mode],
+        inputs=[dd_video_subs, dd_video_subs_local, dd_subs_lang, cb_subs_preview_mode, slider_subs_max_chars],
         outputs=[file_srt, file_json, ui_subs_log]
     )
     
     btn_render_subs.click(
         handle_subtitle_rendering,
-        inputs=[dd_video_subs, file_srt, cb_subs_preview_mode, *_subs_style_inputs],
+        inputs=[dd_video_subs, dd_video_subs_local, file_srt, cb_subs_preview_mode, *_subs_style_inputs],
         outputs=[out_video_subs, ui_subs_log]
     )
     

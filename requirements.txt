@@ -17,6 +17,7 @@ uvicorn>=0.32.0
 ffmpeg-python==0.2.0
 librosa==0.10.2.post1
 soundfile==0.12.1
+faster-whisper==1.1.1
 
 # === UTILIDADES ===
 python-dotenv
@@ -40,3 +41,22 @@ edge-tts
 gTTS==2.5.1
 piper-tts>=1.3.0
 zhconv==1.4.3
+
+# === DIARIZACIÓN CLUSTERING ===
+# Requerido por ali_CAM Phase 1: clustering HDBSCAN de embeddings de voz.
+# Sin estos, el pipeline de diarización falla con ImportError en tiempo de ejecución.
+hdbscan
+umap-learn
+
+# === MODELSCOPE / FUNASR (diarización ONNX) ===
+# Motor ASR y pipeline de diarización CAM++.
+# datasets + simplejson + sortedcontainers requeridos por funasr pipeline internamente.
+modelscope>=1.34.0
+funasr>=1.3.1
+datasets
+simplejson
+sortedcontainers
+
+# === ALIGNER ONNX ===
+# sherpa-onnx: requerido por Qwen3-ForcedAligner para alineación fonética.
+sherpa-onnx>=1.12.15

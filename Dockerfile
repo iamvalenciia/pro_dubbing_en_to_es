@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC
@@ -56,12 +56,17 @@ RUN pip install --no-cache-dir torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Model runtimes.
+# Active Docker flow uses faster-whisper for ASR and Qwen TTS for synthesis.
 # qwen-tts==0.1.1 requires transformers==4.57.3.
-# Keep one validated transformers version and install Qwen packages without
+# Keep one validated transformers version and install qwen-tts without
 # dependency resolution here to avoid accidental upgrades/downgrades.
+# onnxruntime-gpu: provides CUDAExecutionProvider; qwen-tts metadata declares
+#   plain onnxruntime but the GPU variant satisfies runtime imports.
+# qwen-omni-utils, nagisa, soynlp: direct runtime deps of qwen_tts that are
+#   not pulled automatically because qwen-tts is installed --no-deps.
 RUN pip install --no-cache-dir transformers==4.57.3 accelerate==1.12.0 einops sox \
-    && pip install --no-cache-dir --no-deps qwen-asr==0.0.6 \
-  && pip install --no-cache-dir --no-deps qwen-tts==0.1.1
+            onnxruntime-gpu qwen-omni-utils "nagisa==0.2.11" soynlp \
+        && pip install --no-cache-dir --no-deps qwen-tts==0.1.1
 
 # Optional speedups (do not fail image build if unavailable).
 ARG INSTALL_XFORMERS=0
@@ -85,57 +90,36 @@ if Version(v) < Version("2.6.0"):
     raise SystemExit(f"ERROR: torch>=2.6.0 required, got {torch.__version__}")
 PY
 
-COPY . /app
-
-# ========== PRE-BAKE ACTIVE MODELS ==========
-RUN python3 - <<'PY'
-print("[PREBAKE] Downloading Qwen3-TTS base model...")
-from huggingface_hub import snapshot_download as hf_snapshot_download
-hf_snapshot_download(
-    repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    local_dir="/app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base",
-    max_workers=1,
-    local_files_only=False,
-)
-
-print("[PREBAKE] Downloading Qwen3-TTS custom voice model...")
-hf_snapshot_download(
-    repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    local_dir="/app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice",
-    max_workers=1,
-    local_files_only=False,
-)
-
-print("[PREBAKE] Active model pre-bake done.")
-PY
+# Optional warm-model bake.
+# Default is OFF to keep build time and image size under control.
+ARG PREBAKE_QWEN_TTS=0
+RUN if [ "$PREBAKE_QWEN_TTS" = "1" ]; then \
+            mkdir -p /app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base \
+                     /app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice && \
+            python3 -c "from huggingface_hub import snapshot_download as d; print('[PREBAKE] Downloading Qwen3-TTS base model...'); d(repo_id='Qwen/Qwen3-TTS-12Hz-1.7B-Base', local_dir='/app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base', max_workers=1, local_files_only=False); print('[PREBAKE] Downloading Qwen3-TTS custom voice model...'); d(repo_id='Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', local_dir='/app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice', max_workers=1, local_files_only=False); print('[PREBAKE] Qwen3-TTS model pre-bake done.')"; \
+        else \
+            echo "INFO: PREBAKE_QWEN_TTS=0, Qwen TTS models will download on first use"; \
+        fi
 
 # ========== BUILD-TIME ACTIVE WORKFLOW AUDIT ==========
 RUN python3 - <<'PY'
-from pathlib import Path
 import importlib
 
 required_modules = [
     "huggingface_hub",
     "requests",
     "pydub",
+    "faster_whisper",
     "qwen_tts",
 ]
 for mod in required_modules:
     importlib.import_module(mod)
     print(f"[AUDIT] import ok: {mod}")
 
-required_files = [
-    "/app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-Base/config.json",
-    "/app/pyvideotrans/models/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/config.json",
-]
-for p in required_files:
-    path = Path(p)
-    if not path.exists() or path.stat().st_size <= 1024:
-        raise SystemExit(f"[AUDIT] missing or invalid file: {p}")
-    print(f"[AUDIT] file ok: {p}")
-
 print("[AUDIT] Active workflow Docker audit passed.")
 PY
+
+COPY . /app
 
 # ========== OPTIMIZE cfg.json FOR GPU PERFORMANCE ==========
 # Ensure aggressive batching and concurrency settings are baked into the container

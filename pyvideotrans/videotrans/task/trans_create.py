@@ -42,7 +42,7 @@ def _resolve_backaudio_volume(default_value=0.28):
     return result
 
 
-def _resolve_dubbed_audio_volume(default_value=1.25):
+def _resolve_dubbed_audio_volume(default_value=1.05):
     raw = os.environ.get("QDP_DUBBED_AUDIO_VOLUME")
     if raw is not None:
         try:
@@ -357,10 +357,16 @@ class TransCreate(BaseTask):
 
         # 将原始视频分离为无声视频
         if not self.is_audio_trans and self.cfg.app_mode != 'tiqu':
-            app_cfg.queue_novice[self.uuid] = 'ing'
-            if not self.is_copy_video:
-                self._signal(text=tr("Video needs transcoded and take a long time.."))
-            run_in_threadpool(self._split_novoice_byraw)
+            pure_ducking = str(os.environ.get("PYVIDEOTRANS_DUCKING_PURE", "0")).strip().lower() in ("1", "true", "yes", "on")
+            if pure_ducking:
+                logger.info("[qdp-ducking] pure mode enabled: skip novoice split and keep original video stream")
+                self.cfg.novoice_mp4 = self.cfg.name
+                app_cfg.queue_novice[self.uuid] = 'end'
+            else:
+                app_cfg.queue_novice[self.uuid] = 'ing'
+                if not self.is_copy_video:
+                    self._signal(text=tr("Video needs transcoded and take a long time.."))
+                run_in_threadpool(self._split_novoice_byraw)
         else:
             app_cfg.queue_novice[self.uuid] = 'end'
 
@@ -405,7 +411,11 @@ class TransCreate(BaseTask):
         if audio_stream_len > 0 and not tools.vail_file(self.cfg.source_wav):
             self._split_audio_byraw()
 
-        self._signal(text=tr('endfenliyinpin'))
+        pure_ducking = str(os.environ.get("PYVIDEOTRANS_DUCKING_PURE", "0")).strip().lower() in ("1", "true", "yes", "on")
+        if pure_ducking:
+            self._signal(text='Original audio bed mode enabled (no A/V split)')
+        else:
+            self._signal(text=tr('endfenliyinpin'))
 
     # 开始识别
     def recogn(self) -> None:
@@ -1061,6 +1071,24 @@ class TransCreate(BaseTask):
 
     # 从原始视频分离出 无声视频
     def _split_novoice_byraw(self):
+        fast_copy_mode = str(os.environ.get("PYVIDEOTRANS_FAST_NOVOICE_COPY", "0")).strip().lower() in ("1", "true", "yes", "on")
+        if fast_copy_mode:
+            try:
+                logger.info("[qdp-fast] novoice split in fast-copy mode (-c:v copy)")
+                return tools.runffmpeg([
+                    "-y",
+                    "-fflags",
+                    "+genpts",
+                    "-i",
+                    self.cfg.name,
+                    "-an",
+                    "-c:v",
+                    "copy",
+                    os.path.basename(self.cfg.novoice_mp4),
+                ], noextname=self.uuid, cmd_dir=self.cfg.cache_folder)
+            except Exception as e:
+                logger.warning(f"[qdp-fast] fast-copy novoice split failed, fallback to normal path: {e}")
+
         cmd = [
             "-y",
             "-fflags",
@@ -1815,11 +1843,21 @@ class TransCreate(BaseTask):
             background_source = self.cfg.background_music
 
             if source_mode == "original":
+                source_video_for_bed = self.cfg.name
+                forced_original_video = os.environ.get("QDP_ORIGINAL_SOURCE_VIDEO", "").strip()
+                if forced_original_video and Path(forced_original_video).is_file():
+                    source_video_for_bed = forced_original_video
+
+                source_video_info = self.video_info if source_video_for_bed == self.cfg.name else tools.get_video_info(source_video_for_bed)
+                streams_audio = int((source_video_info or {}).get("streams_audio", 0) or 0)
+                if streams_audio < 1:
+                    logger.warning(f"[_back_music] source video has no audio stream; skipping original background bed (source={source_video_for_bed})")
+                    return
                 background_source = self.cfg.cache_folder + "/original_full_bed.wav"
                 tools.runffmpeg([
                     "-y",
                     "-i",
-                    self.cfg.name,
+                    source_video_for_bed,
                     "-vn",
                     "-ac",
                     "2",
@@ -1840,6 +1878,9 @@ class TransCreate(BaseTask):
             vtime = tools.get_audio_time(self.cfg.target_wav)
             # 获取背景音频长度
             atime = tools.get_audio_time(background_source)
+            if atime <= 0:
+                logger.warning("[_back_music] background source duration is zero; skipping background mix")
+                return
             bgm_file = self.cfg.cache_folder + f'/bgm_file.wav'
             self.convert_to_wav(background_source, bgm_file)
             self.cfg.background_music = bgm_file
@@ -2102,36 +2143,40 @@ class TransCreate(BaseTask):
         target_m4a = self.cfg.cache_folder + "/origin_audio.m4a"
         # 用于判断输出原始音频是否结束，is True是结束，
         output_source_output = True
+        has_source_audio = int((self.video_info or {}).get('streams_audio', 0) or 0) > 0
         if not self.shoud_dubbing:
             # 无配音的使用原始音频
             self._get_origin_audio(target_m4a)
             shutil.copy2(target_m4a, self.cfg.source_wav_output)
         else:
-            try:
-                output_source_output = False
-                # 高质量 原始音频输出到目标目录，单独线程执行，不影响继续运行
-                cmd = [
-                    "-y",
-                    "-i",
-                    self.cfg.name,
-                    "-vn",
-                    "-b:a", "128k",
-                    "-c:a",
-                    "aac",
-                    self.cfg.source_wav_output
-                ]
+            if has_source_audio:
+                try:
+                    output_source_output = False
+                    # 高质量 原始音频输出到目标目录，单独线程执行，不影响继续运行
+                    cmd = [
+                        "-y",
+                        "-i",
+                        self.cfg.name,
+                        "-vn",
+                        "-b:a", "128k",
+                        "-c:a",
+                        "aac",
+                        self.cfg.source_wav_output
+                    ]
 
-                def _output():
-                    nonlocal output_source_output
-                    try:
-                        tools.runffmpeg(cmd)
-                    except Exception:
-                        pass
-                    finally:
-                        output_source_output = True
-                threading.Thread(target=_output, daemon=True).start()
-            except Exception:
-                pass
+                    def _output():
+                        nonlocal output_source_output
+                        try:
+                            tools.runffmpeg(cmd)
+                        except Exception:
+                            pass
+                        finally:
+                            output_source_output = True
+                    threading.Thread(target=_output, daemon=True).start()
+                except Exception:
+                    pass
+            else:
+                logger.warning("[_join_video_audio_srt] source video has no audio stream; skip exporting source_wav_output")
 
             # 添加背景音乐
             self._back_music()
@@ -2159,13 +2204,17 @@ class TransCreate(BaseTask):
         os.chdir(self.cfg.cache_folder)
 
         # 末尾对齐
+        pure_ducking = str(os.environ.get("PYVIDEOTRANS_DUCKING_PURE", "0")).strip().lower() in ("1", "true", "yes", "on")
+
         duration_ms = int(tools.get_video_duration(self.cfg.novoice_mp4))
         duration_s = f'{duration_ms / 1000.0:.6f}'
         audio_ms = tools.get_audio_time(target_m4a)
-        if duration_ms < audio_ms:
+        if duration_ms < audio_ms and not pure_ducking:
             self._video_extend(audio_ms - duration_ms)
             duration_ms = int(tools.get_video_duration(self.cfg.novoice_mp4))
             duration_s = f'{duration_ms / 1000.0:.6f}'
+        elif duration_ms < audio_ms and pure_ducking:
+            logger.info('[qdp-ducking] skipping video freeze-extend in pure ducking mode')
 
         # 将生成的视频先导出到临时目录，防止包含各种奇怪符号的targetdir_mp4导致ffmpeg失败
         tmp_target_mp4 = self.cfg.cache_folder + f"/laste_target.mp4"
@@ -2179,7 +2228,10 @@ class TransCreate(BaseTask):
             # 如果需要输出的视频是 264 编码，因开始和中间编码均为264，可以考虑使用copy (如果无硬字幕嵌入的话)
             is_copy_mode = (str(self.video_codec_num) == '264')
             # 无音频视频流
-            novoice_mp4_basename = os.path.basename(self.cfg.novoice_mp4)
+            if pure_ducking:
+                novoice_mp4_input = self.cfg.novoice_mp4
+            else:
+                novoice_mp4_input = os.path.basename(self.cfg.novoice_mp4)
             # 需要嵌入的音频
             target_m4a_basename = os.path.basename(target_m4a)
             # 合成后的结果视频
@@ -2198,7 +2250,7 @@ class TransCreate(BaseTask):
             
             cmd1=[
                 "-i",
-                novoice_mp4_basename,
+                novoice_mp4_input,
                 "-i",
                 target_m4a_basename
             ]

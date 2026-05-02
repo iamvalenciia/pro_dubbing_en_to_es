@@ -5,10 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
+from collections import deque
 from typing import Optional
 
 _LOG_PATH: Optional[str] = None
 _CONFIGURED = False
+_TAIL_LOCK = threading.Lock()
+_TAIL_LINES: deque[str] = deque(maxlen=3000)
+_TAIL_POS = 0
+_TAIL_RENDER_CACHE: dict[int, tuple[int, str]] = {}
+_TAIL_VERSION = 0
 
 
 class _TeeStream:
@@ -93,18 +100,46 @@ def read_log_tail(lines: int = 300) -> str:
     if not _LOG_PATH or not os.path.exists(_LOG_PATH):
         return "(log vacio — pipeline no ha iniciado)"
     try:
-        with open(_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-            all_lines = f.readlines()
-        return "".join(all_lines[-lines:])
+        if lines <= 0:
+            lines = 1
+
+        with _TAIL_LOCK:
+            global _TAIL_POS, _TAIL_VERSION
+            file_size = os.path.getsize(_LOG_PATH)
+
+            # Handle truncation/rotation.
+            if _TAIL_POS > file_size:
+                _TAIL_POS = 0
+                _TAIL_LINES.clear()
+                _TAIL_RENDER_CACHE.clear()
+                _TAIL_VERSION += 1
+
+            with open(_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+                if _TAIL_POS == 0 and not _TAIL_LINES:
+                    # First read: load once, then incremental updates only.
+                    for ln in f.readlines():
+                        _TAIL_LINES.append(ln)
+                    _TAIL_POS = f.tell()
+                    _TAIL_VERSION += 1
+                elif _TAIL_POS < file_size:
+                    f.seek(_TAIL_POS)
+                    chunk = f.read()
+                    _TAIL_POS = f.tell()
+                    if chunk:
+                        for ln in chunk.splitlines(keepends=True):
+                            _TAIL_LINES.append(ln)
+                        _TAIL_VERSION += 1
+
+            cached = _TAIL_RENDER_CACHE.get(lines)
+            if cached and cached[0] == _TAIL_VERSION:
+                return cached[1]
+
+            output = "".join(list(_TAIL_LINES)[-lines:])
+            _TAIL_RENDER_CACHE[lines] = (_TAIL_VERSION, output)
+            return output
     except OSError as exc:
         return f"(error leyendo log: {exc})"
 
 
 def clear_log() -> None:
-    logger = logging.getLogger("qdp")
-    if logger.handlers:
-        logger.info("")
-        logger.info("#" * 72)
-        logger.info("# LOG RESET — NUEVA CORRIDA")
-        logger.info("#" * 72)
-        logger.info("")
+    return

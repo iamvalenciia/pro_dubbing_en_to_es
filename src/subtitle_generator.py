@@ -1,17 +1,18 @@
 """
-Subtitle generator: Extract subtitles from video/audio using AssemblyAI.
+Subtitle generator: Extract subtitles from video/audio using local faster-whisper.
 Generates SRT and JSON with proper timestamps.
 """
 
 import json
 import os
 import re
+import subprocess
 import tempfile
-import time
+import textwrap
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import requests
+from faster_whisper import WhisperModel
 
 
 def get_audio_from_video(
@@ -20,60 +21,85 @@ def get_audio_from_video(
     preview_duration_sec: Optional[float] = None,
 ) -> str:
     """Get 16k mono WAV from video or audio input using ffmpeg."""
-    from videotrans.util import tools
-    
     if output_audio is None:
         output_audio = tempfile.NamedTemporaryFile(suffix='.wav', delete=False).name
     
     ext = Path(video_path).suffix.lower()
     audio_exts = {'.wav', '.mp3', '.m4a', '.aac', '.flac', '.ogg'}
 
-    cmd = ['-y', '-i', video_path]
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_path]
     if preview_duration_sec:
-        cmd.extend(['-t', str(float(preview_duration_sec))])
+        cmd.extend(["-t", str(float(preview_duration_sec))])
 
     if ext in audio_exts:
         # Normalize input audio to 16k mono WAV for ASR consistency.
-        tools.runffmpeg(cmd + [
-            '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+        cmd.extend([
+            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             output_audio
         ])
     else:
-        tools.runffmpeg(cmd + [
-            '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+        cmd.extend([
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
             output_audio
         ])
+    subprocess.run(cmd, check=True)
     return output_audio
 
 
-def _resolve_assemblyai_key() -> str:
-    key = str(os.environ.get("ASSEMBLY_AI_KEY") or os.environ.get("ASSEMBLYAI_API_KEY") or "").strip()
-    if key:
-        return key
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if env_path.is_file():
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            env_key, env_value = line.split("=", 1)
-            if env_key.strip() == "ASSEMBLY_AI_KEY":
-                return env_value.strip().strip('"').strip("'")
-    raise RuntimeError("ASSEMBLY_AI_KEY is required for subtitle generation.")
-
-
-def _resolve_speech_models() -> List[str]:
-    raw = str(
-        os.environ.get("ASSEMBLYAI_SPEECH_MODELS")
-        or os.environ.get("ASSEMBLYAI_SPEECH_MODEL")
-        or "universal-3-pro"
+def _resolve_whisper_runtime() -> tuple[str, str, str]:
+    model_name = str(
+        os.environ.get("QDP_SUBTITLE_ASR_MODEL")
+        or os.environ.get("QDP_ASR_MODEL")
+        or "large-v3"
     ).strip()
-    models = []
-    for item in raw.split(","):
-        token = item.strip().lower()
-        if token and token not in models:
-            models.append(token)
-    return models or ["universal-3-pro"]
+
+    requested_device = str(os.environ.get("QDP_SUBTITLE_ASR_DEVICE") or "auto").strip().lower()
+    device = "cpu"
+    if requested_device in {"cuda", "cpu"}:
+        device = requested_device
+    else:
+        try:
+            import torch  # type: ignore
+            device = "cuda" if bool(torch.cuda.is_available()) else "cpu"
+        except Exception:
+            device = "cpu"
+
+    default_compute = "float16" if device == "cuda" else "int8"
+    compute_type = str(os.environ.get("QDP_SUBTITLE_ASR_COMPUTE_TYPE") or default_compute).strip()
+    return model_name, device, compute_type
+
+
+def _split_segment_by_chars(start: float, end: float, text: str, max_chars_per_line: int) -> List[Dict]:
+    token = str(text or "").strip()
+    if not token:
+        return []
+
+    max_chars = max(int(max_chars_per_line or 35), 8)
+    chunks = textwrap.wrap(
+        token,
+        width=max_chars,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ) or [token]
+
+    duration = max(float(end) - float(start), 0.01)
+    total_chars = sum(max(len(c), 1) for c in chunks)
+    cur = float(start)
+    rows: List[Dict] = []
+    for idx, chunk in enumerate(chunks):
+        portion = max(len(chunk), 1) / max(total_chars, 1)
+        seg_dur = duration * portion
+        seg_start = cur
+        seg_end = float(end) if idx == (len(chunks) - 1) else min(float(end), cur + seg_dur)
+        cur = seg_end
+        if seg_end <= seg_start:
+            continue
+        rows.append({
+            "start": seg_start,
+            "end": seg_end,
+            "text": chunk.strip(),
+        })
+    return rows
 
 
 def _parse_srt_to_segments(srt_text: str) -> List[Dict]:
@@ -115,74 +141,40 @@ def _srt_to_seconds(value: str) -> float:
     return int(hh) * 3600 + int(mm) * 60 + int(ss) + (int(ms) / 1000.0)
 
 
-def transcribe_audio(audio_path: str, language: str = 'es') -> List[Dict]:
-    """
-    Transcribe audio using AssemblyAI and return normalized segments.
-    """
-    api_key = _resolve_assemblyai_key()
-    base_url = os.environ.get("ASSEMBLYAI_BASE_URL", "https://api.assemblyai.com/v2").rstrip("/")
-    request_timeout = float(os.environ.get("ASSEMBLYAI_REQUEST_TIMEOUT", "60"))
-    poll_seconds = float(os.environ.get("ASSEMBLYAI_POLL_SECONDS", "2.0"))
-    max_seconds = int(os.environ.get("ASSEMBLYAI_TIMEOUT_SECONDS", "1800"))
+def transcribe_audio(audio_path: str, language: str = 'es', max_chars_per_line: int = 35) -> List[Dict]:
+    """Transcribe audio using local faster-whisper and return normalized segments."""
+    model_name, device, compute_type = _resolve_whisper_runtime()
+    beam_size = int(os.environ.get("QDP_SUBTITLE_ASR_BEAM_SIZE", "5"))
 
-    with open(audio_path, "rb") as handle:
-        upload_resp = requests.post(
-            f"{base_url}/upload",
-            headers={"authorization": api_key},
-            data=handle,
-            timeout=request_timeout,
-        )
-    upload_resp.raise_for_status()
-    upload_url = str((upload_resp.json() or {}).get("upload_url") or "").strip()
-    if not upload_url:
-        raise RuntimeError("AssemblyAI upload failed: missing upload_url.")
-
-    payload = {
-        "audio_url": upload_url,
-        "language_detection": False,
-        "language_code": language,
-        "speech_model": _resolve_speech_models()[0],
-    }
-    create_resp = requests.post(
-        f"{base_url}/transcript",
-        headers={"authorization": api_key, "content-type": "application/json"},
-        json=payload,
-        timeout=request_timeout,
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    whisper_segments, _info = model.transcribe(
+        audio_path,
+        language=(language or "").strip() or None,
+        vad_filter=True,
+        beam_size=max(1, beam_size),
     )
-    create_resp.raise_for_status()
-    transcript_id = str((create_resp.json() or {}).get("id") or "").strip()
-    if not transcript_id:
-        raise RuntimeError("AssemblyAI transcript creation failed: missing transcript id.")
 
-    started = time.time()
-    while True:
-        if (time.time() - started) > max_seconds:
-            raise RuntimeError(f"AssemblyAI subtitle transcription timeout after {max_seconds}s.")
+    rows: List[Dict] = []
+    for seg in whisper_segments:
+        start = float(getattr(seg, "start", 0.0) or 0.0)
+        end = float(getattr(seg, "end", 0.0) or 0.0)
+        text = str(getattr(seg, "text", "") or "").strip()
+        if end <= start or not text:
+            continue
+        rows.extend(_split_segment_by_chars(start, end, text, max_chars_per_line=max_chars_per_line))
 
-        status_resp = requests.get(
-            f"{base_url}/transcript/{transcript_id}",
-            headers={"authorization": api_key},
-            timeout=request_timeout,
-        )
-        status_resp.raise_for_status()
-        status_body = status_resp.json() or {}
-        status = str(status_body.get("status") or "").strip().lower()
-        if status == "completed":
-            break
-        if status == "error":
-            raise RuntimeError(f"AssemblyAI subtitle transcription failed: {status_body.get('error')}")
-        time.sleep(max(0.5, poll_seconds))
+    normalized = []
+    for idx, it in enumerate(rows, start=1):
+        normalized.append({
+            "start": float(it["start"]),
+            "end": float(it["end"]),
+            "text": str(it["text"]),
+            "id": idx,
+        })
 
-    srt_resp = requests.get(
-        f"{base_url}/transcript/{transcript_id}/srt",
-        headers={"authorization": api_key},
-        timeout=request_timeout,
-    )
-    srt_resp.raise_for_status()
-    segments = _parse_srt_to_segments(srt_resp.text)
-    if not segments:
-        raise RuntimeError("AssemblyAI returned no subtitle segments.")
-    return segments
+    if not normalized:
+        raise RuntimeError("faster-whisper no devolvió segmentos válidos de subtítulos.")
+    return normalized
 
 
 def format_timestamp(seconds: float) -> str:
@@ -216,6 +208,7 @@ def generate_subtitles_from_video(
     language: str = 'es',
     output_json: Optional[str] = None,
     preview_duration_sec: Optional[float] = None,
+    max_chars_per_line: int = 35,
 ) -> tuple[str, str]:
     """
     Complete pipeline: extract audio, transcribe, generate SRT and JSON.
@@ -242,8 +235,12 @@ def generate_subtitles_from_video(
     
     try:
         # Transcribe
-        print(f"[Subtitle] Transcribing with language={language}...")
-        segments = transcribe_audio(temp_audio, language=language)
+        print(f"[Subtitle] Transcribing locally with faster-whisper language={language}...")
+        segments = transcribe_audio(
+            temp_audio,
+            language=language,
+            max_chars_per_line=max_chars_per_line,
+        )
         
         # Generate SRT
         print(f"[Subtitle] Writing SRT file...")

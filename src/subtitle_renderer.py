@@ -15,20 +15,21 @@ from typing import Dict, List, Optional, Tuple
 @dataclass
 class SubtitleStyleConfig:
     preset: str = "documental_limpio"
-    fontsize: int = 60
+    fontsize: int = 70
     font_color: str = "#FFFFFF"
     border_color: str = "#000000"
-    border_width: int = 4
-    box_enabled: bool = False
+    border_width: int = 0
+    box_enabled: bool = True
     box_color: str = "#000000"
-    box_opacity: float = 0.0
-    max_chars_per_line: int = 34
+    box_opacity: float = 0.8
+    max_chars_per_line: int = 35
     max_lines: int = 2
     line_spacing: int = 10
     alignment: str = "center"
     position_preset: str = "bottom"
     y_offset_ratio: float = 0.78
-    bottom_margin: int = 72
+    bottom_margin: int = 20
+    margin_slider_max: int = 180
     margin_x: int = 72
     fontfile: Optional[str] = None
     sample_text: str = "Este es un preview profesional de subtitulos en espanol."
@@ -39,20 +40,21 @@ class SubtitleStyleConfig:
 
 _STYLE_PRESETS: Dict[str, Dict] = {
     "documental_limpio": {
-        "fontsize": 60,
+        "fontsize": 70,
         "font_color": "#FFFFFF",
-        "border_color": "#101010",
-        "border_width": 4,
-        "box_enabled": False,
+        "border_color": "#000000",
+        "border_width": 0,
+        "box_enabled": True,
         "box_color": "#000000",
-        "box_opacity": 0.0,
-        "max_chars_per_line": 34,
+        "box_opacity": 0.8,
+        "max_chars_per_line": 35,
         "max_lines": 2,
         "line_spacing": 10,
         "alignment": "center",
         "position_preset": "bottom",
         "y_offset_ratio": 0.78,
-        "bottom_margin": 72,
+        "bottom_margin": 20,
+        "margin_slider_max": 180,
         "margin_x": 72,
     },
     "youtube_moderno": {
@@ -70,6 +72,7 @@ _STYLE_PRESETS: Dict[str, Dict] = {
         "position_preset": "bottom",
         "y_offset_ratio": 0.74,
         "bottom_margin": 88,
+        "margin_slider_max": 180,
         "margin_x": 64,
     },
     "caja_negra_broadcast": {
@@ -87,6 +90,7 @@ _STYLE_PRESETS: Dict[str, Dict] = {
         "position_preset": "bottom",
         "y_offset_ratio": 0.8,
         "bottom_margin": 54,
+        "margin_slider_max": 180,
         "margin_x": 72,
     },
 }
@@ -267,7 +271,37 @@ def _wrap_text(text: str, style: SubtitleStyleConfig) -> str:
     return "\n".join(visible)
 
 
-def _position_expressions(style: SubtitleStyleConfig, video_height: int) -> Tuple[str, str]:
+def _estimate_subtitle_block_height_px(text: str, style: SubtitleStyleConfig) -> int:
+    lines = [ln for ln in str(text or "").split("\n") if ln is not None]
+    line_count = max(1, len(lines))
+    fontsize = max(1, int(style.fontsize))
+    spacing = max(0, int(style.line_spacing))
+    border = max(0, int(style.border_width))
+    # Keep in sync with drawtext boxborderw=18 when box is enabled.
+    box_padding = 36 if bool(style.box_enabled) else 0
+
+    text_h = (line_count * fontsize) + ((line_count - 1) * spacing)
+    block_h = text_h + (2 * border) + box_padding
+    return max(fontsize, int(block_h))
+
+
+def _compute_bottom_y_px(text: str, style: SubtitleStyleConfig, video_height: int) -> int:
+    block_h = _estimate_subtitle_block_height_px(text, style)
+    max_y = max(0, int(video_height) - block_h)
+
+    slider_max = max(1, int(style.margin_slider_max or 180))
+    raw_margin = max(0.0, float(style.bottom_margin))
+    normalized = min(raw_margin / float(slider_max), 1.0)
+
+    # At normalized=1 subtitle is approximately centered vertically.
+    max_effective_margin = max(0, max_y // 2)
+    effective_margin = int(round(normalized * max_effective_margin))
+
+    y_px = int(video_height) - block_h - effective_margin
+    return max(0, min(y_px, max_y))
+
+
+def _position_expressions(style: SubtitleStyleConfig, video_height: int, text: str = "") -> Tuple[str, str]:
     alignment = str(style.alignment or "center").lower()
     if alignment == "left":
         x_expr = str(max(8, int(style.margin_x)))
@@ -278,12 +312,11 @@ def _position_expressions(style: SubtitleStyleConfig, video_height: int) -> Tupl
 
     pos = str(style.position_preset or "bottom").lower()
     if pos == "top":
-        y_expr = str(max(24, int(style.bottom_margin)))
+        y_expr = str(max(0, int(style.bottom_margin)))
     elif pos == "middle":
         y_expr = "(h-text_h)/2"
     else:
-        computed = int(video_height * float(style.y_offset_ratio)) - int(style.bottom_margin)
-        y_expr = str(max(24, computed))
+        y_expr = str(_compute_bottom_y_px(text, style, int(video_height)))
     return x_expr, y_expr
 
 
@@ -316,12 +349,12 @@ def generate_ffmpeg_drawtext_filter(
     if not prepared:
         raise ValueError("No subtitle segments available after layout processing")
 
-    x_expr, y_expr = _position_expressions(style, video_height)
+    x_expr, _ = _position_expressions(style, video_height)
     filters: List[str] = []
     for seg in prepared:
         text = _escape_text(seg["text"])
+        _, y_expr = _position_expressions(style, video_height, text=seg["text"])
         parts = [
-            "drawtext",
             f"fontsize={int(style.fontsize)}",
             f"fontcolor={_normalize_color(style.font_color)}",
             f"borderw={int(style.border_width)}",
@@ -340,7 +373,7 @@ def generate_ffmpeg_drawtext_filter(
                 f"boxcolor={_color_with_opacity(style.box_color, style.box_opacity)}",
                 "boxborderw=18",
             ])
-        filters.append(":".join(parts))
+        filters.append("drawtext=" + ":".join(parts))
     return ",".join(filters)
 
 

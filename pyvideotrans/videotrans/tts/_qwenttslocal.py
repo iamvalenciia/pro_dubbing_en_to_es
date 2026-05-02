@@ -71,13 +71,31 @@ class QwenttsLocal(BaseTTS):
     
         self._signal(text=f'convert wav')
         all_task = []
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(4,len(self.queue_tts),os.cpu_count())) as pool:
+        import os
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        env_workers = os.environ.get("PYVIDEOTRANS_CONVERT_WAV_WORKERS", "").strip()
+        try:
+            max_workers = int(env_workers) if env_workers else min(4, len(self.queue_tts), os.cpu_count() or 1)
+        except Exception:
+            max_workers = min(4, len(self.queue_tts), os.cpu_count() or 1)
+        max_workers = max(1, max_workers)
+        total = 0
+        done = 0
+        self._signal(text=f"[qwen3tts] convert_wav_start workers={max_workers}")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             for item in self.queue_tts:
                 filename=item.get('filename','')+"-qwen3tts.wav"
                 if tools.vail_file(filename):
                     all_task.append(pool.submit(self.convert_to_wav, filename,item['filename']))
-            if len(all_task) > 0:
-                _ = [i.result() for i in all_task]
+            total = len(all_task)
+            if total > 0:
+                for fut in as_completed(all_task):
+                    fut.result()
+                    done += 1
+                    if done == 1 or done == total or done % 10 == 0:
+                        self._signal(text=f"[qwen3tts] convert_wav {done}/{total}")
+            else:
+                self._signal(text="[qwen3tts] convert_wav 0/0")
+        self._signal(text=f"[qwen3tts] convert_wav_done {done}/{total}")
 
 

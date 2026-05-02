@@ -111,7 +111,15 @@ class BaseCon:
         ]
         try:
             tools.runffmpeg(cmd, force_cpu=True)
-            if settings.get('remove_dubb_silence',True):
+            remove_silence_env = os.environ.get("PYVIDEOTRANS_REMOVE_DUBB_SILENCE", "").strip().lower()
+            if remove_silence_env in ("1", "true", "yes", "on"):
+                remove_silence = True
+            elif remove_silence_env in ("0", "false", "no", "off"):
+                remove_silence = False
+            else:
+                remove_silence = bool(settings.get('remove_dubb_silence', True))
+
+            if remove_silence:
                 tools.remove_silence_wav(output_wav_file_path)
         except Exception:
             pass
